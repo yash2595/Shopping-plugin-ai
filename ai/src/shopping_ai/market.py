@@ -324,7 +324,13 @@ def expire_search(
     )
 
 
-def rank_offers(state: MarketSearch, *, now: datetime, config: AIConfig) -> MarketResult:
+def rank_offers(
+    state: MarketSearch,
+    *,
+    now: datetime,
+    config: AIConfig,
+    language: Literal["en", "hi-Latn"] = "en",
+) -> MarketResult:
     state = MarketSearch.model_validate(state.model_dump())
     if now.tzinfo is None or now < state.created_at:
         raise ValueError("Valid aware ranking time required")
@@ -365,21 +371,60 @@ def rank_offers(state: MarketSearch, *, now: datetime, config: AIConfig) -> Mark
         if ranked and status == "complete"
         else ()
     )
+    hi = language == "hi-Latn"
     if cheapest:
-        names = ", ".join(item.store_id for item in ranked if item.offer.offer_id in cheapest)
+        # At most six distinct configured stores, even with many tied offers.
+        names = ", ".join(
+            dict.fromkeys(item.store_id for item in ranked if item.offer.offer_id in cheapest)
+        )
         message = (
-            f"Lowest verified total among checked stores: {state.currency} {ranked[0].total:.2f}. "
+            f"Checked stores mein lowest verified total: {state.currency} {ranked[0].total:.2f}. "
+            f"Stores: {names}."
+            if hi
+            else f"Checked stores: lowest verified total {state.currency} {ranked[0].total:.2f}. "
             f"Stores: {names}."
         )
+        if len(cheapest) > 1:
+            message += (
+                f" {len(cheapest)} offers ka lowest total same hai."
+                if hi
+                else f" {len(cheapest)} offers share this lowest total."
+            )
     elif ranked:
-        message = "Search incomplete: showing verified totals; cheapest offer is not confirmed."
+        message = (
+            "Search incomplete hai: verified totals dikha raha hoon; cheapest confirm nahi hai."
+            if hi
+            else "Search incomplete: showing verified totals; cheapest offer is not confirmed."
+        )
     else:
-        message = "No fresh, exact-match offers with verified total costs are available."
-    message += (
-        " Conditional discounts are not deducted. Prices apply to the supplied delivery context."
+        message = (
+            "Fresh exact-match offers ke verified total costs available nahi hain."
+            if hi
+            else "No fresh, exact-match offers with verified total costs are available."
+        )
+    disclaimer = (
+        " Conditional discounts deduct nahi kiye. Prices diye gaye delivery context ke liye hain."
+        if hi
+        else " Conditional discounts are not deducted. Prices use the supplied delivery context."
     )
+    speech = message + disclaimer
     if unresolved:
-        message += " Stores without complete results: " + ", ".join(unresolved) + "."
+        speech += (
+            f" {len(tasks)} stores mein se {len(unresolved)} ke complete results nahi mile."
+            if hi
+            else f" Of {len(tasks)} requested stores, {len(unresolved)} lack complete results."
+        )
+    message += disclaimer
+    if unresolved:
+        message += (
+            (
+                " In stores ke complete results nahi mile: "
+                if hi
+                else " Stores without complete results: "
+            )
+            + ", ".join(unresolved)
+            + "."
+        )
     for item in ranked[:5]:
         message += (
             f"\n{item.store_id}: {item.offer.currency} {item.total:.2f} "
@@ -387,7 +432,11 @@ def rank_offers(state: MarketSearch, *, now: datetime, config: AIConfig) -> Mark
             f"+ extra tax/fees {item.offer.extra_tax_and_fees:.2f})."
         )
     if len(ranked) > 5:
-        message += " Additional offers are available in the structured results."
+        message += (
+            " Baaki offers structured results mein hain."
+            if hi
+            else " Additional offers are available in the structured results."
+        )
     return MarketResult(
         search_id=state.search_id,
         status=status,
@@ -396,5 +445,5 @@ def rank_offers(state: MarketSearch, *, now: datetime, config: AIConfig) -> Mark
         unresolved_store_ids=unresolved,
         cheapest_offer_ids=cheapest,
         message=message,
-        speech_text=message,
+        speech_text=speech,
     )

@@ -8,10 +8,11 @@ import asyncio
 from pathlib import Path
 from uuid import uuid4
 
-from shopping_ai import Conversation, Orchestrator, Principal, ShoppingAI
-from shopping_ai.providers.chat import ChatProvider, ChatSettings
-from shopping_ai.providers.speech import SpeechProvider, SpeechSettings
-from shopping_ai.voice import AudioClip, VoiceConversation, VoiceTurn
+from shopping_ai import Principal
+from shopping_ai.providers.chat import ChatSettings
+from shopping_ai.providers.speech import SpeechSettings
+from shopping_ai.runtime import AudioEvent, live_runtime
+from shopping_ai.voice import AudioClip, VoiceTurn
 
 
 def read_audio(source: Path) -> AudioClip:
@@ -31,20 +32,16 @@ async def run(source: Path, output: Path):
     if output.suffix.lower() != "." + settings.output_format:
         raise ValueError("Output extension must match AI_TTS_FORMAT")
     audio = await asyncio.to_thread(read_audio, source)
-    async with ChatProvider(ChatSettings.from_env()) as model, SpeechProvider(settings) as speech:
-        dialogue = Conversation(
-            Orchestrator(ShoppingAI(model)),
-            interpreter=model,
-            detail_interpreter=model,
-        )
+    async with live_runtime(ChatSettings.from_env(), speech=settings) as assistant:
         principal = Principal(owner_id="local-voice-demo", session_id=uuid4().hex)
-        state = dialogue.start(principal).state
-        result = await VoiceConversation(dialogue, speech, speech).respond(
+        state = (await assistant.start(principal)).state
+        output_event = await assistant.handle(
             state,
             principal,
-            VoiceTurn(request_id=uuid4().hex, audio=audio),
+            AudioEvent(turn=VoiceTurn(request_id=uuid4().hex, audio=audio)),
             expected_version=state.version,
         )
+        result = output_event.reply
         print(result.message)
         if result.audio is None:
             raise SystemExit("No audio produced; check configured speech services.")

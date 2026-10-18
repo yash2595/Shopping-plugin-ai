@@ -50,7 +50,14 @@ def test_single_runtime_routes_discovery_navigation_and_verified_cart(now, produ
                 state, principal, event, expected_version=state.version, speak=speak
             )
             reply = output.reply.reply if isinstance(output, VoiceOutput) else output.reply
-            state = reply.state
+            payload = runtime.snapshot(reply.state, principal)
+            state = runtime.restore(
+                payload,
+                principal,
+                conversation_id=reply.state.conversation_id,
+                expected_version=reply.state.version,
+            )
+            assert state == reply.state
             return reply
 
         for index, message in enumerate(
@@ -267,3 +274,64 @@ def test_live_factory_shares_providers_and_closes_on_failure_without_network():
         assert model._closed and audio._closed
 
     asyncio.run(scenario())
+
+
+def test_generic_factory_wires_independent_adapters_without_provider_configuration(
+    now, monkeypatch
+):
+    from shopping_ai.intents import BasicInterpreter
+    from shopping_ai.market_dialogue import OfflineDetailInterpreter
+    from shopping_ai.runtime import create_runtime
+
+    for name in ("AI_CHAT_ENDPOINT", "AI_CHAT_MODEL", "AI_STT_ENDPOINT", "AI_TTS_ENDPOINT"):
+        monkeypatch.delenv(name, raising=False)
+
+    class STTOnly:
+        async def transcribe(self, clip, *, language):
+            return Transcript(text="hi", confidence=0.99)
+
+    class TTSOnly:
+        async def synthesize(self, text, *, language):
+            return AudioClip(format="wav", data=b"fake")
+
+    async def scenario():
+        decisions, intent, detail = MockProvider(), BasicInterpreter(), OfflineDetailInterpreter()
+        stt, tts = STTOnly(), TTSOnly()
+        assistant = create_runtime(
+            decisions,
+            interpreter=intent,
+            detail_interpreter=detail,
+            transcriber=stt,
+            synthesizer=tts,
+            clock=lambda: now,
+        )
+        assert assistant.conversation.orchestrator.ai.provider is decisions
+        assert assistant.conversation.interpreter is intent
+        assert assistant.conversation.detail_interpreter is detail
+        assert assistant.voice.transcriber is stt and assistant.voice.synthesizer is tts
+        principal = Principal(owner_id="owner", session_id="session")
+        started = await assistant.start(principal, speak=True)
+        output = await assistant.handle(
+            started.state,
+            principal,
+            {
+                "kind": "audio",
+                "turn": {"request_id": "voice", "audio": AudioClip(format="webm", data=b"input")},
+            },
+            expected_version=started.state.version,
+        )
+        assert output.reply.status == "complete" and output.state.principal == principal
+
+    asyncio.run(scenario())
+
+
+def test_generic_factory_rejects_partial_speech_and_invalid_roles():
+    from shopping_ai.intents import BasicInterpreter
+    from shopping_ai.market_dialogue import OfflineDetailInterpreter
+    from shopping_ai.runtime import create_runtime
+
+    kwargs = dict(interpreter=BasicInterpreter(), detail_interpreter=OfflineDetailInterpreter())
+    with pytest.raises(ValueError, match="both transcriber and synthesizer"):
+        create_runtime(MockProvider(), **kwargs, transcriber=Speech())
+    with pytest.raises(ValueError, match="implement decide"):
+        create_runtime(object(), **kwargs)

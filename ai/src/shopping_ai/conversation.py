@@ -267,6 +267,13 @@ class Conversation:
             updates["market_display_ids"] = tuple(
                 item.offer.offer_id for item in market_result.ranked
             )
+        speech = (
+            market_result.speech_text
+            if market_result is not None
+            else comparison.speech(state.language)
+            if comparison is not None
+            else text
+        )
         history = (*state.history, Message(role="assistant", text=text[:2000]))[-12:]
         next_state = ConversationState.model_validate(
             state.model_dump() | updates | {"version": state.version + 1, "history": history}
@@ -275,7 +282,7 @@ class Conversation:
             state=next_state,
             status=status,
             message=text,
-            speech_text=text,
+            speech_text=speech,
             action=action,
             navigation=navigation,
             facts=facts,
@@ -379,6 +386,7 @@ class Conversation:
             market,
             now=self.orchestrator.ai.clock(),
             config=self.orchestrator.ai.config,
+            language=state.language,
         )
         return self._reply(
             state,
@@ -409,6 +417,7 @@ class Conversation:
             market,
             now=self.orchestrator.ai.clock(),
             config=self.orchestrator.ai.config,
+            language=state.language,
         )
         return self._reply(
             state,
@@ -616,6 +625,7 @@ class Conversation:
                     state.active_market,
                     now=self.orchestrator.ai.clock(),
                     config=self.orchestrator.ai.config,
+                    language=state.language,
                 )
                 return self._reply(
                     state,
@@ -793,7 +803,10 @@ class Conversation:
                 ),
             )
         result = rank_offers(
-            market, now=self.orchestrator.ai.clock(), config=self.orchestrator.ai.config
+            market,
+            now=self.orchestrator.ai.clock(),
+            config=self.orchestrator.ai.config,
+            language=state.language,
         )
         offer_id = None
         if meaning.reference == "ordinal" and meaning.ordinal <= len(state.market_display_ids):

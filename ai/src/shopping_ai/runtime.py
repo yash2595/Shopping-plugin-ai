@@ -4,12 +4,15 @@ Caller authenticates principals, loads owned state and persists returned checkpo
 with CAS before dispatch/playback. This module never executes browser proposals.
 """
 
+from collections.abc import Callable
 from contextlib import AsyncExitStack, asynccontextmanager
+from datetime import datetime
 from typing import Annotated, Literal
 
 from pydantic import Field, TypeAdapter
 
 from shopping_ai.browser import BrowserResult, BrowserTarget
+from shopping_ai.checkpoint import dump_checkpoint, load_checkpoint
 from shopping_ai.config import AIConfig
 from shopping_ai.conversation import (
     Conversation,
@@ -19,13 +22,16 @@ from shopping_ai.conversation import (
     ConversationTurn,
 )
 from shopping_ai.engine import ShoppingAI
+from shopping_ai.intents import Interpreter
 from shopping_ai.market import SearchReceipt, Store
+from shopping_ai.market_dialogue import DetailInterpreter
 from shopping_ai.models import Contract
 from shopping_ai.navigation import NavigationReceipt
 from shopping_ai.orchestrator import Orchestrator, Principal
+from shopping_ai.providers.base import DecisionProvider
 from shopping_ai.providers.chat import ChatProvider, ChatSettings
 from shopping_ai.providers.speech import SpeechProvider, SpeechSettings
-from shopping_ai.voice import VoiceConversation, VoiceReply, VoiceTurn
+from shopping_ai.voice import Synthesizer, Transcriber, VoiceConversation, VoiceReply, VoiceTurn
 
 
 class TextEvent(Contract):
@@ -117,6 +123,25 @@ class AssistantRuntime:
         self.conversation = conversation
         self.voice = voice
 
+    @staticmethod
+    def snapshot(state: ConversationState, principal: Principal) -> bytes:
+        return dump_checkpoint(state, principal)
+
+    @staticmethod
+    def restore(
+        payload: bytes,
+        principal: Principal,
+        *,
+        conversation_id: str,
+        expected_version: int,
+    ) -> ConversationState:
+        return load_checkpoint(
+            payload,
+            principal,
+            conversation_id=conversation_id,
+            expected_version=expected_version,
+        )
+
     def _require_voice(self) -> VoiceConversation:
         if self.voice is None:
             raise ValueError("VOICE_NOT_CONFIGURED")
@@ -200,6 +225,45 @@ class AssistantRuntime:
         return await self._output(reply, principal, speak)
 
 
+def create_runtime(
+    decisions: DecisionProvider,
+    *,
+    interpreter: Interpreter,
+    detail_interpreter: DetailInterpreter,
+    transcriber: Transcriber | None = None,
+    synthesizer: Synthesizer | None = None,
+    config: AIConfig | None = None,
+    stores: tuple[Store, ...] = (),
+    clock: Callable[[], datetime] | None = None,
+) -> AssistantRuntime:
+    """Wire independent adapters; no vendor selection, env access or resource ownership.
+
+    Injected adapters belong to the caller. Reuse and close them using their own
+    lifecycle. Nothing requires LLM decisions/intent/details or STT/TTS to use the
+    same implementation, model, service or credential.
+    """
+    roles = ((decisions, "decide"), (interpreter, "interpret"), (detail_interpreter, "extract"))
+    if (transcriber is None) != (synthesizer is None):
+        raise ValueError("Configure both transcriber and synthesizer, or neither")
+    if transcriber is not None:
+        roles += ((transcriber, "transcribe"), (synthesizer, "synthesize"))
+    for adapter, method in roles:
+        if not callable(getattr(adapter, method, None)):
+            raise ValueError(f"Adapter must implement {method}")
+    conversation = Conversation(
+        Orchestrator(ShoppingAI(decisions, config, clock=clock)),
+        interpreter=interpreter,
+        detail_interpreter=detail_interpreter,
+        stores=stores,
+    )
+    voice = (
+        VoiceConversation(conversation, transcriber, synthesizer)
+        if transcriber is not None
+        else None
+    )
+    return AssistantRuntime(conversation, voice)
+
+
 @asynccontextmanager
 async def live_runtime(
     chat: ChatSettings,
@@ -216,14 +280,15 @@ async def live_runtime(
     config = config or AIConfig()
     async with AsyncExitStack() as stack:
         model = await stack.enter_async_context(ChatProvider(chat, config))
-        conversation = Conversation(
-            Orchestrator(ShoppingAI(model, config)),
-            interpreter=model,
-            detail_interpreter=model,
-            stores=stores,
-        )
-        voice = None
+        audio = None
         if speech is not None:
             audio = await stack.enter_async_context(SpeechProvider(speech, config))
-            voice = VoiceConversation(conversation, audio, audio)
-        yield AssistantRuntime(conversation, voice)
+        yield create_runtime(
+            model,
+            interpreter=model,
+            detail_interpreter=model,
+            transcriber=audio,
+            synthesizer=audio,
+            config=config,
+            stores=stores,
+        )

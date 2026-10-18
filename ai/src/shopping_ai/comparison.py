@@ -46,6 +46,50 @@ class ComparisonResult(Contract):
             raise ValueError("Equal prices must have zero difference")
         return self
 
+    def speech(self, language: Literal["en", "hi-Latn"]) -> str:
+        hi = language == "hi-Latn"
+        intro = (
+            f"Products {self.left_product_id} aur {self.right_product_id}. "
+            if hi
+            else (f"Products {self.left_product_id} and {self.right_product_id}. ")
+        )
+        if self.price_relation in {"left_lower", "right_lower"}:
+            cheaper = (
+                self.left_product_id
+                if self.price_relation == "left_lower"
+                else self.right_product_id
+            )
+            detail = (
+                f"{cheaper} ka listed price {self.currency} {self.difference:.2f} kam hai. "
+                if hi
+                else f"{cheaper}: listed price is lower by {self.currency} {self.difference:.2f}. "
+            )
+        elif self.price_relation == "equal":
+            detail = (
+                "Observed listed prices same hain. " if hi else "Observed listed prices are equal. "
+            )
+        elif self.price_relation == "different_currency":
+            detail = (
+                "Currencies alag hain; price ranking nahi ki. "
+                if hi
+                else ("Currencies differ; no price ranking was made. ")
+            )
+        else:
+            detail = (
+                "Dono taraf complete price evidence nahi hai. "
+                if hi
+                else ("Price evidence is incomplete. ")
+            )
+        return (
+            intro
+            + detail
+            + (
+                "Delivery aur fees verify nahi hain. Ye overall quality recommendation nahi hai."
+                if hi
+                else "Delivery/fees are unverified. This is not an overall quality recommendation."
+            )
+        )
+
     def render(self, language: Literal["en", "hi-Latn"]) -> str:
         unknown = "unknown" if language == "en" else "data nahi hai"
         shortened = False

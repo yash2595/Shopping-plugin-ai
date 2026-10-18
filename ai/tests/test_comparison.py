@@ -169,7 +169,8 @@ def test_two_product_conversation_comparison_needs_no_model(product, now):
     assert result.status == "complete" and result.action is None
     assert result.comparison.right_product_id == "p2"
     assert "500.00" in result.message
-    assert result.speech_text == result.message
+    assert result.speech_text == result.comparison.speech(result.state.language)
+    assert "500.00" in result.speech_text
 
 
 def test_explicit_reference_pair_preserves_user_order(product, now):
@@ -263,3 +264,14 @@ def test_comparison_is_available_while_an_action_is_pending(product, now):
     assert result.status == "chat" and result.action is None
     assert result.comparison is not None
     assert result.state.active_run.pending.action_id == action_id
+
+
+def test_pair_speech_retains_currency_and_listed_price_limitations(product, now):
+    same = compare(product, second(product), now)
+    spoken = same.speech("hi-Latn")
+    assert "500.00" in spoken and "INR" in spoken
+    assert "listed price" in spoken and "fees verify nahi" in spoken
+    assert len(spoken) < 1000
+    foreign = compare(product, second(product, currency="USD"), now)
+    assert "no price ranking" in foreign.speech("en")
+    assert "lower" not in foreign.speech("en")

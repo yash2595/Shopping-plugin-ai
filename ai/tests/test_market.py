@@ -96,7 +96,8 @@ def test_rank_total_not_advertised_price_and_keep_ties(now):
     assert result.cheapest_offer_ids == ("offer1",)
     assert result.ranked[0].total == Decimal("100")
     assert result.ranked[0].offer.url.endswith("/product/1")
-    assert result.message == result.speech_text
+    assert "+ delivery" not in result.speech_text.lower()
+    assert "verified total" in result.speech_text
 
 
 @pytest.mark.parametrize(
@@ -262,7 +263,8 @@ def test_dialogue_search_plan_to_final_offer_reply(now):
     )
     assert final.status == "complete" and not final.search_tasks
     assert final.market_result.cheapest_offer_ids == ("offer1",)
-    assert final.speech_text == final.message
+    assert final.speech_text == final.market_result.speech_text
+    assert final.speech_text != final.message
     assert len(final.state.history) <= 12
 
 
@@ -503,3 +505,96 @@ def test_timeout_status_cannot_be_injected_as_browser_receipt(now):
     )
     with pytest.raises(ValueError, match="only by expire_search"):
         accept(state, item)
+
+
+def test_hinglish_speech_keeps_partial_coverage_and_discount_limits(now):
+    state = plan(now)
+    state = accept(state, receipt(state, 0, now))
+    result = rank_offers(state, now=now, config=AIConfig(), language="hi-Latn")
+    assert "cheapest confirm nahi hai" in result.speech_text
+    assert "discounts deduct nahi kiye" in result.speech_text
+    assert "complete results nahi mile" in result.speech_text
+    assert not result.cheapest_offer_ids
+    assert "+ delivery" in result.message and "+ delivery" not in result.speech_text
+
+
+def test_many_ties_have_bounded_display_and_speech_without_losing_offers(now):
+    state = plan_search(
+        search_id="many",
+        owner_id="owner1",
+        session_id="session1",
+        identity=identity(),
+        currency="INR",
+        delivery_context="201001",
+        now=now,
+        stores=tuple(
+            Store(
+                store_id=f"store{i}" + "x" * 94,
+                origin=f"https://s{i}.example",
+                search_path="/search",
+                query_parameter="q",
+            )
+            for i in range(6)
+        ),
+    )
+    base = receipt(plan(now), 0, now).offers[0]
+    for site, task in enumerate(state.tasks):
+        offers = tuple(
+            Offer.model_validate(
+                base.model_dump()
+                | {
+                    "offer_id": f"o{site}_{i}",
+                    "snapshot_id": f"s{site}_{i}",
+                    "url": task.store.origin + f"/product/{i}",
+                }
+            )
+            for i in range(20)
+        )
+        state = accept(
+            state,
+            SearchReceipt(
+                search_id=state.search_id,
+                owner_id=state.owner_id,
+                session_id=state.session_id,
+                task_id=task.task_id,
+                delivery_context=state.delivery_context,
+                status="complete",
+                offers=offers,
+            ),
+        )
+    result = rank_offers(state, now=now, config=AIConfig())
+    assert len(result.ranked) == len(result.cheapest_offer_ids) == 120
+    assert len(result.speech_text) < 1500 and len(result.message) < 4096
+    assert "120 offers" in result.speech_text
+    for task in state.tasks:
+        assert result.speech_text.count(task.store.store_id) == 1
+
+
+def test_market_summary_is_the_text_sent_to_speech_adapter(now):
+    from shopping_ai.voice import AudioClip, VoiceConversation
+
+    conversation, principal, state = dialogue(now)
+    reply = begin(conversation, principal, state, now)
+    for index in range(2):
+        reply = conversation.accept_market_receipt(
+            reply.state,
+            principal,
+            receipt(reply.state.active_market, index, now),
+            expected_version=reply.state.version,
+        )
+    spoken = []
+
+    class Speech:
+        async def transcribe(self, clip, *, language):
+            pytest.fail("Speaking an existing reply must not run STT")
+
+        async def synthesize(self, text, *, language):
+            spoken.append(text)
+            return AudioClip(format="wav", data=b"fake")
+
+    speech = Speech()
+    result = asyncio.run(VoiceConversation(conversation, speech, speech).speak(reply, principal))
+    assert result.status == "complete"
+    assert spoken == [reply.market_result.speech_text]
+    assert spoken[0] != reply.message and "https://" not in spoken[0]
+    assert reply.market_result.ranked[0].offer.url.startswith("https://")

@@ -924,3 +924,116 @@ quality measurement, security proof, latency/load benchmark, live ecommerce test
 speech evaluation. Run with the actual chosen model before claiming natural-language
 capability, then expand cases from observed user failures. Real browser and microphone
 acceptance testing still require their respective executor/UI integrations.
+
+### Provider selection can stay undecided
+
+`create_runtime` is the generic, non-networking assembly function. Unlike the
+compatible-HTTP `live_runtime` convenience context, it accepts **independent
+implementations** of every protocol and reads no endpoint/model environment values:
+
+```python
+from shopping_ai.runtime import create_runtime
+
+assistant = create_runtime(
+    decision_adapter,
+    interpreter=intent_adapter,
+    detail_interpreter=detail_adapter,
+    transcriber=stt_adapter,
+    synthesizer=tts_adapter,
+    stores=trusted_store_configs,
+)
+```
+
+One LLM adapter may implement all three model roles, or the roles may use different
+models/services. STT and TTS need not use the same service or SDK. Omit both speech
+adapters for text-only use; supplying only one is rejected. The generic factory
+validates required callable roles, shares one conversation across text/audio and
+receipts, and retains existing bounds/ownership/policy checks. It does not load keys,
+select a vendor, open connections or close injected adapters. The caller owns their
+lifecycle and must isolate adapter-internal state between users.
+
+`live_runtime` now delegates to this same generic factory while retaining ownership
+of the compatible HTTP providers it creates. The offline market example and live
+text/voice smoke scripts also use the common runtime/event path rather than separate
+manual wiring. Custom SDKs need only implement the protocols; their API does not
+have to match Chat Completions or the bundled speech endpoints.
+
+Run `python ai/examples/market_search.py` to exercise the shared integration without
+choosing a vendor or setting any API credentials. Offers remain simulated; this
+command does not search real stores. Provider selection is required only for live
+quality/latency evaluation, not for continuing provider-independent integration.
+
+## Versioned checkpoint save/restore (no database adapter)
+
+The runtime now exposes a bounded, versioned JSON checkpoint codec:
+
+```python
+payload = assistant.snapshot(result.state, authenticated_principal)
+# Future backend writes payload and state.version with owner-scoped SQL/CAS.
+restored = assistant.restore(
+    payload_from_trusted_store,
+    authenticated_principal,
+    conversation_id=owned_row_conversation_id,
+    expected_version=owned_row_version,
+)
+```
+
+Only ConversationState is serialized; provider clients, API keys, sockets and raw
+audio are not part of it. The checkpoint **does contain conversation text, product
+observations and any caller authorization grants**, so store it privately and apply
+backend retention/access controls. It is ordinary JSON, not encrypted or signed.
+Never treat a user-uploaded snapshot as trusted ownership or authorization evidence.
+The backend must authenticate the principal and load the record through an
+owner/session-scoped query before decoding it. The codec does not authenticate you.
+
+Schema version 1 is explicit. Restore checks owner/session, conversation ID and
+expected conversation version; rejects unknown schema versions, duplicate JSON
+keys, invalid/non-finite JSON, extra fields and invalid nested contracts; and returns
+only redacted CheckpointError codes on failure. Both input and output have a 4 MB
+checkpoint budget. This can be narrower than theoretical maxima of every nested
+contract combined; bound/trim observations before saving. If persistence fails,
+retain the old committed state and do not dispatch the candidate's browser work.
+
+Restore preserves request/action/search IDs, timestamps, deadlines, selected product
+and bounded history. It does not make old observations fresh, renew grants, reset
+versions or revive cancelled actions. Existing freshness/lifecycle checks still
+apply. Unsupported schema versions require an explicit migration strategy, not a
+silent upgrade based on caller-supplied data.
+
+This is ready for a future Neon/PostgreSQL adapter but creates no SQL tables,
+database connections, session registry or background writer. Durable CAS and atomic
+outbox/task dispatch remain backend responsibilities. A decoded state passing its
+metadata checks is **not** a distributed lock or anti-replay guarantee by itself.
+The complete simulated runtime flow now saves/restores between events to verify
+that search, navigation and cart checkpoints survive a JSON round-trip. A separate
+test verifies restored navigation keeps its original expiry and still rejects late
+receipts. No live database persistence has been tested.
+
+## Separate display and spoken comparison replies
+
+Cross-store ranking now accepts `language="en"` or `"hi-Latn"`; Conversation passes
+its saved language for receipts, timeout settlement and price follow-ups. Detailed
+`message` retains the price/delivery/fees breakdown. `speech_text` is a shorter,
+deterministic summary derived from the **same calculated evidence**, not an extra
+LLM response. The voice bridge already speaks speech_text, so this is integrated
+without choosing a TTS provider or changing the frontend/backend.
+
+Speech retains checked-store scope, missing coverage, conditional-discount limits,
+lowest verified total and tied-offer count where applicable. Incomplete evidence
+still produces no confirmed cheapest claim. Repeated store IDs are deduplicated
+for presentation while every tied offer/link remains in the structured ranking.
+A maximum-size 120-tied-offer test verifies bounded message/speech length and no
+loss of ranked offers. Speech summaries avoid reading full listing URLs; UI links
+remain available from the structured result.
+
+Saved-product pair comparisons similarly have short speech summaries covering
+listed-price difference/equality/missing/different-currency evidence, unverified
+delivery/fees and absence of an overall quality recommendation. Display rows and
+fact IDs are unchanged. This prevents long comparison tables from being sent
+wholesale to the speech service. Other unusually long replies can still exceed a
+specific TTS service's input limit and preserve their text checkpoint on failure;
+no content is silently truncated or user turn replayed.
+
+Tests verify the generated summary is exactly what reaches the speech adapter.
+This verifies deterministic text integration, not actual pronunciation or audio
+quality; those remain dependent on the eventual selected service.
