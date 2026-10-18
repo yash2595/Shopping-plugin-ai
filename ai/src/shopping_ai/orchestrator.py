@@ -234,11 +234,21 @@ class Orchestrator:
         updates = {"pending": None, "target": result.target}
         if state.status == "cancelled":
             # Preserve observations but never revive the cancelled task.
+            expected = state.cart_expectation
+            reconciled = (
+                result.outcome == "observed"
+                and result.cart is not None
+                and (
+                    expected is not None
+                    and result.cart.quantity_of(expected.product_id, expected.variant_id)
+                    == expected.quantity
+                )
+            )
             return self._change(
                 state,
                 **updates,
                 cart=result.cart or state.cart,
-                recovery_required=state.cart_expectation is not None,
+                recovery_required=state.cart_expectation is not None and not reconciled,
                 pause_code="CANCELLED_RESULT_RECORDED",
             )
         if result.outcome != "observed":

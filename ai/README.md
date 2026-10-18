@@ -1,4 +1,4 @@
-# Standalone shopping AI — v0.2 (local review)
+# Standalone shopping AI
 
 This folder is a real installable Python AI decision package. It runs independently
 of the future FastAPI backend, Neon and Chrome extension. The first milestone is:
@@ -17,6 +17,7 @@ application validation → grounded answer, question, or tool proposal**
 | Real model adapter | Gemini JSON-schema decision generation, timeout, redacted API errors; optional dependency. |
 | Safety boundaries | Unknown tools/arguments/fact IDs rejected; no executable model code or automatic tool execution. |
 | Integration contract | Async `ShoppingAI.decide(AIRequest) -> AIResponse`; no web framework dependency. |
+| Dialogue | Greeting, requirements, product references and speech-ready reply plus action via `Conversation`. |
 
 `ShoppingAI` performs one model decision; `Orchestrator` composes decisions with
 validated extension observations using explicit checkpoints. Persistence, auth,
@@ -108,6 +109,8 @@ src/shopping_ai/
   engine.py         One step, bounded concurrency, timeout and grounded rendering
   browser.py        Visible-execution envelopes and typed browser observations
   orchestrator.py   Owner-bound checkpoint transitions, result checks and recovery
+  intents.py        Generic meaning/requirements contract and conservative offline fallback
+  conversation.py   Owned dialogue checkpoints, follow-ups and reply/action coordination
   cli.py            JSON fixture runner
 examples/           Price/colour, cart proposal, missing product
 tests/              Contract, policy, freshness, errors and mocked SDK tests
@@ -264,3 +267,70 @@ It runs baseline read → proposed cart action → simulated observation → ver
 checkpoint. To integrate later, replace simulated results with the extension's
 observations and persist every transition. Never send a pending action until its
 checkpoint is committed, and never treat an AI proposal as a completed action.
+
+
+## Conversation-first AI (provider-independent)
+
+`Conversation(Orchestrator(ai), interpreter=...)` adds the dialogue above the
+existing decision/action core. It never imports an API SDK, web framework or voice
+provider. `start(principal)` returns the opening greeting without a model call;
+call it only for a new conversation. Restore its saved state on reconnect instead
+of creating another conversation. Existing sessions do not share a global store.
+
+`respond(state, principal, ConversationTurn(...), expected_version=...)` returns a
+`ConversationReply` with the next checkpoint, display `message`, `speech_text`, and
+optional bound browser `action`. Product answers retain their `facts` and source
+snapshot IDs. TTS playback and actual navigation are the
+frontend/executor's job. Persist using CAS **before** delivering a returned action.
+A pending task is not overwritten by a new goal. Fresh read-only product questions
+and greetings can still be answered without dispatching a second action. Stop cancels future dispatch;
+late receipts can still be recorded without restarting that task.
+
+Capabilities in this increment:
+
+- Collect category/budget, retain use case/colour/size when interpreted, and record
+  which user turn supplied each slot. Later values can replace earlier values.
+- Resolve selected/first/second/third/previous products against a bounded stable
+  list. Multiple candidates or unavailable references ask instead of guessing.
+- Explain fresh saved product evidence without unnecessary navigation. A stale
+  product needs a fresh read; mutations also require the current page binding.
+- Return natural progress text **with** a browser action. It says an action is
+  underway, not that it succeeded. Verified cart observations produce completion.
+- Never create mutation grants from extracted slots. Existing trusted grants are
+  checked; a stored budget can only narrow their unit-price ceiling. An explicit
+  colour that conflicts with the authorized variant asks for clarification.
+- Bound history to 12 messages and products to 10; retain 50 recent request IDs to
+  reject immediate turn replay. Backend durable idempotency remains required.
+
+The default `BasicInterpreter` is a deliberately limited, deterministic fallback,
+not general NLU or an LLM. It covers explicit English/Hinglish shopping phrases,
+several categories/colours and INR-style budget amounts (including `2k`). It leaves
+negated, ambiguous and compound goals unclear rather than executing part of them.
+Currency is a caller-provided conversation setting; foreign-currency conversion is
+not performed. Search/discovery, comparison, review synthesis and arbitrary
+navigation are not implemented by this layer; it reports those limitations.
+
+For richer understanding, inject an async `Interpreter` returning a validated
+`Meaning` (intent, requirement patch, selected/previous/ordinal reference). That
+interface is model-neutral; this release adds no provider/API integration.
+Slot extraction is conversational context, not independent proof of user consent.
+The existing backend-grant contract still applies to all mutations.
+
+For action receipts, call `Conversation.accept_result(...)`. If it returns
+`working`, call `Conversation.advance(...)` for the next bounded step. A paused run
+can be resumed with `Conversation.resume(...)` and a fresh trusted target.
+Use `Conversation.expire_pending(...)` when an action receipt never arrives;
+expiry does not imply the website action failed. Never rewrite client checkpoints. Persist each run and
+conversation transition under the same owner with version checks. Ownership
+checks inside these pure objects are not a substitute for backend authentication.
+
+Offline demonstration, with simulated observations only:
+
+```sh
+python ai/examples/conversation.py
+```
+
+It shows greeting → category → budget → product question → reply plus cart read →
+cart proposal → observed completion. It performs no search, browser action, audio
+playback or external API call. Unit tests cover multi-turn slots, ordinal/pronoun
+references, replay, owner separation, action progress and concurrent dialogues.
