@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from shopping_ai.config import AIConfig
-from shopping_ai.models import AIRequest, Fact
+from shopping_ai.models import AIRequest, Fact, ProductSnapshot
 
 PROMPT_VERSION = "shopping_decision_v2"
 SYSTEM_PROMPT = """You are a shopping decision planner, not a browser executor.
@@ -38,34 +38,38 @@ class BuiltContext:
     fresh: bool
 
 
+def product_facts(product: ProductSnapshot) -> tuple[Fact, ...]:
+    """Render normalized observations once for answers and deterministic comparisons."""
+    fields = [("title", product.title)]
+    if product.price is not None:
+        fields.append(("price", f"{product.currency} {product.price:.2f}"))
+    if product.selected_variant_id:
+        label = next(
+            v.label for v in product.variants if v.variant_id == product.selected_variant_id
+        )
+        fields.append(("selected_variant", label))
+    if product.in_stock is not None:
+        fields.append(("stock", "in stock" if product.in_stock else "out of stock"))
+    fields.extend(
+        (f"spec:{i}", f"{key}: {value}") for i, (key, value) in enumerate(product.specs.items())
+    )
+    facts = [
+        Fact(
+            fact_id=f"{product.snapshot_id}.{key}",
+            key=key,
+            value=value,
+            snapshot_id=product.snapshot_id,
+        )
+        for key, value in fields
+    ]
+    return tuple(facts)
+
+
 def build_context(request: AIRequest, config: AIConfig, now: datetime) -> BuiltContext:
     product = request.product
     age = (now - product.observed_at).total_seconds() if product else None
     fresh = age is not None and 0 <= age <= config.max_snapshot_age_seconds
-    facts: list[Fact] = []
-    if product and fresh:
-        fields = [("title", product.title)]
-        if product.price is not None:
-            fields.append(("price", f"{product.currency} {product.price:.2f}"))
-        if product.selected_variant_id:
-            label = next(
-                v.label for v in product.variants if v.variant_id == product.selected_variant_id
-            )
-            fields.append(("selected_variant", label))
-        if product.in_stock is not None:
-            fields.append(("stock", "in stock" if product.in_stock else "out of stock"))
-        fields.extend(
-            (f"spec:{i}", f"{key}: {value}") for i, (key, value) in enumerate(product.specs.items())
-        )
-        facts = [
-            Fact(
-                fact_id=f"{product.snapshot_id}.{key}",
-                key=key,
-                value=value,
-                snapshot_id=product.snapshot_id,
-            )
-            for key, value in fields
-        ]
+    facts = product_facts(product) if product and fresh else ()
     # Never send the entire caller request or credentials to the provider.
     # The models reject arbitrary page fields such as HTML, cookies and passwords.
     data = {

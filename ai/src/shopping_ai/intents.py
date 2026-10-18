@@ -6,7 +6,7 @@ not a general language model, and inferred slots never authorize browser actions
 
 import re
 from decimal import Decimal
-from typing import Literal, Protocol
+from typing import Annotated, Literal, Protocol
 
 from pydantic import Field, model_validator
 
@@ -38,17 +38,31 @@ class Meaning(Contract):
         "select_variant",
         "add_to_cart",
         "compare",
+        "market_search",
         "reviews",
         "unknown",
     ] = "unknown"
     slots: Requirements = Field(default_factory=Requirements)
     reference: Literal["selected", "previous", "ordinal"] = "selected"
     ordinal: int | None = Field(default=None, ge=1, le=10, strict=True)
+    comparison_indices: (
+        tuple[
+            Annotated[int, Field(strict=True, ge=1, le=10)],
+            Annotated[int, Field(strict=True, ge=1, le=10)],
+        ]
+        | None
+    ) = None
 
     @model_validator(mode="after")
     def reference_shape(self):
         if (self.reference == "ordinal") != (self.ordinal is not None):
             raise ValueError("Ordinal reference requires exactly one index")
+        if self.comparison_indices is not None and (
+            self.intent != "compare"
+            or self.reference != "selected"
+            or self.comparison_indices[0] == self.comparison_indices[1]
+        ):
+            raise ValueError("Comparison indices require two distinct explicit products")
         return self
 
 
@@ -66,6 +80,11 @@ class BasicInterpreter:
         # An explicit negation must never become a cart or variant command.
         if re.search(r"\b(mat|nahi|nahin|don't|dont|not)\b", text):
             return Meaning()
+        # Cross-store requests must not fall back to comparing saved products.
+        if re.search(
+            r"\b(across|websites|website|stores|sites|amazon|flipkart|ecommerce)\b", text
+        ) and re.search(r"\b(compare|comparison|search|find|cheapest|sasta|sasti)\b", text):
+            return Meaning(intent="market_search")
         slots = {}
         for words, category in [
             (("earbuds", "earphones"), "earbuds"),
@@ -99,21 +118,41 @@ class BasicInterpreter:
                 amount = Decimal(value.rstrip("kK")) * (1000 if value.endswith(("k", "K")) else 1)
                 if 0 < amount <= Decimal("999999999999.99") and amount.as_tuple().exponent >= -2:
                     slots["budget"] = amount
-        reference, ordinal = "selected", None
-        for words, index in [
-            (("first", "pehla", "pehle", "1st"), 1),
-            (("second", "dusra", "dusre", "2nd"), 2),
-            (("third", "teesra", "teesre", "3rd"), 3),
-        ]:
-            if any(re.search(rf"\b{word}\b", text) for word in words):
-                if ordinal is not None:
-                    return Meaning()  # Do not choose one of conflicting references.
-                reference, ordinal = "ordinal", index
+        is_compare = bool(
+            re.search(r"\b(compare|comparison|better|cheaper|cheapest|sasta|sasti)\b", text)
+        )
+        ordinal_words = {
+            "first": 1,
+            "pehla": 1,
+            "pehle": 1,
+            "1st": 1,
+            "second": 2,
+            "dusra": 2,
+            "dusre": 2,
+            "2nd": 2,
+            "third": 3,
+            "teesra": 3,
+            "teesre": 3,
+            "3rd": 3,
+        }
+        indices = list(
+            dict.fromkeys(
+                ordinal_words[m.group()]
+                for m in re.finditer(r"\b(?:" + "|".join(ordinal_words) + r")\b", text)
+            )
+        )
+        reference, ordinal, comparison_indices = "selected", None, None
+        if len(indices) > 1:
+            if not is_compare or len(indices) != 2:
+                return Meaning()
+            comparison_indices = tuple(indices)
+        elif indices:
+            reference, ordinal = "ordinal", indices[0]
         if re.search(r"\b(previous|pichla|pichle)\b", text):
-            if ordinal is not None:
+            if indices:
                 return Meaning()
             reference = "previous"
-        if re.search(r"\b(compare|comparison|better)\b", text):
+        if is_compare:
             intent = "compare"
         elif re.search(r"\b(review|reviews|complaints)\b", text):
             intent = "reviews"
@@ -137,4 +176,5 @@ class BasicInterpreter:
             slots=Requirements.model_validate(slots),
             reference=reference,
             ordinal=ordinal,
+            comparison_indices=comparison_indices,
         )

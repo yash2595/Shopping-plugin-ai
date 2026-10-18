@@ -11,7 +11,25 @@ from uuid import uuid4
 from pydantic import Field, model_validator
 
 from shopping_ai.browser import BrowserAction, BrowserResult, BrowserTarget
+from shopping_ai.comparison import ComparisonError, ComparisonResult, compare_products
 from shopping_ai.intents import BasicInterpreter, Interpreter, Meaning, Requirements, SlotName
+from shopping_ai.market import (
+    MarketResult,
+    MarketSearch,
+    ProductIdentity,
+    SearchReceipt,
+    SearchTask,
+    Store,
+    accept_search_receipt,
+    plan_search,
+    rank_offers,
+)
+from shopping_ai.market_dialogue import (
+    DetailInterpreter,
+    MarketDraft,
+    OfflineDetailInterpreter,
+    validate_detail_proposal,
+)
 from shopping_ai.models import (
     AIRequest,
     Contract,
@@ -60,6 +78,8 @@ class ConversationState(Contract):
     history: tuple[Message, ...] = Field(default_factory=tuple, max_length=12)
     recent_request_ids: tuple[Identifier, ...] = Field(default_factory=tuple, max_length=50)
     active_run: RunState | None = None
+    active_market: MarketSearch | None = None
+    market_draft: MarketDraft | None = None
 
     @model_validator(mode="after")
     def coherent_context(self) -> Self:
@@ -70,6 +90,12 @@ class ConversationState(Contract):
             raise ValueError("Selected and previous products must exist in context")
         if self.active_run and self.active_run.principal != self.principal:
             raise ValueError("Active run belongs to another principal")
+        if self.active_market and (
+            (self.active_market.owner_id, self.active_market.session_id)
+            != (self.principal.owner_id, self.principal.session_id)
+            or self.active_market.currency != self.currency
+        ):
+            raise ValueError("Market search must belong to this principal and currency")
         return self
 
 
@@ -90,9 +116,41 @@ class ConversationReply(Contract):
     speech_text: Annotated[str, Field(min_length=1, max_length=8000)]
     action: BrowserAction | None = None
     facts: tuple[Fact, ...] = Field(default_factory=tuple, max_length=10)
+    comparison: ComparisonResult | None = None
+    search_tasks: tuple[SearchTask, ...] = Field(default_factory=tuple, max_length=6)
+    market_result: MarketResult | None = None
 
     @model_validator(mode="after")
     def action_binding(self) -> Self:
+        market = self.state.active_market
+        if self.search_tasks and (
+            self.status != "ready_for_search"
+            or market is None
+            or self.search_tasks != market.tasks
+            or market.receipts
+        ):
+            raise ValueError("Search tasks must be the new owned market plan")
+        if self.market_result and (
+            market is None or self.market_result.search_id != market.search_id
+        ):
+            raise ValueError("Market result must belong to the active search")
+        if self.action and self.search_tasks:
+            raise ValueError("Cannot dispatch cart and search work together")
+        if self.comparison:
+            ids = {p.product_id for p in self.state.products}
+            snapshots = {p.snapshot_id for p in self.state.products}
+            refs = (
+                fact.snapshot_id
+                for row in self.comparison.rows
+                for fact in (row.left, row.right)
+                if fact
+            )
+            if (
+                self.status not in {"chat", "complete"}
+                or not {self.comparison.left_product_id, self.comparison.right_product_id} <= ids
+                or any(ref not in snapshots for ref in refs)
+            ):
+                raise ValueError("Comparison must refer to this conversation's evidence")
         if self.facts:
             snapshots = {p.snapshot_id for p in self.state.products}
             if self.status not in {"chat", "complete"} or any(
@@ -113,9 +171,25 @@ class ConversationError(ValueError):
 
 
 class Conversation:
-    def __init__(self, orchestrator: Orchestrator, interpreter: Interpreter | None = None):
+    def __init__(
+        self,
+        orchestrator: Orchestrator,
+        interpreter: Interpreter | None = None,
+        *,
+        stores: tuple[Store, ...] = (),
+        detail_interpreter: DetailInterpreter | None = None,
+    ):
         self.orchestrator = orchestrator
         self.interpreter = interpreter or BasicInterpreter()
+        self.detail_interpreter = detail_interpreter or OfflineDetailInterpreter()
+        self._detail_capacity = asyncio.Semaphore(orchestrator.ai.config.max_concurrent_calls)
+        self.stores = tuple(Store.model_validate(store.model_dump()) for store in stores)
+        if self.stores and (
+            not 2 <= len(self.stores) <= 6
+            or len({store.store_id for store in self.stores}) != len(self.stores)
+            or len({store.origin for store in self.stores}) != len(self.stores)
+        ):
+            raise ValueError("Configure 2-6 distinct supported stores")
 
     @staticmethod
     def _check(state: ConversationState, principal: Principal, version: int) -> ConversationState:
@@ -138,6 +212,9 @@ class Conversation:
         *,
         action: BrowserAction | None = None,
         facts: tuple[Fact, ...] = (),
+        comparison: ComparisonResult | None = None,
+        search_tasks: tuple[SearchTask, ...] = (),
+        market_result: MarketResult | None = None,
         **updates,
     ) -> ConversationReply:
         history = (*state.history, Message(role="assistant", text=text[:2000]))[-12:]
@@ -151,6 +228,9 @@ class Conversation:
             speech_text=text,
             action=action,
             facts=facts,
+            comparison=comparison,
+            search_tasks=search_tasks,
+            market_result=market_result,
         )
 
     def start(
@@ -171,6 +251,84 @@ class Conversation:
                 "Hello! What would you like to shop for today?",
                 "Namaste! Aaj kya shopping karni hai?",
             ),
+        )
+
+    def begin_market_search(
+        self,
+        state: ConversationState,
+        principal: Principal,
+        *,
+        identity: ProductIdentity,
+        delivery_context: str,
+        stores: tuple[Store, ...],
+        expected_version: int,
+    ) -> ConversationReply:
+        """Start only after the caller has clarified and confirmed exact identity.
+
+        Store configurations come from the trusted adapter, not a user/model URL.
+        Persist the returned checkpoint with CAS before dispatching search_tasks.
+        """
+        state = self._check(state, principal, expected_version)
+        run = state.active_run
+        if run and (run.pending or run.recovery_required or run.status in {"ready", "paused"}):
+            raise ConversationError("ACTIVE_BROWSER_TASK")
+        if state.active_market and len(state.active_market.receipts) < len(
+            state.active_market.tasks
+        ):
+            raise ConversationError("ACTIVE_MARKET_SEARCH")
+        market = plan_search(
+            search_id=uuid4().hex,
+            owner_id=principal.owner_id,
+            session_id=principal.session_id,
+            identity=identity,
+            currency=state.currency,
+            delivery_context=delivery_context,
+            stores=stores,
+            now=self.orchestrator.ai.clock(),
+        )
+        return self._reply(
+            state,
+            "ready_for_search",
+            self._text(
+                state,
+                "Search plan ready. The browser adapter must now check the configured stores.",
+                "Search plan taiyar hai. Browser adapter ab configured stores check karega.",
+            ),
+            active_market=market,
+            market_draft=None,
+            awaiting=None,
+            search_tasks=market.tasks,
+        )
+
+    def accept_market_receipt(
+        self,
+        state: ConversationState,
+        principal: Principal,
+        receipt: SearchReceipt,
+        *,
+        expected_version: int,
+    ) -> ConversationReply:
+        state = self._check(state, principal, expected_version)
+        if state.active_market is None:
+            raise ConversationError("NO_ACTIVE_MARKET_SEARCH")
+        market = accept_search_receipt(
+            state.active_market,
+            receipt,
+            owner_id=principal.owner_id,
+            session_id=principal.session_id,
+            expected_version=state.active_market.version,
+        )
+        result = rank_offers(
+            market,
+            now=self.orchestrator.ai.clock(),
+            config=self.orchestrator.ai.config,
+        )
+        return self._reply(
+            state,
+            "working" if result.status == "searching" else "complete",
+            result.message,
+            active_market=market,
+            market_result=result,
         )
 
     async def respond(
@@ -205,12 +363,20 @@ class Conversation:
                     "Rok diya. Agar action pehle chal chuka hai toh uska result check karna hoga.",
                 ),
                 active_run=run,
+                active_market=None,
+                market_draft=None,
             )
         busy = state.active_run is not None and (
             state.active_run.pending is not None
             or state.active_run.recovery_required
             or state.active_run.status in {"ready", "paused"}
         )
+        busy = busy or (
+            state.active_market is not None
+            and len(state.active_market.receipts) < len(state.active_market.tasks)
+        )
+        if state.market_draft is not None and not busy:
+            return await self._collect_market_details(state, turn.message)
         try:
             async with asyncio.timeout(self.orchestrator.ai.config.timeout_seconds):
                 raw = await self.interpreter.interpret(turn.message, state.awaiting)
@@ -235,7 +401,7 @@ class Conversation:
                     "Product details ya variant/cart action mein help chahiye?",
                 ),
             )
-        if busy and meaning.intent != "product_question":
+        if busy and meaning.intent not in {"product_question", "compare"}:
             return self._reply(
                 state,
                 "paused",
@@ -297,6 +463,30 @@ class Conversation:
                     "previous_id": state.previous_id if state.previous_id in ids else None,
                 }
             )
+        if meaning.intent == "market_search":
+            draft = MarketDraft()
+            state = ConversationState.model_validate(
+                state.model_dump() | {"market_draft": draft, "awaiting": None}
+            )
+            return await self._collect_market_details(state, turn.message, initial=True)
+        if meaning.intent == "compare":
+            if (
+                state.active_market is not None
+                and meaning.reference == "selected"
+                and meaning.comparison_indices is None
+            ):
+                result = rank_offers(
+                    state.active_market,
+                    now=self.orchestrator.ai.clock(),
+                    config=self.orchestrator.ai.config,
+                )
+                return self._reply(
+                    state,
+                    "working" if result.status == "searching" else "complete",
+                    result.message,
+                    market_result=result,
+                )
+            return self._compare(state, meaning, busy=busy)
         selected = state.selected_id
         if meaning.reference == "ordinal":
             selected = (
@@ -344,14 +534,14 @@ class Conversation:
                 "previous_id": previous,
             }
         )
-        if meaning.intent in {"compare", "reviews"}:
+        if meaning.intent == "reviews":
             return self._reply(
                 state,
                 "needs_input",
                 self._text(
                     state,
-                    "Comparison/review evidence is not supported yet.",
-                    "Comparison/review evidence support abhi baaki hai.",
+                    "Review evidence is not supported yet.",
+                    "Review evidence support abhi baaki hai.",
                 ),
             )
         product = next(p for p in state.products if p.product_id == selected)
@@ -447,6 +637,150 @@ class Conversation:
         run = self.orchestrator.start(principal, request, target)
         run = await self.orchestrator.advance(run, principal, expected_version=run.version)
         return self._run_reply(state, run)
+
+    async def _collect_market_details(
+        self,
+        state: ConversationState,
+        message: str,
+        *,
+        initial: bool = False,
+    ) -> ConversationReply:
+        draft = state.market_draft
+        if message.strip().casefold() in {"confirm", "haan confirm", "yes confirm"}:
+            if draft.missing:
+                return self._reply(state, "needs_input", draft.prompt(state.language))
+            if not self.stores:
+                return self._reply(
+                    state,
+                    "needs_input",
+                    self._text(
+                        state,
+                        "Details are complete, but supported store adapters are not configured. "
+                        "No websites have been searched.",
+                        "Details complete hain, lekin store adapters configure nahi hain. "
+                        "Koi website search nahi hui hai.",
+                    ),
+                )
+            return self.begin_market_search(
+                state,
+                state.principal,
+                identity=draft.identity(),
+                delivery_context=draft.postcode,
+                stores=self.stores,
+                expected_version=state.version,
+            )
+        config = self.orchestrator.ai.config
+        try:
+            async with asyncio.timeout(config.capacity_wait_seconds):
+                await self._detail_capacity.acquire()
+        except TimeoutError:
+            return self._reply(
+                state,
+                "error",
+                self._text(
+                    state,
+                    "Detail understanding is busy. Please retry.",
+                    "Details samajhne ki capacity busy hai. Dobara try karo.",
+                ),
+            )
+        try:
+            # Drafts contain mutable maps despite frozen contracts. Never expose
+            # the saved checkpoint or validation baseline to an async adapter.
+            private = MarketDraft.model_validate(draft.model_dump())
+            async with asyncio.timeout(config.timeout_seconds):
+                raw = await self.detail_interpreter.extract(message, private)
+            draft = validate_detail_proposal(draft, raw, message)
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            return self._reply(
+                state,
+                "error",
+                self._text(
+                    state,
+                    "Detail understanding timed out. Please retry.",
+                    "Details samajhne mein timeout hua. Dobara try karo.",
+                ),
+            )
+        except Exception:
+            return self._reply(
+                state,
+                "needs_input",
+                (
+                    ""
+                    if initial
+                    else self._text(
+                        state,
+                        "I could not safely read that detail. ",
+                        "Ye detail clear nahi hui. ",
+                    )
+                )
+                + draft.prompt(state.language),
+            )
+        finally:
+            self._detail_capacity.release()
+        return self._reply(
+            state,
+            "needs_input",
+            draft.prompt(state.language),
+            market_draft=draft,
+        )
+
+    def _compare(
+        self, state: ConversationState, meaning: Meaning, *, busy: bool
+    ) -> ConversationReply:
+        products = {p.product_id: p for p in state.products}
+        pair = None
+        if meaning.comparison_indices:
+            left_index, right_index = meaning.comparison_indices
+            if max(left_index, right_index) <= len(state.products):
+                pair = (state.products[left_index - 1], state.products[right_index - 1])
+        elif state.selected_id:
+            other = None
+            if meaning.reference == "previous":
+                other = state.previous_id
+            elif meaning.reference == "ordinal" and meaning.ordinal <= len(state.products):
+                other = state.products[meaning.ordinal - 1].product_id
+            elif meaning.reference == "selected":
+                other = state.previous_id or (
+                    next((key for key in products if key != state.selected_id), None)
+                    if len(products) == 2
+                    else None
+                )
+            if other and other != state.selected_id:
+                pair = (products[state.selected_id], products[other])
+        elif len(products) == 2 and meaning.reference == "selected":
+            pair = tuple(state.products)
+        if pair is None:
+            return self._reply(
+                state,
+                "needs_input",
+                self._text(
+                    state,
+                    "Which two products should I compare? Select them from the visible list.",
+                    "Kaunse do products compare karne hain? Visible list se choose karo.",
+                ),
+            )
+        try:
+            comparison = compare_products(
+                *pair, now=self.orchestrator.ai.clock(), config=self.orchestrator.ai.config
+            )
+        except ComparisonError as exc:
+            return self._reply(
+                state,
+                "needs_input",
+                self._text(
+                    state,
+                    f"Fresh, distinct product evidence is needed ({exc}).",
+                    f"Fresh aur distinct product evidence chahiye ({exc}).",
+                ),
+            )
+        return self._reply(
+            state,
+            "chat" if busy else "complete",
+            comparison.render(state.language),
+            comparison=comparison,
+        )
 
     def _run_reply(self, state: ConversationState, run: RunState) -> ConversationReply:
         if run.pending:

@@ -77,6 +77,24 @@ async def main():
             )
         print("Assistant:", reply.message)
 
+    other = ProductSnapshot.model_validate(
+        product.model_dump()
+        | {
+            "product_id": "earbuds_99",
+            "snapshot_id": "comparison_snapshot",
+            "document_id": "doc_2",
+            "title": "Second Demo Earbuds",
+            "price": "1299.00",
+        }
+    )
+    turn = ConversationTurn(
+        request_id="compare_turn", message="Compare first and second", products=(product, other)
+    )
+    reply = await dialogue.respond(
+        reply.state, principal, turn, expected_version=reply.state.version
+    )
+    print("Simulated evidence comparison:", reply.message)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

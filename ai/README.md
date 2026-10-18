@@ -21,8 +21,8 @@ application validation → grounded answer, question, or tool proposal**
 
 `ShoppingAI` performs one model decision; `Orchestrator` composes decisions with
 validated extension observations using explicit checkpoints. Persistence, auth,
-Neon, real browser execution and voice are not connected. Review summaries,
-comparison and free-form conversational answers remain later AI milestones.
+Neon, real browser execution and voice are not connected. Review synthesis and
+free-form conversational answers remain later AI milestones.
 Answer values are grounded in supplied observations, not independently verified
 retailer claims. Source facts themselves can be incorrect or contain hostile text.
 They must be rendered as text, never HTML. Fact selection can still be irrelevant;
@@ -111,6 +111,7 @@ src/shopping_ai/
   orchestrator.py   Owner-bound checkpoint transitions, result checks and recovery
   intents.py        Generic meaning/requirements contract and conservative offline fallback
   conversation.py   Owned dialogue checkpoints, follow-ups and reply/action coordination
+  comparison.py     Deterministic comparison of fresh normalized product evidence
   cli.py            JSON fixture runner
 examples/           Price/colour, cart proposal, missing product
 tests/              Contract, policy, freshness, errors and mocked SDK tests
@@ -307,7 +308,7 @@ not general NLU or an LLM. It covers explicit English/Hinglish shopping phrases,
 several categories/colours and INR-style budget amounts (including `2k`). It leaves
 negated, ambiguous and compound goals unclear rather than executing part of them.
 Currency is a caller-provided conversation setting; foreign-currency conversion is
-not performed. Search/discovery, comparison, review synthesis and arbitrary
+not performed. Search/discovery, review synthesis and arbitrary
 navigation are not implemented by this layer; it reports those limitations.
 
 For richer understanding, inject an async `Interpreter` returning a validated
@@ -334,3 +335,172 @@ It shows greeting → category → budget → product question → reply plus ca
 cart proposal → observed completion. It performs no search, browser action, audio
 playback or external API call. Unit tests cover multi-turn slots, ordinal/pronoun
 references, replay, owner separation, action progress and concurrent dialogues.
+
+
+## Grounded product comparison
+
+Dialogue now supports “compare”, “kaunsa sasta hai?”, “previous vs selected” and
+explicit first/second/third pairs against saved products. With exactly two products,
+a generic comparison can use both; larger ambiguous sets ask for an explicit pair.
+Comparing never changes the selected product or dispatches a browser action. It
+can answer from fresh evidence while another task is pending.
+
+`ConversationReply.comparison` contains at most eight rows with separate left/right
+`Fact` records and snapshot IDs. Price differences use Decimal only when both
+prices and currencies match. Missing values stay unknown; differing currencies
+produce no conversion, cheapest-product claim or calculated difference. Stale,
+future, same-product and ambiguous snapshot observations are rejected.
+
+Specification labels are matched conservatively by whitespace/case; values and
+units are retained as observed. No inference that “30 hours” equals “1800 minutes”
+or that a bigger number makes a better product is made. Duplicate ambiguous labels
+are omitted. Long display text can be shortened with an explicit note; the full
+source values remain in structured rows. Prices are observed listed prices, not
+checkout totals, historical bargains, stock guarantees or overall quality scores.
+
+The pure `compare_products(left, right, now=..., config=...)` function is also
+available for a future adapter. It performs no model/API call, storage operation
+or currency lookup. The caller must supply owned, normalized observations. Fresh
+here means within the configured observation window, not independently rechecked
+with the retailer.
+
+`python ai/examples/conversation.py` includes an offline comparison after the
+simulated cart flow. The fixtures are demonstration data, not real product offers.
+
+## Cross-website cheapest-offer search
+
+The main price-comparison use case is the **same exact product across multiple
+stores**. Saved-product side-by-side comparison above remains a separate helper;
+it does not perform this search. Explicit cross-website dialogue requests now ask
+for brand/model, exact variant and delivery postcode, and disclose that the browser
+adapter is not connected. They cannot silently return the two saved products.
+
+`shopping_ai.market` supplies the provider-independent AI workflow:
+
+1. Resolve a `ProductIdentity`: brand, exact model, condition and **all relevant
+   variant attributes** (storage/RAM/colour/size/pack count/region as applicable).
+   A normalizer/interpreter must ask when uncertain; never use title similarity
+   as proof that two products match. This module does not infer identity from HTML.
+2. The authenticated caller passes 2–6 trusted `Store` adapter configurations and
+   the delivery context to `plan_search`. It returns bounded `SearchTask` records
+   with encoded HTTPS search URLs and visible execution required. These are
+   requests for the future extension adapter, not executed browser actions.
+3. Persist the owned search checkpoint, then have the extension open/search the
+   configured stores in visible Chrome tabs. The adapter must enforce its own
+   allowlist on redirects, observe the exact listing/variant/seller and obtain
+   costs for the supplied postcode. No CAPTCHA bypass or hidden fallback exists.
+4. Normalize observed evidence into `SearchReceipt` / `Offer`. Only the trusted
+   adapter may provide receipts; website text and model output are not trusted
+   proof of identity, ownership or costs. The backend must validate the actual
+   authenticated principal and bind adapter receipts to the issued task.
+5. `accept_search_receipt` checks owner/session/search/task/version, delivery
+   context, exact store origin, duplicate receipts and duplicate offer evidence.
+   Persist its returned state with **database compare-and-swap** before using it.
+   In-process version checks alone do not prevent concurrent database writes.
+6. `rank_offers` includes fresh in-stock exact matches in the requested currency.
+   Total = listed price + observed shipping + observed extra tax/fees. Use zero
+   only when explicitly observed free/included; unknown costs stay `None`.
+   Conditional bank/member/coupon discounts are retained as notes, never deducted.
+7. Show structured ranked offers, seller, listing links, evidence timestamps and
+   exclusions. `message` / `speech_text` support future UI/TTS integration. Equal
+   cheapest totals retain all ties. While a store is pending/failed/blocked or a
+   potentially competing offer has uncertain evidence, there is no confirmed
+   cheapest claim. Complete results mean lowest observed total **among checked
+   stores and returned offers**, never a guarantee across the entire internet.
+
+`python ai/examples/market_search.py` runs a fully offline demonstration: the lower
+listed price loses after shipping is included. No browser, network, LLM, database,
+frontend or backend integration is included. Store extraction adapters, automatic
+identity resolution and persisted execution scheduling remain integration work.
+Do not expose the pure checkpoint helpers as unauthenticated APIs. Preserve the
+state/receipts per user; there is no shared mutable registry in this module.
+
+### Conversation adapter contract
+
+After clarifying/confirming exact identity, call
+`Conversation.begin_market_search(state, principal, identity=..., delivery_context=...,
+stores=..., expected_version=state.version)`. The result contains the owned
+checkpoint in `reply.state.active_market` and the initial tasks in
+`reply.search_tasks`. Persist using conversation-version CAS **before** scheduling
+those tasks. Re-delivering an old reply must not enqueue its tasks twice; the
+adapter should use `(search_id, task_id)` as the durable dispatch key.
+
+Feed each normalized browser receipt to `Conversation.accept_market_receipt` with
+the current conversation version. Intermediate replies are `working`; after all
+stores have replied, the conversation reply is `complete`, while
+`reply.market_result.status` distinguishes complete evidence from partial coverage.
+Progress/final replies never redispatch search tasks. The final structured result
+contains ranked offers and listing links; message/speech text includes a bounded
+price breakdown. A higher price before shipping can legitimately be the winner.
+
+An unfinished search prevents a new search or cart/variant task from replacing it.
+Product questions from saved evidence remain allowed. A `stop` turn clears the
+active market checkpoint; its late receipts are rejected. The executor must also
+cancel queued browser work when it receives stop—clearing an AI checkpoint alone
+does not stop actions already running in Chrome. A replacement search has a new ID
+and rejects receipts from earlier searches. Never derive principal IDs from the
+user's spoken message. No STT/TTS client or live store adapter is implemented here.
+
+### Collect and confirm exact search details
+
+Configure `Conversation(..., stores=(...))` with trusted supported-store adapters.
+A cross-store request starts an owned `MarketDraft`. Through normal `respond`
+turns, the offline fallback asks for brand, exact model, all variant attributes,
+condition (new/used/refurbished), and a six-digit Indian delivery postcode.
+It accepts direct answers to the current question or explicit labelled updates:
+
+```text
+brand: Example; model: Phone One; attributes: storage=128GB,colour=black; condition: new; postcode: 201001
+```
+
+The completed draft is shown back to the user. Only a separate exact `confirm`,
+`yes confirm` or `haan confirm` turn creates a search plan. Corrections update the
+summary and require confirmation again. Early confirmation, ambiguous duplicate
+labels, invalid postcodes or malformed variant details produce another question;
+invalid input preserves the existing draft. `stop` clears the draft. No configured
+stores means no search plan, even after confirmation. Search confirmation permits
+only this read-only search, never a cart update or purchase.
+
+This is deliberately a conservative **offline fallback**, not general free-form
+product understanding. It does not extract “Samsung S24 128GB” into reliable model
+and variant fields, infer which variant dimensions a catalogue requires, validate
+that a model actually exists, or invent omitted details. The user must explicitly
+supply and confirm all relevant distinctions; a future catalogue/NLU adapter can
+resolve those before using `begin_market_search`. Attribute corrections replace
+the entire attribute map, so the summary must include every desired distinction.
+Current postcode collection is India-specific; generic `plan_search` still accepts
+an adapter-supplied delivery context. `market_search.py` now demonstrates dialogue
+collection → confirmation → simulated browser receipts → final ranked offers.
+
+### Model-independent detail interpreter
+
+Inject `detail_interpreter=` into `Conversation` to replace the conservative
+collector through the async `DetailInterpreter.extract(message, draft)` protocol.
+It returns a schema-validated **complete proposed `MarketDraft`**, not browser
+commands. This is an integration interface; no paid API or production NLU adapter
+is bundled. `OfflineDetailInterpreter` remains the default.
+
+The first cross-store request is passed to this interpreter too, allowing an
+injected adapter to extract several explicit details from one natural sentence.
+Changed values must occur literally in the current user message (case and
+whitespace normalization only). Invented model/variant/postcode values, clearing
+known scalar fields, and silently dropping variant requirements are rejected.
+Existing unchanged details may be retained. Replacing/removing attributes requires
+explicit `attributes:` / `replace` / `reset` wording. The final summary still needs
+a separate user confirmation; source occurrence alone does not establish product
+existence, semantic correctness or user intent, and does not defeat every prompt
+injection. The adapter must treat user text as data and preserve unknown fields.
+
+Only a private draft copy is passed to the interpreter. Calls have bounded
+concurrency, capacity wait and execution timeout using AIConfig limits; provider
+failure text is never reflected to the user. Cancellation releases the capacity
+permit and propagates. The limit applies per Conversation instance/process, so
+reuse instances and add distributed admission control in a future multi-worker
+backend. Interpreter implementations must be stateless across users or isolate
+their own per-request context. No keys, principals or browser sessions are sent by
+this interface.
+
+After a market search, a generic “kaunsa sasta hai?” / “cheapest” follow-up reranks
+its saved observations with the **current clock** and never redispatches search
+tasks. Expired prices lose their cheapest claim. Explicit ordinal/previous product
+references continue to use saved-product comparison instead.

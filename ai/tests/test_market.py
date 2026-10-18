@@ -1,0 +1,370 @@
+import asyncio
+from datetime import timedelta
+from decimal import Decimal
+
+import pytest
+
+from shopping_ai.config import AIConfig
+from shopping_ai.intents import BasicInterpreter
+from shopping_ai.market import (
+    Offer,
+    ProductIdentity,
+    SearchReceipt,
+    Store,
+    accept_search_receipt,
+    plan_search,
+    rank_offers,
+)
+
+
+def identity(**updates):
+    return ProductIdentity.model_validate(
+        dict(brand="Example", model="Phone 1", attributes={"storage": "128GB", "colour": "black"})
+        | updates
+    )
+
+
+def plan(now):
+    return plan_search(
+        search_id="search1",
+        owner_id="owner1",
+        session_id="session1",
+        identity=identity(),
+        currency="INR",
+        delivery_context="201001",
+        now=now,
+        stores=tuple(
+            Store(
+                store_id=name,
+                origin=f"https://{name}.example",
+                search_path="/search",
+                query_parameter="q",
+            )
+            for name in ("a", "b")
+        ),
+    )
+
+
+def receipt(state, index, now, **updates):
+    data = dict(
+        offer_id=f"offer{index}",
+        snapshot_id=f"snap{index}",
+        identity=identity(),
+        url=f"https://{'a' if index == 0 else 'b'}.example/product/1",
+        seller="Seller",
+        observed_at=now,
+        in_stock=True,
+        price="100.00",
+        currency="INR",
+        shipping="0",
+        extra_tax_and_fees="0",
+    )
+    return SearchReceipt(
+        search_id=state.search_id,
+        owner_id=state.owner_id,
+        session_id=state.session_id,
+        task_id=state.tasks[index].task_id,
+        delivery_context=state.delivery_context,
+        status="complete",
+        offers=(Offer.model_validate(data | updates),),
+    )
+
+
+def accept(state, item, **updates):
+    return accept_search_receipt(
+        state,
+        item,
+        **(
+            dict(
+                owner_id=state.owner_id,
+                session_id=state.session_id,
+                expected_version=state.version,
+            )
+            | updates
+        ),
+    )
+
+
+def test_rank_total_not_advertised_price_and_keep_ties(now):
+    state = plan(now)
+    state = accept(state, receipt(state, 0, now, price="80", shipping="30"))
+    assert not rank_offers(state, now=now, config=AIConfig()).cheapest_offer_ids
+    state = accept(state, receipt(state, 1, now, price="100"))
+    result = rank_offers(state, now=now, config=AIConfig())
+    assert result.status == "complete"
+    assert result.cheapest_offer_ids == ("offer1",)
+    assert result.ranked[0].total == Decimal("100")
+    assert result.ranked[0].offer.url.endswith("/product/1")
+    assert result.message == result.speech_text
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"shipping": None},
+        {"extra_tax_and_fees": None},
+        {"in_stock": None},
+        {"observed_at": "2020-01-01T00:00:00Z"},
+        {"currency": "USD"},
+    ],
+)
+def test_unknown_competitor_prevents_cheapest_claim(now, updates):
+    state = plan(now)
+    state = accept(state, receipt(state, 0, now, **updates))
+    state = accept(state, receipt(state, 1, now))
+    result = rank_offers(state, now=now, config=AIConfig())
+    assert result.status == "partial"
+    assert not result.cheapest_offer_ids
+
+
+def test_wrong_variant_and_out_of_stock_do_not_win(now):
+    for updates in (
+        {"identity": identity(attributes={"storage": "256GB", "colour": "black"})},
+        {"in_stock": False},
+    ):
+        state = plan(now)
+        state = accept(state, receipt(state, 0, now, price="1", **updates))
+        state = accept(state, receipt(state, 1, now))
+        result = rank_offers(state, now=now, config=AIConfig())
+        assert result.cheapest_offer_ids == ("offer1",)
+        assert result.excluded_offer_ids == ("offer0",)
+
+
+def test_equal_totals_keep_both_and_ignore_conditional_coupon(now):
+    state = plan(now)
+    state = accept(state, receipt(state, 0, now, conditional_discount_note="Bank card 20 off"))
+    state = accept(state, receipt(state, 1, now))
+    result = rank_offers(state, now=now, config=AIConfig())
+    assert result.cheapest_offer_ids == ("offer0", "offer1")
+    assert result.ranked[0].total == 100
+
+
+def test_failed_store_is_explicit_partial(now):
+    state = plan(now)
+    state = accept(state, receipt(state, 0, now))
+    state = accept(
+        state,
+        SearchReceipt(
+            search_id=state.search_id,
+            owner_id=state.owner_id,
+            session_id=state.session_id,
+            task_id=state.tasks[1].task_id,
+            delivery_context=state.delivery_context,
+            status="blocked",
+        ),
+    )
+    result = rank_offers(state, now=now, config=AIConfig())
+    assert result.status == "partial"
+    assert result.unresolved_store_ids == ("b",)
+    assert not result.cheapest_offer_ids
+
+
+def test_receipt_binding_replay_and_version(now):
+    state = plan(now)
+    item = receipt(state, 0, now)
+    for updates in ({"owner_id": "other"}, {"session_id": "other"}, {"expected_version": 1}):
+        with pytest.raises(ValueError):
+            accept(state, item, **updates)
+    for updates in ({"search_id": "other"}, {"task_id": "other"}, {"delivery_context": "other"}):
+        with pytest.raises(ValueError):
+            accept(state, SearchReceipt.model_validate(item.model_dump() | updates))
+    state = accept(state, item)
+    with pytest.raises(ValueError, match="DUPLICATE_SEARCH_RECEIPT"):
+        accept(state, item)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://a.example.evil.test/item",
+        "https://a.example@evil.test/item",
+        "http://a.example/item",
+        "javascript:alert(1)",
+    ],
+)
+def test_offer_links_cannot_escape_store(now, url):
+    state = plan(now)
+    with pytest.raises(ValueError, match="OFFER_ORIGIN_MISMATCH"):
+        accept(state, receipt(state, 0, now, url=url))
+
+
+def test_future_prices_and_expired_prices_do_not_win(now):
+    state = plan(now)
+    state = accept(state, receipt(state, 0, now + timedelta(seconds=5)))
+    state = accept(state, receipt(state, 1, now))
+    assert not rank_offers(state, now=now, config=AIConfig()).cheapest_offer_ids
+    assert not rank_offers(state, now=now + timedelta(days=1), config=AIConfig()).ranked
+
+
+def test_search_encodes_query_and_does_not_mutate_caller_identity(now):
+    state = plan(now)
+    assert state.tasks[0].visible is True
+    assert state.tasks[0].url == "https://a.example/search?q=Example+Phone+1+128GB+black"
+    assert identity(brand=" EXAMPLE ").matches(identity())
+    assert not identity(attributes={"storage": "128GB"}).matches(identity())
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "find cheapest across websites",
+        "amazon flipkart compare",
+        "websites par sasta search kro",
+    ],
+)
+def test_cross_store_requests_are_not_saved_product_comparison(message):
+    result = asyncio.run(BasicInterpreter().interpret(message, None))
+    assert result.intent == "market_search"
+
+
+def dialogue(now):
+    from shopping_ai import Conversation, Orchestrator, Principal, ShoppingAI
+    from shopping_ai.providers import MockProvider
+
+    conversation = Conversation(Orchestrator(ShoppingAI(MockProvider(), clock=lambda: now)))
+    principal = Principal(owner_id="owner1", session_id="session1")
+    return conversation, principal, conversation.start(principal, language="en").state
+
+
+def begin(conversation, principal, state, now):
+    return conversation.begin_market_search(
+        state,
+        principal,
+        identity=identity(),
+        delivery_context="201001",
+        stores=tuple(task.store for task in plan(now).tasks),
+        expected_version=state.version,
+    )
+
+
+def test_dialogue_search_plan_to_final_offer_reply(now):
+    conversation, principal, state = dialogue(now)
+    reply = begin(conversation, principal, state, now)
+    assert reply.status == "ready_for_search" and len(reply.search_tasks) == 2
+    assert reply.action is None and reply.market_result is None
+    first = receipt(reply.state.active_market, 0, now, shipping="50")
+    progress = conversation.accept_market_receipt(
+        reply.state,
+        principal,
+        first,
+        expected_version=reply.state.version,
+    )
+    assert progress.status == "working" and not progress.search_tasks
+    assert not progress.market_result.cheapest_offer_ids
+    second = receipt(progress.state.active_market, 1, now)
+    final = conversation.accept_market_receipt(
+        progress.state,
+        principal,
+        second,
+        expected_version=progress.state.version,
+    )
+    assert final.status == "complete" and not final.search_tasks
+    assert final.market_result.cheapest_offer_ids == ("offer1",)
+    assert final.speech_text == final.message
+    assert len(final.state.history) <= 12
+
+
+def test_dialogue_market_cannot_be_overwritten_or_replayed(now):
+    from shopping_ai import ConversationTurn, Principal
+    from shopping_ai.conversation import ConversationError
+
+    conversation, principal, state = dialogue(now)
+    reply = begin(conversation, principal, state, now)
+    with pytest.raises(ConversationError, match="ACTIVE_MARKET_SEARCH"):
+        begin(conversation, principal, reply.state, now)
+    with pytest.raises(ConversationError, match="STALE_CONVERSATION_VERSION"):
+        conversation.accept_market_receipt(
+            reply.state,
+            principal,
+            receipt(reply.state.active_market, 0, now),
+            expected_version=state.version,
+        )
+    with pytest.raises(ConversationError, match="ACCESS_DENIED"):
+        conversation.accept_market_receipt(
+            reply.state,
+            Principal(owner_id="other", session_id="session1"),
+            receipt(reply.state.active_market, 0, now),
+            expected_version=reply.state.version,
+        )
+    paused = asyncio.run(
+        conversation.respond(
+            reply.state,
+            principal,
+            ConversationTurn(request_id="turn1", message="add to cart"),
+            expected_version=reply.state.version,
+        )
+    )
+    assert paused.status == "paused" and paused.state.active_market == reply.state.active_market
+    assert not paused.search_tasks and paused.action is None
+    stopped = asyncio.run(
+        conversation.respond(
+            paused.state,
+            principal,
+            ConversationTurn(request_id="turn2", message="stop"),
+            expected_version=paused.state.version,
+        )
+    )
+    assert stopped.status == "cancelled" and stopped.state.active_market is None
+    with pytest.raises(ConversationError, match="NO_ACTIVE_MARKET_SEARCH"):
+        conversation.accept_market_receipt(
+            stopped.state,
+            principal,
+            receipt(reply.state.active_market, 0, now),
+            expected_version=stopped.state.version,
+        )
+
+
+def test_new_search_rejects_late_receipt_from_completed_search(now):
+    conversation, principal, state = dialogue(now)
+    reply = begin(conversation, principal, state, now)
+    old_receipt = receipt(reply.state.active_market, 0, now)
+    for index in range(2):
+        reply = conversation.accept_market_receipt(
+            reply.state,
+            principal,
+            receipt(reply.state.active_market, index, now),
+            expected_version=reply.state.version,
+        )
+    restarted = begin(conversation, principal, reply.state, now)
+    with pytest.raises(ValueError, match="RECEIPT_BINDING_MISMATCH"):
+        conversation.accept_market_receipt(
+            restarted.state,
+            principal,
+            old_receipt,
+            expected_version=restarted.state.version,
+        )
+
+
+def test_cheapest_followup_refreshes_market_evidence_without_redispatch(now):
+    from shopping_ai import ConversationTurn
+
+    conversation, principal, state = dialogue(now)
+    reply = begin(conversation, principal, state, now)
+    for index in range(2):
+        reply = conversation.accept_market_receipt(
+            reply.state,
+            principal,
+            receipt(reply.state.active_market, index, now),
+            expected_version=reply.state.version,
+        )
+    followup = asyncio.run(
+        conversation.respond(
+            reply.state,
+            principal,
+            ConversationTurn(request_id="followup", message="kaunsa sasta hai"),
+            expected_version=reply.state.version,
+        )
+    )
+    assert followup.market_result.cheapest_offer_ids == ("offer0", "offer1")
+    assert followup.comparison is None and not followup.search_tasks and followup.action is None
+    conversation.orchestrator.ai.clock = lambda: now + timedelta(days=1)
+    expired = asyncio.run(
+        conversation.respond(
+            followup.state,
+            principal,
+            ConversationTurn(request_id="expired", message="cheapest"),
+            expected_version=followup.state.version,
+        )
+    )
+    assert not expired.market_result.cheapest_offer_ids
+    assert not expired.market_result.ranked and not expired.search_tasks
