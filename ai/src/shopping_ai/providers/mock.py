@@ -22,14 +22,11 @@ class MockProvider:
             if not product or not product["observation_fresh"]:
                 return self._read_or_ask(data)
             target = grant["variant_id"]
-            if (
-                any(word in message for word in ("select", "choose"))
-                or product["selected_variant_id"] != target
-            ):
+            if product["selected_variant_id"] != target:
                 tool = ToolProposal(
                     name="select_variant", product_id=grant["product_id"], variant_id=target
                 )
-            else:
+            elif any(word in message for word in ("cart", "daal")):
                 tool = ToolProposal(
                     name="add_to_cart",
                     product_id=grant["product_id"],
@@ -37,6 +34,9 @@ class MockProvider:
                     quantity=grant["quantity"],
                     mode=grant["mode"],
                 )
+            else:
+                ids = [f["fact_id"] for f in data["facts"] if f["key"] == "selected_variant"]
+                return ModelDecision(kind="answer", fact_ids=ids)
             return ModelDecision(kind="tool", tool=tool)
         if not product or not product["observation_fresh"]:
             return self._read_or_ask(data)

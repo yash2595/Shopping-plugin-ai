@@ -1,6 +1,7 @@
 import asyncio
 import json
 from datetime import timedelta
+from decimal import Decimal
 
 import pytest
 
@@ -267,3 +268,130 @@ def test_grant_expiring_during_model_call_is_checked_again(ai_request, grant, no
     ai = ShoppingAI(FixedProvider(proposal(cart())), clock=lambda: next(times))
     result = asyncio.run(ai.decide(ai_request.model_copy(update={"authorization": grant})))
     assert result.code == "AUTHORIZATION_EXPIRED"
+
+
+def test_caller_cannot_change_facts_while_model_is_awaiting(ai_request, now):
+    original = ai_request.product.specs["Battery"]
+
+    class EditingProvider:
+        name = "test"
+
+        async def decide(self, context):
+            await asyncio.sleep(0)
+            ai_request.product.specs["Battery"] = "Incorrect replacement after inference began"
+            return ModelDecision(kind="answer", fact_ids=["snap_1.spec:0"])
+
+    result = asyncio.run(ShoppingAI(EditingProvider(), clock=lambda: now).decide(ai_request))
+    assert result.status == "answered"
+    assert result.facts[0].value == f"Battery: {original}"
+
+
+def test_invalid_copied_request_is_rejected_before_provider(ai_request, now):
+    from pydantic import ValidationError
+
+    provider = FixedProvider(None)
+    invalid = ai_request.model_copy(update={"cancelled": "false"})
+    with pytest.raises(ValidationError):
+        asyncio.run(ShoppingAI(provider, clock=lambda: now).decide(invalid))
+    assert provider.calls == 0
+
+
+def test_concurrent_requests_keep_evidence_separate(ai_request, now):
+    second_product = ai_request.product.model_copy(
+        update={"snapshot_id": "snap_2", "price": Decimal("2499.00")}
+    )
+    second = ai_request.model_copy(update={"request_id": "r2", "product": second_product})
+    ai = ShoppingAI(MockProvider(), clock=lambda: now)
+
+    async def concurrent():
+        return await asyncio.gather(ai.decide(ai_request), ai.decide(second))
+
+    first_result, second_result = asyncio.run(concurrent())
+    assert first_result.request_id == "r1"
+    assert second_result.request_id == "r2"
+    assert first_result.facts[0].value == "INR 1499.00"
+    assert second_result.facts[0].value == "INR 2499.00"
+    assert all(f.snapshot_id == "snap_1" for f in first_result.facts)
+    assert all(f.snapshot_id == "snap_2" for f in second_result.facts)
+
+
+def test_provider_concurrency_is_bounded(ai_request, now):
+    class CountingProvider:
+        name = "test"
+        active = 0
+        peak = 0
+
+        async def decide(self, context):
+            self.active += 1
+            self.peak = max(self.peak, self.active)
+            try:
+                await asyncio.sleep(0.005)
+                return ModelDecision(kind="clarification", question="Which product?")
+            finally:
+                self.active -= 1
+
+    provider = CountingProvider()
+    ai = ShoppingAI(provider, AIConfig(max_concurrent_calls=3), clock=lambda: now)
+
+    async def concurrent():
+        return await asyncio.gather(*(ai.decide(ai_request) for _ in range(25)))
+
+    results = asyncio.run(concurrent())
+    assert all(r.status == "needs_input" for r in results)
+    assert provider.peak == 3
+    assert provider.active == 0
+
+
+def test_capacity_timeout_does_not_leak_slots(ai_request, now):
+    class SlowProvider:
+        name = "test"
+
+        async def decide(self, context):
+            await asyncio.sleep(0.03)
+            return ModelDecision(kind="clarification", question="Which product?")
+
+    ai = ShoppingAI(
+        SlowProvider(),
+        AIConfig(max_concurrent_calls=1, capacity_wait_seconds=0.001),
+        clock=lambda: now,
+    )
+
+    async def scenario():
+        first = asyncio.create_task(ai.decide(ai_request))
+        await asyncio.sleep(0)
+        busy = await ai.decide(ai_request)
+        done = await first
+        after = await ai.decide(ai_request)
+        return busy, done, after
+
+    busy, done, after = asyncio.run(scenario())
+    assert busy.code == "AI_CAPACITY" and busy.retryable
+    assert done.status == after.status == "needs_input"
+
+
+def test_cancelling_inference_releases_capacity(ai_request, now):
+    class InterruptibleProvider:
+        name = "test"
+
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.block = True
+
+        async def decide(self, context):
+            self.started.set()
+            if self.block:
+                await asyncio.Event().wait()
+            return ModelDecision(kind="clarification", question="Which product?")
+
+    async def scenario():
+        provider = InterruptibleProvider()
+        ai = ShoppingAI(provider, AIConfig(max_concurrent_calls=1), clock=lambda: now)
+        task = asyncio.create_task(ai.decide(ai_request))
+        await provider.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        provider.block = False
+        return await ai.decide(ai_request)
+
+    assert asyncio.run(scenario()).status == "needs_input"

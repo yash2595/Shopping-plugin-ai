@@ -3,10 +3,20 @@
 from decimal import Decimal
 from typing import Annotated, Literal, Self
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    AwareDatetime,
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 Identifier = Annotated[str, Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_.:-]+$")]
-ShortText = Annotated[str, Field(min_length=1, max_length=500)]
+ShortText = Annotated[str, StringConstraints(min_length=1, max_length=500, strip_whitespace=True)]
+FactIdentifier = Annotated[str, Field(min_length=1, max_length=150, pattern=r"^[a-zA-Z0-9_.:-]+$")]
 Money = Annotated[Decimal, Field(ge=0, max_digits=14, decimal_places=2, allow_inf_nan=False)]
 ToolName = Literal["read_product", "read_cart", "select_variant", "add_to_cart"]
 
@@ -30,7 +40,7 @@ class ProductSnapshot(Contract):
     variants: list[Variant] = Field(default_factory=list, max_length=50)
     price: Money | None = None
     currency: Annotated[str, Field(pattern=r"^[A-Z]{3}$")] | None = None
-    in_stock: bool | None = None
+    in_stock: StrictBool | None = None
     specs: dict[Annotated[str, Field(min_length=1, max_length=80)], ShortText] = Field(
         default_factory=dict, max_length=30
     )
@@ -49,7 +59,7 @@ class ProductSnapshot(Contract):
 
 class Message(Contract):
     role: Literal["user", "assistant"]
-    text: Annotated[str, Field(min_length=1, max_length=2000)]
+    text: Annotated[str, StringConstraints(min_length=1, max_length=2000, strip_whitespace=True)]
 
 
 class MutationAuthorization(Contract):
@@ -63,6 +73,7 @@ class MutationAuthorization(Contract):
     allowed_tools: list[Literal["select_variant", "add_to_cart"]] = Field(
         min_length=1, max_length=2
     )
+
     product_id: Identifier
     document_id: Identifier
     variant_id: Identifier
@@ -71,6 +82,13 @@ class MutationAuthorization(Contract):
     max_unit_price: Money
     currency: Annotated[str, Field(pattern=r"^[A-Z]{3}$")]
     expires_at: AwareDatetime
+
+    @field_validator("allowed_tools")
+    @classmethod
+    def unique_tools(cls, tools: list[str]) -> list[str]:
+        if len(tools) != len(set(tools)):
+            raise ValueError("Allowed tools must be distinct")
+        return tools
 
 
 class ToolProposal(Contract):
@@ -99,10 +117,8 @@ class ModelDecision(Contract):
     """One structured next step. Answers select facts instead of inventing prose."""
 
     kind: Literal["answer", "clarification", "tool"]
-    fact_ids: list[
-        Annotated[str, Field(min_length=1, max_length=150, pattern=r"^[a-zA-Z0-9_.:-]+$")]
-    ] = Field(default_factory=list, max_length=10)
-    question: Annotated[str, Field(min_length=1, max_length=500)] | None = None
+    fact_ids: list[FactIdentifier] = Field(default_factory=list, max_length=10)
+    question: ShortText | None = None
     tool: ToolProposal | None = None
 
     @model_validator(mode="after")
@@ -127,26 +143,59 @@ class AIRequest(Contract):
     product: ProductSnapshot | None = None
     history: list[Message] = Field(default_factory=list, max_length=20)
     available_tools: list[ToolName] = Field(default_factory=lambda: ["read_product"], max_length=4)
+
     authorization: MutationAuthorization | None = None
-    cancelled: bool = False
+    last_verified_tool: ToolProposal | None = None
+    cancelled: StrictBool = False
     step_count: Annotated[int, Field(strict=True, ge=0)] = 0
+
+    @property
+    def stop_requested(self) -> bool:
+        return self.cancelled or self.message.casefold() in {"stop", "cancel", "ruko", "band karo"}
+
+    @field_validator("available_tools")
+    @classmethod
+    def unique_tools(cls, tools: list[str]) -> list[str]:
+        if len(tools) != len(set(tools)):
+            raise ValueError("Available tools must be distinct")
+        return tools
 
 
 class Fact(Contract):
-    fact_id: Annotated[str, Field(min_length=1, max_length=150, pattern=r"^[a-zA-Z0-9_.:-]+$")]
-    key: str
-    value: str
+    fact_id: FactIdentifier
+    key: Annotated[str, Field(min_length=1, max_length=80)]
+    value: Annotated[str, Field(min_length=1, max_length=600)]
     snapshot_id: Identifier
 
 
 class AIResponse(Contract):
     request_id: Identifier
     status: Literal["answered", "needs_input", "tool_proposed", "blocked", "error", "cancelled"]
-    message: str
-    facts: list[Fact] = Field(default_factory=list)
+    message: Annotated[str, StringConstraints(min_length=1, max_length=8000, strip_whitespace=True)]
+    facts: list[Fact] = Field(default_factory=list, max_length=10)
     tool: ToolProposal | None = None
     expected_document_id: Identifier | None = None
-    code: str | None = None
-    retryable: bool = False
-    provider: str
-    prompt_version: str
+    code: Identifier | None = None
+    retryable: StrictBool = False
+    provider: Identifier
+    prompt_version: Identifier
+
+    @model_validator(mode="after")
+    def coherent_response(self) -> Self:
+        if self.status == "answered":
+            if not self.facts or len({f.fact_id for f in self.facts}) != len(self.facts):
+                raise ValueError("Answered response requires distinct evidence facts")
+        elif self.facts:
+            raise ValueError("Only answered responses may contain facts")
+        if (self.status == "tool_proposed") != (self.tool is not None):
+            raise ValueError("Only tool_proposed responses require a tool")
+        if self.expected_document_id is not None and self.status != "tool_proposed":
+            raise ValueError("Document binding belongs only to a tool proposal")
+        if self.tool and self.tool.name in {"select_variant", "add_to_cart"}:
+            if not self.expected_document_id:
+                raise ValueError("Mutation proposal requires a document binding")
+        if (self.status in {"blocked", "error"}) != (self.code is not None):
+            raise ValueError("Only blocked/error responses require an error code")
+        if self.retryable and self.status != "error":
+            raise ValueError("Only errors may be marked retryable")
+        return self

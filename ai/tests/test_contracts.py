@@ -67,3 +67,66 @@ def test_invalid_product_data_rejected(product, changes):
 def test_blank_message_rejected():
     with pytest.raises(ValidationError):
         AIRequest(request_id="r1", message="   ")
+
+
+@pytest.mark.parametrize("value", ["true", "false", 0, 1])
+def test_stock_requires_actual_boolean(product, value):
+    with pytest.raises(ValidationError):
+        type(product).model_validate(product.model_dump() | {"in_stock": value})
+
+
+def test_whitespace_clarification_is_rejected():
+    with pytest.raises(ValidationError):
+        ModelDecision(kind="clarification", question="  \n ")
+
+
+def test_duplicate_capabilities_are_rejected():
+    with pytest.raises(ValidationError):
+        AIRequest(request_id="r1", message="price?", available_tools=["read_product"] * 2)
+
+
+def test_duplicate_authorization_tools_are_rejected(grant):
+    with pytest.raises(ValidationError):
+        type(grant).model_validate(grant.model_dump() | {"allowed_tools": ["add_to_cart"] * 2})
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"status": "answered"},
+        {"status": "tool_proposed"},
+        {"status": "blocked"},
+        {"status": "error"},
+        {"code": "WRONG_PRODUCT"},
+        {"retryable": True},
+        {"message": "  "},
+        {"expected_document_id": "doc_1"},
+        {"tool": {"name": "read_cart"}},
+    ],
+)
+def test_inconsistent_responses_are_rejected(changes):
+    from shopping_ai import AIResponse
+
+    payload = dict(
+        request_id="r1",
+        status="needs_input",
+        message="Which product?",
+        provider="mock",
+        prompt_version="v1",
+    )
+    with pytest.raises(ValidationError):
+        AIResponse.model_validate(payload | changes)
+
+
+def test_mutation_response_requires_document_binding():
+    from shopping_ai import AIResponse
+
+    with pytest.raises(ValidationError, match="document binding"):
+        AIResponse(
+            request_id="r1",
+            status="tool_proposed",
+            message="Proposal only",
+            provider="mock",
+            prompt_version="v1",
+            tool=ToolProposal(name="select_variant", product_id="p42", variant_id="black"),
+        )

@@ -1,4 +1,4 @@
-# Standalone shopping AI — v0.1
+# Standalone shopping AI — v0.2 (local review)
 
 This folder is a real installable Python AI decision package. It runs independently
 of the future FastAPI backend, Neon and Chrome extension. The first milestone is:
@@ -18,9 +18,10 @@ application validation → grounded answer, question, or tool proposal**
 | Safety boundaries | Unknown tools/arguments/fact IDs rejected; no executable model code or automatic tool execution. |
 | Integration contract | Async `ShoppingAI.decide(AIRequest) -> AIResponse`; no web framework dependency. |
 
-This is one decision step, not a persistent autonomous agent. Review summaries,
-comparison, free-form conversational answers, action receipts/reconciliation, auth,
-Neon persistence, browser execution and voice are later integration milestones.
+`ShoppingAI` performs one model decision; `Orchestrator` composes decisions with
+validated extension observations using explicit checkpoints. Persistence, auth,
+Neon, real browser execution and voice are not connected. Review summaries,
+comparison and free-form conversational answers remain later AI milestones.
 Answer values are grounded in supplied observations, not independently verified
 retailer claims. Source facts themselves can be incorrect or contain hostile text.
 They must be rendered as text, never HTML. Fact selection can still be irrelevant;
@@ -77,6 +78,11 @@ python -m shopping_ai.cli path/to/fresh-request.json
 
 `.env.example` documents these settings; the package **does not auto-load .env**.
 Use your backend's settings loader later. No keys are needed for the mock.
+Optional environment limits: `AI_TIMEOUT_SECONDS`, `AI_MAX_CONTEXT_CHARS`,
+`AI_MAX_SNAPSHOT_AGE_SECONDS`, `AI_MAX_STEPS`, `AI_MAX_OUTPUT_TOKENS`,
+`AI_MAX_CONCURRENT_CALLS`, `AI_CAPACITY_WAIT_SECONDS`.
+Invalid/blank settings fail configuration validation instead of silently falling back.
+Gemini requires a nonblank model name; credentials remain the provider's responsibility.
 The model name is deliberately configurable; model availability, quotas, free-tier
 terms and schema support vary. Real calls can incur charges/send supplied data to
 the provider. No live model call was required to build/test this package.
@@ -99,17 +105,19 @@ src/shopping_ai/
     mock.py         Offline demonstration, not production NLU
     gemini.py       Real SDK call and redacted provider failures
   policy.py         Deterministic tool and mutation checks
-  engine.py         One step, timeout, evidence validation and response rendering
+  engine.py         One step, bounded concurrency, timeout and grounded rendering
+  browser.py        Visible-execution envelopes and typed browser observations
+  orchestrator.py   Owner-bound checkpoint transitions, result checks and recovery
   cli.py            JSON fixture runner
 examples/           Price/colour, cart proposal, missing product
- tests/             Contract, policy, freshness, errors and mocked SDK tests
+tests/              Contract, policy, freshness, errors and mocked SDK tests
 ```
 
 Context is capped in **characters**, not tokens. Old history is removed first;
 relevant facts/task constraints are never silently truncated. Oversized remaining
 context is blocked. Default limits: 24,000 context characters, 1,000 output tokens,
 30-second call timeout, snapshot age up to 120 seconds, and 8 caller-counted steps.
-No repair loop or provider retries are enabled in v0.1. Limits are engineering
+No repair loop or provider retries are enabled. Limits are engineering
 settings, not a provider reliability guarantee.
 
 ## Backend connection later
@@ -138,6 +146,12 @@ response = await ai.decide(request)
 must enforce owner access, serialize mutations, persist/increment step counts,
 deduplicate requests/actions and handle cancellation. This package has no shared
 mutable session state, background workers, DB transactions or browser effects.
+Each decision validates a private request copy before inference, so caller edits to
+nested collections during the await do not alter that step. Invalid input raises
+Pydantic `ValidationError` before a provider call; provider/output failures return
+an `AIResponse`. Booleans must be actual booleans, and tool lists must be distinct.
+Response validation enforces status/field consistency: answers need facts, mutation
+proposals need a document binding, and only error responses may be retryable.
 
 ### Mutation authorization is a trusted caller input
 
@@ -171,9 +185,82 @@ checks, cancellation, deadlines and error redaction. SDK request construction is
 tested with an in-memory fake client; this does not prove live account compatibility.
 GitHub Actions runs lint, formatting, tests and mock demos on Python 3.11–3.13.
 
-Next: connect a real retailer's read-only product snapshot to this interface;
+Next (after approval): connect a real retailer's read-only product snapshot to this interface;
 then add a backend-owned task/action store and a verified browser executor. Add
 free-form, evidence-backed summaries only with separate claim evaluation.
 
 Official references: [SDK](https://googleapis.github.io/python-genai/),
 [structured output](https://ai.google.dev/gemini-api/docs/structured-output).
+
+
+## Orchestration and visible browser execution
+
+`Orchestrator` stores no runs internally. Its methods accept an authenticated
+`Principal`, a trusted saved `RunState` and `expected_version`; they return a new
+checkpoint. Principal/run checkpoints must never be deserialized directly from
+an untrusted client's claims. The future backend owns their authority.
+
+| Method | Transition / output |
+| --- | --- |
+| `start` | Create an isolated, JSON-serializable checkpoint (not a DB record). |
+| `advance` | One bounded step; answer/clarify, or return one pending browser action. |
+| `accept_result` | Validate action/run/session/version/tab/document/time binding; verify observed product/variant/cart. |
+| `pause` / `resume` | Pause a ready run; resume only the same bound tab/document. |
+| `cancel` | Stop future steps; retain in-flight action binding for a late receipt. |
+| `expire_pending` | Lost/expired action pauses; cart mutations become uncertain, never auto-replayed. |
+
+A browser action requires foreground execution, target highlighting, smooth
+scrolling and visible typing. These are **executor requirements**, not an
+implementation of a browser UI. Packaged extension adapters must perform the
+scroll/type/click sequence appropriate to the semantic tool, verify current
+focus/document/expiry immediately before acting, and stop on manual interference.
+No arbitrary selector, script or URL is accepted as an AI argument. Generic
+navigation/search/typing tools are not enabled by this release; that needs a
+separately approved action registry and target validation. No Playwright or
+Browser Use dependency has been added to the AI package.
+
+Cart proposals first request a fresh baseline read. `ensure_quantity` can finish
+without a click when the observed baseline already matches. `add_quantity` checks
+the exact baseline plus increment. Only a matching product/variant/quantity in a
+fresh post-action observation completes a cart task. Unknown/failed/expired cart
+mutations pause; after explicit resume the only next operation is a safe cart
+read. Unresolved reads stay paused; no Add replay. Step budgets also bound these
+recovery attempts. A cancelled task records late results without becoming active.
+The backend must separately arrange any needed reconciliation for a cancelled
+mutation, since this orchestrator will dispatch no further actions from that run.
+
+`last_verified_tool` is trusted observation context set by the orchestrator, not
+model authority. A repeated successful variant selection pauses instead of
+clicking again. A clarification requires a new user turn/run; this initial API
+has no automatic checkpoint rewriting to change goals/grants. Unexpected document
+changes pause rather than transferring an old mutation grant to a different page.
+
+### Concurrency and integration responsibilities
+
+1. **Persist with compare-and-swap before dispatch.** Update the row only when
+   stored version equals the input version. Two callers can compute different
+   candidates from the same checkpoint; only the committed winner may dispatch.
+   The local `expected_version` check cannot detect a stale DB checkpoint by itself.
+2. **Cancellation wins through the same CAS.** A model response computed before
+   cancellation must be discarded if its input version is no longer current.
+3. Deduplicate action IDs in the executor and receipt store; accept only receipts
+   authenticated to that owner/session. IDs are correlation, not authentication.
+   External website effects cannot be made exactly-once with a local version check.
+4. Reuse one `ShoppingAI` per worker/event loop. It limits active provider calls
+   (default 8); capacity waits time out (default 2 seconds) with retryable
+   `AI_CAPACITY`. Always release capacity after timeout/cancellation. These limits
+   are per instance, not distributed quotas or per-user fairness.
+5. Backend ingress limits, identity verification, DB locking/CAS, durable storage,
+   cross-process quotas and real load testing remain backend/deployment work.
+   Concurrent isolated mock tests do not certify production capacity.
+
+Offline simulated-executor example (no browser or real cart is touched):
+
+```sh
+python ai/examples/orchestrated_cart.py
+```
+
+It runs baseline read → proposed cart action → simulated observation → verified
+checkpoint. To integrate later, replace simulated results with the extension's
+observations and persist every transition. Never send a pending action until its
+checkpoint is committed, and never treat an AI proposal as a completed action.

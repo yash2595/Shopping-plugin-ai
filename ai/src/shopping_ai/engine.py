@@ -25,8 +25,13 @@ class ShoppingAI:
         self.provider = provider
         self.config = config or AIConfig()
         self.clock = clock or (lambda: datetime.now(UTC))
+        self._capacity = asyncio.Semaphore(self.config.max_concurrent_calls)
 
     async def decide(self, request: AIRequest) -> AIResponse:
+        # Frozen models still contain mutable collections. Validate a private copy
+        # before awaiting a provider so later caller edits cannot change this step.
+        request = AIRequest.model_validate(request.model_dump(warnings=False))
+
         def reply(status: str, message: str, **kwargs) -> AIResponse:
             return AIResponse(
                 request_id=request.request_id,
@@ -37,12 +42,7 @@ class ShoppingAI:
                 **kwargs,
             )
 
-        if request.cancelled or request.message.casefold().strip() in {
-            "stop",
-            "cancel",
-            "ruko",
-            "band karo",
-        }:
+        if request.stop_requested:
             return reply(
                 "cancelled", "Further actions stopped. In-flight actions need reconciliation."
             )
@@ -54,11 +54,21 @@ class ShoppingAI:
             )
         try:
             context = build_context(request, self.config, self.clock())
-            async with asyncio.timeout(self.config.timeout_seconds):
-                raw = await self.provider.decide(context)
+            try:
+                async with asyncio.timeout(self.config.capacity_wait_seconds):
+                    await self._capacity.acquire()
+            except TimeoutError:
+                return reply(
+                    "error", "AI capacity is busy. Retry later.", code="AI_CAPACITY", retryable=True
+                )
+            try:
+                async with asyncio.timeout(self.config.timeout_seconds):
+                    raw = await self.provider.decide(context)
+            finally:
+                self._capacity.release()
             # Provider implementations are an untrusted boundary; revalidate their output.
             decision = ModelDecision.model_validate(
-                raw.model_dump() if isinstance(raw, ModelDecision) else raw
+                raw.model_dump(warnings=False) if isinstance(raw, ModelDecision) else raw
             )
             if decision.kind == "clarification":
                 return reply("needs_input", decision.question)
