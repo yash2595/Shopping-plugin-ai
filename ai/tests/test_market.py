@@ -79,6 +79,7 @@ def accept(state, item, **updates):
                 owner_id=state.owner_id,
                 session_id=state.session_id,
                 expected_version=state.version,
+                now=state.created_at,
             )
             | updates
         ),
@@ -199,6 +200,7 @@ def test_future_prices_and_expired_prices_do_not_win(now):
 def test_search_encodes_query_and_does_not_mutate_caller_identity(now):
     state = plan(now)
     assert state.tasks[0].visible is True
+    assert state.tasks[0].deadline_at == state.deadline_at
     assert state.tasks[0].url == "https://a.example/search?q=Example+Phone+1+128GB+black"
     assert identity(brand=" EXAMPLE ").matches(identity())
     assert not identity(attributes={"storage": "128GB"}).matches(identity())
@@ -368,3 +370,136 @@ def test_cheapest_followup_refreshes_market_evidence_without_redispatch(now):
     )
     assert not expired.market_result.cheapest_offer_ids
     assert not expired.market_result.ranked and not expired.search_tasks
+
+
+def test_deadline_settlement_preserves_received_offers_and_rejects_late_results(now):
+    from shopping_ai.market import expire_search
+
+    state = plan(now)
+    state = accept(state, receipt(state, 0, now))
+    with pytest.raises(ValueError, match="SEARCH_NOT_EXPIRED"):
+        expire_search(
+            state,
+            owner_id=state.owner_id,
+            session_id=state.session_id,
+            expected_version=state.version,
+            now=state.deadline_at - timedelta(microseconds=1),
+        )
+    with pytest.raises(ValueError, match="SEARCH_EXPIRED"):
+        accept(state, receipt(state, 1, now), now=state.deadline_at)
+    # Ranking alone must never call an overdue search still 'searching'.
+    overdue = rank_offers(state, now=state.deadline_at, config=AIConfig())
+    assert overdue.status == "partial" and overdue.unresolved_store_ids == ("b",)
+    settled = expire_search(
+        state,
+        owner_id=state.owner_id,
+        session_id=state.session_id,
+        expected_version=state.version,
+        now=state.deadline_at,
+    )
+    assert settled.receipts[0] == state.receipts[0]
+    assert settled.receipts[1].status == "timed_out"
+    assert settled.version == state.version + 1
+    result = rank_offers(settled, now=state.deadline_at, config=AIConfig())
+    assert result.ranked[0].offer.offer_id == "offer0"
+    assert not result.cheapest_offer_ids and "b" in result.message
+    repeated = expire_search(
+        settled,
+        owner_id=state.owner_id,
+        session_id=state.session_id,
+        expected_version=settled.version,
+        now=state.deadline_at,
+    )
+    assert repeated == settled
+
+
+def test_expiration_checks_owner_version_and_clock(now):
+    from shopping_ai.market import expire_search
+
+    state = plan(now)
+    kwargs = dict(
+        owner_id=state.owner_id,
+        session_id=state.session_id,
+        expected_version=state.version,
+        now=state.deadline_at,
+    )
+    for updates, code in (
+        ({"owner_id": "other"}, "SEARCH_OWNER_MISMATCH"),
+        ({"session_id": "other"}, "SEARCH_OWNER_MISMATCH"),
+        ({"expected_version": 1}, "SEARCH_VERSION_CONFLICT"),
+        ({"now": now.replace(tzinfo=None)}, "Invalid search clock"),
+    ):
+        with pytest.raises(ValueError, match=code):
+            expire_search(state, **(kwargs | updates))
+
+
+def test_conversation_settles_expired_search_and_can_start_again(now):
+    from shopping_ai import ConversationTurn
+
+    conversation, principal, state = dialogue(now)
+    reply = begin(conversation, principal, state, now)
+    conversation.orchestrator.ai.clock = lambda: reply.state.active_market.deadline_at
+    expired = conversation.expire_market_search(
+        reply.state, principal, expected_version=reply.state.version
+    )
+    assert expired.status == "complete" and expired.market_result.status == "partial"
+    assert all(r.status == "timed_out" for r in expired.state.active_market.receipts)
+    assert not expired.search_tasks and expired.action is None
+    # A normal turn also settles the expired checkpoint without a timer callback.
+    followup = asyncio.run(
+        conversation.respond(
+            reply.state,
+            principal,
+            ConversationTurn(
+                request_id="overdue",
+                message="cheapest",
+            ),
+            expected_version=reply.state.version,
+        )
+    )
+    assert followup.market_result.status == "partial"
+    assert len(followup.state.active_market.receipts) == 2
+    old_id = followup.state.active_market.search_id
+    restarted = begin(conversation, principal, followup.state, now)
+    assert restarted.state.active_market.search_id != old_id
+    assert len(restarted.search_tasks) == 2
+
+
+def test_timeout_config_and_checkpoint_binding_are_validated(now):
+    from shopping_ai.market import MarketSearch
+
+    state = plan(now)
+    for update in (
+        {"deadline_at": now},
+        {"deadline_at": now + timedelta(seconds=601)},
+        {"tasks": (state.tasks[0], state.tasks[0])},
+        {
+            "receipts": (
+                SearchReceipt.model_validate(
+                    receipt(state, 0, now).model_dump()
+                    | {
+                        "owner_id": "other",
+                    }
+                ),
+            )
+        },
+        {"receipts": (receipt(state, 0, now), receipt(state, 0, now))},
+    ):
+        with pytest.raises(ValueError):
+            MarketSearch.model_validate(state.model_dump() | update)
+    for value in (0, 601, True, 1.5):
+        with pytest.raises(ValueError):
+            AIConfig(search_timeout_seconds=value)
+
+
+def test_timeout_status_cannot_be_injected_as_browser_receipt(now):
+    state = plan(now)
+    item = SearchReceipt.model_validate(
+        receipt(state, 0, now).model_dump()
+        | {
+            "status": "timed_out",
+            "offers": (),
+        }
+    )
+    with pytest.raises(ValueError, match="only by expire_search"):
+        accept(state, item)

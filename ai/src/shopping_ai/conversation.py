@@ -12,7 +12,15 @@ from pydantic import Field, model_validator
 
 from shopping_ai.browser import BrowserAction, BrowserResult, BrowserTarget
 from shopping_ai.comparison import ComparisonError, ComparisonResult, compare_products
-from shopping_ai.intents import BasicInterpreter, Interpreter, Meaning, Requirements, SlotName
+from shopping_ai.context import product_facts
+from shopping_ai.intents import (
+    BasicInterpreter,
+    Interpreter,
+    Meaning,
+    Requirements,
+    SlotName,
+    explicit_open_request,
+)
 from shopping_ai.market import (
     MarketResult,
     MarketSearch,
@@ -21,6 +29,7 @@ from shopping_ai.market import (
     SearchTask,
     Store,
     accept_search_receipt,
+    expire_search,
     plan_search,
     rank_offers,
 )
@@ -39,12 +48,17 @@ from shopping_ai.models import (
     MutationAuthorization,
     ProductSnapshot,
 )
+from shopping_ai.navigation import (
+    NavigationReceipt,
+    OfferNavigation,
+    propose_navigation,
+    verify_navigation,
+)
 from shopping_ai.orchestrator import Orchestrator, Principal, RunState
+from shopping_ai.providers.base import ProviderError
 
 
-class ConversationTurn(Contract):
-    request_id: Identifier
-    message: Annotated[str, Field(min_length=1, max_length=2000)]
+class ConversationContext(Contract):
     products: tuple[ProductSnapshot, ...] | None = Field(default=None, max_length=10)
     target: BrowserTarget | None = None
     available_tools: tuple[
@@ -58,6 +72,15 @@ class ConversationTurn(Contract):
             raise ValueError("Product references must be distinct")
         if len(self.available_tools) != len(set(self.available_tools)):
             raise ValueError("Tools must be distinct")
+        return self
+
+
+class ConversationTurn(ConversationContext):
+    request_id: Identifier
+    message: Annotated[str, Field(min_length=1, max_length=2000)]
+
+    @model_validator(mode="after")
+    def nonempty_message(self) -> Self:
         if not self.message.strip():
             raise ValueError("Empty user turn")
         return self
@@ -80,6 +103,8 @@ class ConversationState(Contract):
     active_run: RunState | None = None
     active_market: MarketSearch | None = None
     market_draft: MarketDraft | None = None
+    pending_navigation: OfferNavigation | None = None
+    market_display_ids: tuple[Identifier, ...] = Field(default_factory=tuple, max_length=120)
 
     @model_validator(mode="after")
     def coherent_context(self) -> Self:
@@ -90,6 +115,18 @@ class ConversationState(Contract):
             raise ValueError("Selected and previous products must exist in context")
         if self.active_run and self.active_run.principal != self.principal:
             raise ValueError("Active run belongs to another principal")
+        if self.pending_navigation and (
+            (self.pending_navigation.owner_id, self.pending_navigation.session_id)
+            != (self.principal.owner_id, self.principal.session_id)
+            or self.active_market is None
+            or self.pending_navigation.search_id != self.active_market.search_id
+            or not any(
+                offer == self.pending_navigation.offer
+                for receipt in self.active_market.receipts
+                for offer in receipt.offers
+            )
+        ):
+            raise ValueError("Navigation must belong to this principal and market search")
         if self.active_market and (
             (self.active_market.owner_id, self.active_market.session_id)
             != (self.principal.owner_id, self.principal.session_id)
@@ -105,6 +142,7 @@ class ConversationReply(Contract):
         "chat",
         "needs_input",
         "ready_for_search",
+        "ready_to_navigate",
         "awaiting_browser",
         "working",
         "complete",
@@ -115,6 +153,7 @@ class ConversationReply(Contract):
     message: Annotated[str, Field(min_length=1, max_length=8000)]
     speech_text: Annotated[str, Field(min_length=1, max_length=8000)]
     action: BrowserAction | None = None
+    navigation: OfferNavigation | None = None
     facts: tuple[Fact, ...] = Field(default_factory=tuple, max_length=10)
     comparison: ComparisonResult | None = None
     search_tasks: tuple[SearchTask, ...] = Field(default_factory=tuple, max_length=6)
@@ -122,6 +161,12 @@ class ConversationReply(Contract):
 
     @model_validator(mode="after")
     def action_binding(self) -> Self:
+        if (self.status == "ready_to_navigate") != (self.navigation is not None):
+            raise ValueError("Navigation reply requires its pending proposal")
+        if self.navigation and (
+            self.state.pending_navigation != self.navigation or self.action or self.search_tasks
+        ):
+            raise ValueError("Navigation cannot dispatch other browser work")
         market = self.state.active_market
         if self.search_tasks and (
             self.status != "ready_for_search"
@@ -211,12 +256,17 @@ class Conversation:
         text: str,
         *,
         action: BrowserAction | None = None,
+        navigation: OfferNavigation | None = None,
         facts: tuple[Fact, ...] = (),
         comparison: ComparisonResult | None = None,
         search_tasks: tuple[SearchTask, ...] = (),
         market_result: MarketResult | None = None,
         **updates,
     ) -> ConversationReply:
+        if market_result is not None:
+            updates["market_display_ids"] = tuple(
+                item.offer.offer_id for item in market_result.ranked
+            )
         history = (*state.history, Message(role="assistant", text=text[:2000]))[-12:]
         next_state = ConversationState.model_validate(
             state.model_dump() | updates | {"version": state.version + 1, "history": history}
@@ -227,6 +277,7 @@ class Conversation:
             message=text,
             speech_text=text,
             action=action,
+            navigation=navigation,
             facts=facts,
             comparison=comparison,
             search_tasks=search_tasks,
@@ -269,6 +320,9 @@ class Conversation:
         Persist the returned checkpoint with CAS before dispatching search_tasks.
         """
         state = self._check(state, principal, expected_version)
+        state = self._settle_expired_market(state)
+        if state.pending_navigation is not None:
+            raise ConversationError("ACTIVE_NAVIGATION")
         run = state.active_run
         if run and (run.pending or run.recovery_required or run.status in {"ready", "paused"}):
             raise ConversationError("ACTIVE_BROWSER_TASK")
@@ -285,6 +339,7 @@ class Conversation:
             delivery_context=delivery_context,
             stores=stores,
             now=self.orchestrator.ai.clock(),
+            timeout_seconds=self.orchestrator.ai.config.search_timeout_seconds,
         )
         return self._reply(
             state,
@@ -296,6 +351,7 @@ class Conversation:
             ),
             active_market=market,
             market_draft=None,
+            market_display_ids=(),
             awaiting=None,
             search_tasks=market.tasks,
         )
@@ -317,6 +373,7 @@ class Conversation:
             owner_id=principal.owner_id,
             session_id=principal.session_id,
             expected_version=state.active_market.version,
+            now=self.orchestrator.ai.clock(),
         )
         result = rank_offers(
             market,
@@ -330,6 +387,60 @@ class Conversation:
             active_market=market,
             market_result=result,
         )
+
+    def expire_market_search(
+        self,
+        state: ConversationState,
+        principal: Principal,
+        *,
+        expected_version: int,
+    ) -> ConversationReply:
+        state = self._check(state, principal, expected_version)
+        if state.active_market is None:
+            raise ConversationError("NO_ACTIVE_MARKET_SEARCH")
+        market = expire_search(
+            state.active_market,
+            owner_id=principal.owner_id,
+            session_id=principal.session_id,
+            expected_version=state.active_market.version,
+            now=self.orchestrator.ai.clock(),
+        )
+        result = rank_offers(
+            market,
+            now=self.orchestrator.ai.clock(),
+            config=self.orchestrator.ai.config,
+        )
+        return self._reply(
+            state,
+            "complete",
+            result.message,
+            active_market=market,
+            market_result=result,
+        )
+
+    def _settle_expired_market(self, state: ConversationState) -> ConversationState:
+        if (
+            state.pending_navigation is not None
+            and self.orchestrator.ai.clock() >= state.pending_navigation.expires_at
+        ):
+            state = ConversationState.model_validate(
+                state.model_dump() | {"pending_navigation": None}
+            )
+        market = state.active_market
+        if (
+            market is not None
+            and len(market.receipts) < len(market.tasks)
+            and self.orchestrator.ai.clock() >= market.deadline_at
+        ):
+            market = expire_search(
+                market,
+                owner_id=state.principal.owner_id,
+                session_id=state.principal.session_id,
+                expected_version=market.version,
+                now=self.orchestrator.ai.clock(),
+            )
+            return ConversationState.model_validate(state.model_dump() | {"active_market": market})
+        return state
 
     async def respond(
         self,
@@ -365,12 +476,16 @@ class Conversation:
                 active_run=run,
                 active_market=None,
                 market_draft=None,
+                pending_navigation=None,
+                market_display_ids=(),
             )
+        state = self._settle_expired_market(state)
         busy = state.active_run is not None and (
             state.active_run.pending is not None
             or state.active_run.recovery_required
             or state.active_run.status in {"ready", "paused"}
         )
+        busy = busy or state.pending_navigation is not None
         busy = busy or (
             state.active_market is not None
             and len(state.active_market.receipts) < len(state.active_market.tasks)
@@ -389,6 +504,16 @@ class Conversation:
                     state,
                     "Understanding the request timed out. Please retry.",
                     "Request samajhne mein timeout hua. Dobara try karo.",
+                ),
+            )
+        except ProviderError:
+            return self._reply(
+                state,
+                "error",
+                self._text(
+                    state,
+                    "The request could not be understood. Please retry.",
+                    "Request samajh nahi aayi. Dobara try karo.",
                 ),
             )
         if meaning.intent in {"greeting", "help"}:
@@ -463,6 +588,18 @@ class Conversation:
                     "previous_id": state.previous_id if state.previous_id in ids else None,
                 }
             )
+        if meaning.intent == "open_offer":
+            if not explicit_open_request(turn.message):
+                return self._reply(
+                    state,
+                    "needs_input",
+                    self._text(
+                        state,
+                        "Please explicitly request opening one offer without a purchase/cart task.",
+                        "Ek offer kholne ka explicit request do; cart/purchase alag task hai.",
+                    ),
+                )
+            return self._open_offer(state, meaning, turn.target)
         if meaning.intent == "market_search":
             draft = MarketDraft()
             state = ConversationState.model_validate(
@@ -637,6 +774,159 @@ class Conversation:
         run = self.orchestrator.start(principal, request, target)
         run = await self.orchestrator.advance(run, principal, expected_version=run.version)
         return self._run_reply(state, run)
+
+    def _open_offer(
+        self,
+        state: ConversationState,
+        meaning: Meaning,
+        target: BrowserTarget | None,
+    ) -> ConversationReply:
+        market = state.active_market
+        if market is None or target is None or not target.visible:
+            return self._reply(
+                state,
+                "needs_input",
+                self._text(
+                    state,
+                    "A verified offer search and current visible tab are needed.",
+                    "Verified offers aur current visible tab ki information chahiye.",
+                ),
+            )
+        result = rank_offers(
+            market, now=self.orchestrator.ai.clock(), config=self.orchestrator.ai.config
+        )
+        offer_id = None
+        if meaning.reference == "ordinal" and meaning.ordinal <= len(state.market_display_ids):
+            offer_id = state.market_display_ids[meaning.ordinal - 1]
+        elif meaning.reference == "selected" and len(result.cheapest_offer_ids) == 1:
+            offer_id = result.cheapest_offer_ids[0]
+        if offer_id is None:
+            return self._reply(
+                state,
+                "needs_input",
+                self._text(
+                    state,
+                    "Choose an offer from the displayed ranking; "
+                    "a unique cheapest offer is not confirmed.",
+                    "Displayed ranking se exact offer choose karo; "
+                    "ek unique cheapest offer confirm nahi hai.",
+                ),
+            )
+        try:
+            action = propose_navigation(
+                market,
+                principal=state.principal,
+                target=target,
+                offer_id=offer_id,
+                now=self.orchestrator.ai.clock(),
+                config=self.orchestrator.ai.config,
+            )
+        except ValueError:
+            return self._reply(
+                state,
+                "needs_input",
+                self._text(
+                    state,
+                    "That offer needs fresh verification before opening. "
+                    "Please refresh the search.",
+                    "Offer kholne se pehle fresh verification chahiye. Search refresh karo.",
+                ),
+            )
+        return self._reply(
+            state,
+            "ready_to_navigate",
+            self._text(
+                state,
+                "Offer navigation is proposed. Waiting for visible-browser page evidence.",
+                "Offer kholne ka proposal taiyar hai. "
+                "Visible browser ke page evidence ka wait hai.",
+            ),
+            pending_navigation=action,
+            navigation=action,
+        )
+
+    def accept_navigation_receipt(
+        self,
+        state: ConversationState,
+        principal: Principal,
+        receipt: NavigationReceipt,
+        *,
+        expected_version: int,
+    ) -> ConversationReply:
+        state = self._check(state, principal, expected_version)
+        action = state.pending_navigation
+        if action is None:
+            raise ConversationError("NO_PENDING_NAVIGATION")
+        product = verify_navigation(
+            action,
+            receipt,
+            principal=principal,
+            now=self.orchestrator.ai.clock(),
+            config=self.orchestrator.ai.config,
+        )
+        if product is None:
+            return self._reply(
+                state,
+                "needs_input",
+                self._text(
+                    state,
+                    "The browser could not verify the requested offer page.",
+                    "Browser requested offer ka page verify nahi kar saka.",
+                ),
+                pending_navigation=None,
+            )
+        products = tuple(p for p in state.products if p.product_id != product.product_id)[-9:] + (
+            product,
+        )
+        previous = (
+            state.selected_id if state.selected_id != product.product_id else state.previous_id
+        )
+        if previous not in {p.product_id for p in products}:
+            previous = None
+        market = state.active_market
+        changed = (
+            product.price != action.offer.price
+            or product.currency != action.offer.currency
+            or product.in_stock is not True
+        )
+        if changed:
+            # Contradicted listing evidence must not keep winning in cached rankings.
+            receipts = tuple(
+                receipt.model_copy(update={"status": "failed", "offers": ()})
+                if any(offer.offer_id == action.offer.offer_id for offer in receipt.offers)
+                else receipt
+                for receipt in market.receipts
+            )
+            market = MarketSearch.model_validate(
+                market.model_dump()
+                | {
+                    "version": market.version + 1,
+                    "receipts": receipts,
+                }
+            )
+        message = self._text(
+            state,
+            "The requested offer page is verified. Fresh product evidence is selected.",
+            "Requested offer ka page verify ho gaya. Fresh product evidence select ho gaya hai.",
+        )
+        if changed:
+            message += self._text(
+                state,
+                " Price/availability changed or is unknown; refresh cross-store prices.",
+                " Price/availability badli hai ya unknown hai; cross-store prices refresh karo.",
+            )
+        return self._reply(
+            state,
+            "complete",
+            message,
+            pending_navigation=None,
+            active_market=market,
+            products=products,
+            selected_id=product.product_id,
+            previous_id=previous,
+            market_display_ids=() if changed else state.market_display_ids,
+            facts=product_facts(product)[:10],
+        )
 
     async def _collect_market_details(
         self,

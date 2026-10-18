@@ -17,6 +17,7 @@ class AIConfig(Contract):
     timeout_seconds: float = Field(default=30, gt=0, le=120, strict=True, allow_inf_nan=False)
     max_context_chars: int = Field(default=24000, ge=1000, le=100000, strict=True)
     max_snapshot_age_seconds: int = Field(default=120, ge=1, le=3600, strict=True)
+    search_timeout_seconds: int = Field(default=120, ge=1, le=600, strict=True)
     max_steps: int = Field(default=8, ge=1, le=30, strict=True)
     max_output_tokens: int = Field(default=1000, ge=100, le=4000, strict=True)
 
@@ -40,6 +41,7 @@ class AIConfig(Contract):
             "max_context_chars",
             "max_snapshot_age_seconds",
             "max_steps",
+            "search_timeout_seconds",
             "max_output_tokens",
             "max_concurrent_calls",
             "capacity_wait_seconds",

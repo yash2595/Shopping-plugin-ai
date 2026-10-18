@@ -39,6 +39,7 @@ class Meaning(Contract):
         "add_to_cart",
         "compare",
         "market_search",
+        "open_offer",
         "reviews",
         "unknown",
     ] = "unknown"
@@ -70,6 +71,14 @@ class Interpreter(Protocol):
     async def interpret(self, message: str, awaiting: SlotName | None) -> Meaning: ...
 
 
+def explicit_open_request(message: str) -> bool:
+    text = " ".join(message.casefold().split())
+    return bool(re.search(r"\b(open|kholo|khol)\b", text)) and not re.search(
+        r"\b(mat|nahi|nahin|don't|dont|not|cart|buy|purchase|checkout|pay)\b",
+        text,
+    )
+
+
 class BasicInterpreter:
     async def interpret(self, message: str, awaiting: SlotName | None) -> Meaning:
         text = " ".join(message.casefold().split())
@@ -81,9 +90,14 @@ class BasicInterpreter:
         if re.search(r"\b(mat|nahi|nahin|don't|dont|not)\b", text):
             return Meaning()
         # Cross-store requests must not fall back to comparing saved products.
-        if re.search(
-            r"\b(across|websites|website|stores|sites|amazon|flipkart|ecommerce)\b", text
-        ) and re.search(r"\b(compare|comparison|search|find|cheapest|sasta|sasti)\b", text):
+        if (
+            re.search(r"\b(across|websites|website|stores|sites|amazon|flipkart|ecommerce)\b", text)
+            and re.search(r"\b(compare|comparison|search|find|cheapest|sasta|sasti)\b", text)
+            and not re.search(
+                r"\b(open|kholo|khol)\b",
+                text,
+            )
+        ):
             return Meaning(intent="market_search")
         slots = {}
         for words, category in [
@@ -152,7 +166,13 @@ class BasicInterpreter:
             if indices:
                 return Meaning()
             reference = "previous"
-        if is_compare:
+        if re.search(r"\b(open|kholo|khol)\b", text):
+            if comparison_indices or not explicit_open_request(message):
+                return Meaning()
+            if not (is_compare or reference == "ordinal" or re.search(r"\boffer\b", text)):
+                return Meaning()
+            intent = "open_offer"
+        elif is_compare:
             intent = "compare"
         elif re.search(r"\b(review|reviews|complaints)\b", text):
             intent = "reviews"

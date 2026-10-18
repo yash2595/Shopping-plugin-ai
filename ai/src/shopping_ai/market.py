@@ -4,7 +4,7 @@ The authenticated caller supplies supported stores, persists state with CAS, and
 executes each search in the user's visible browser. Store content is data only.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Literal
 from urllib.parse import urlencode, urlsplit
@@ -73,6 +73,7 @@ class Store(Contract):
 
 
 class SearchTask(Contract):
+    deadline_at: AwareDatetime
     task_id: Identifier
     store: Store
     url: Annotated[str, Field(max_length=3000)]
@@ -107,7 +108,7 @@ class SearchReceipt(Contract):
     session_id: Identifier
     task_id: Identifier
     delivery_context: ShortText
-    status: Literal["complete", "failed", "blocked"]
+    status: Literal["complete", "failed", "blocked", "timed_out"]
     offers: tuple[Offer, ...] = Field(default_factory=tuple, max_length=20)
 
     @model_validator(mode="after")
@@ -126,8 +127,41 @@ class MarketSearch(Contract):
     currency: Currency
     delivery_context: ShortText  # e.g. delivery postcode; no full address needed
     created_at: AwareDatetime
+    deadline_at: AwareDatetime
     tasks: tuple[SearchTask, ...] = Field(min_length=2, max_length=6)
     receipts: tuple[SearchReceipt, ...] = Field(default_factory=tuple, max_length=6)
+
+    @model_validator(mode="after")
+    def coherent_checkpoint(self):
+        if not 1 <= (self.deadline_at - self.created_at).total_seconds() <= 600:
+            raise ValueError("Search deadline must be 1-600 seconds after creation")
+        if any(task.deadline_at != self.deadline_at for task in self.tasks):
+            raise ValueError("Task deadline must match its search checkpoint")
+        tasks = {task.task_id: task for task in self.tasks}
+        if len(tasks) != len(self.tasks):
+            raise ValueError("Duplicate search tasks")
+        if len({task.store.store_id for task in self.tasks}) != len(self.tasks):
+            raise ValueError("Duplicate search stores")
+        if len({task.store.origin for task in self.tasks}) != len(self.tasks):
+            raise ValueError("Duplicate store origins")
+        seen = set()
+        for receipt in self.receipts:
+            if receipt.task_id not in tasks or receipt.task_id in seen:
+                raise ValueError("Invalid or duplicate checkpoint receipt")
+            if (
+                receipt.search_id,
+                receipt.owner_id,
+                receipt.session_id,
+                receipt.delivery_context,
+            ) != (
+                self.search_id,
+                self.owner_id,
+                self.session_id,
+                self.delivery_context,
+            ):
+                raise ValueError("Checkpoint receipt belongs to another search")
+            seen.add(receipt.task_id)
+        return self
 
 
 class RankedOffer(Contract):
@@ -159,7 +193,10 @@ def plan_search(
     delivery_context: str,
     stores: tuple[Store, ...],
     now: datetime,
+    timeout_seconds: int = 120,
 ) -> MarketSearch:
+    if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 600:
+        raise ValueError("Search timeout must be an integer in 1-600 seconds")
     identity = ProductIdentity.model_validate(identity.model_dump())
     stores = tuple(Store.model_validate(store.model_dump()) for store in stores)
     if len({s.store_id for s in stores}) != len(stores):
@@ -175,8 +212,10 @@ def plan_search(
         currency=currency,
         delivery_context=delivery_context,
         created_at=now,
+        deadline_at=now + timedelta(seconds=timeout_seconds),
         tasks=tuple(
             SearchTask(
+                deadline_at=now + timedelta(seconds=timeout_seconds),
                 task_id=f"store:{index}",
                 store=store,
                 url=store.origin
@@ -196,6 +235,7 @@ def accept_search_receipt(
     owner_id: str,
     session_id: str,
     expected_version: int,
+    now: datetime,
 ) -> MarketSearch:
     state = MarketSearch.model_validate(state.model_dump())
     receipt = SearchReceipt.model_validate(receipt.model_dump())
@@ -203,6 +243,12 @@ def accept_search_receipt(
         raise ValueError("SEARCH_OWNER_MISMATCH")
     if expected_version != state.version:
         raise ValueError("SEARCH_VERSION_CONFLICT")
+    if now.tzinfo is None or now < state.created_at:
+        raise ValueError("Invalid search clock")
+    if now >= state.deadline_at:
+        raise ValueError("SEARCH_EXPIRED")
+    if receipt.status == "timed_out":
+        raise ValueError("Timeout receipts are created only by expire_search")
     if (receipt.search_id, receipt.owner_id, receipt.session_id) != (
         state.search_id,
         owner_id,
@@ -236,10 +282,52 @@ def accept_search_receipt(
     )
 
 
+def expire_search(
+    state: MarketSearch,
+    *,
+    owner_id: str,
+    session_id: str,
+    expected_version: int,
+    now: datetime,
+) -> MarketSearch:
+    """Settle unreturned tasks after deadline; never retry browser work."""
+    state = MarketSearch.model_validate(state.model_dump())
+    if (owner_id, session_id) != (state.owner_id, state.session_id):
+        raise ValueError("SEARCH_OWNER_MISMATCH")
+    if expected_version != state.version:
+        raise ValueError("SEARCH_VERSION_CONFLICT")
+    if now.tzinfo is None or now < state.created_at:
+        raise ValueError("Invalid search clock")
+    if now < state.deadline_at:
+        raise ValueError("SEARCH_NOT_EXPIRED")
+    returned = {receipt.task_id for receipt in state.receipts}
+    missing = tuple(
+        SearchReceipt(
+            search_id=state.search_id,
+            owner_id=state.owner_id,
+            session_id=state.session_id,
+            task_id=task.task_id,
+            delivery_context=state.delivery_context,
+            status="timed_out",
+        )
+        for task in state.tasks
+        if task.task_id not in returned
+    )
+    if not missing:
+        return state
+    return MarketSearch.model_validate(
+        state.model_dump()
+        | {
+            "version": state.version + 1,
+            "receipts": (*state.receipts, *missing),
+        }
+    )
+
+
 def rank_offers(state: MarketSearch, *, now: datetime, config: AIConfig) -> MarketResult:
     state = MarketSearch.model_validate(state.model_dump())
-    if now.tzinfo is None:
-        raise ValueError("Aware ranking time required")
+    if now.tzinfo is None or now < state.created_at:
+        raise ValueError("Valid aware ranking time required")
     tasks = {task.task_id: task for task in state.tasks}
     completed = {r.task_id for r in state.receipts if r.status == "complete"}
     unresolved = tuple(t.store.store_id for t in state.tasks if t.task_id not in completed)
@@ -270,7 +358,7 @@ def rank_offers(state: MarketSearch, *, now: datetime, config: AIConfig) -> Mark
                 )
             )
     ranked.sort(key=lambda item: (item.total, item.store_id, item.offer.offer_id))
-    pending = len(state.receipts) < len(state.tasks)
+    pending = len(state.receipts) < len(state.tasks) and now < state.deadline_at
     status = "searching" if pending else "partial" if unresolved or uncertain else "complete"
     cheapest = (
         tuple(item.offer.offer_id for item in ranked if item.total == ranked[0].total)
@@ -290,6 +378,8 @@ def rank_offers(state: MarketSearch, *, now: datetime, config: AIConfig) -> Mark
     message += (
         " Conditional discounts are not deducted. Prices apply to the supplied delivery context."
     )
+    if unresolved:
+        message += " Stores without complete results: " + ", ".join(unresolved) + "."
     for item in ranked[:5]:
         message += (
             f"\n{item.store_id}: {item.offer.currency} {item.total:.2f} "

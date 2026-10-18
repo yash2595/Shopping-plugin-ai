@@ -32,6 +32,7 @@ def test_environment_limits_are_parsed_and_model_is_trimmed(monkeypatch):
         "AI_MAX_CONTEXT_CHARS": "12000",
         "AI_MAX_SNAPSHOT_AGE_SECONDS": "60",
         "AI_MAX_STEPS": "4",
+        "AI_SEARCH_TIMEOUT_SECONDS": "90",
         "AI_MAX_OUTPUT_TOKENS": "500",
         "AI_MAX_CONCURRENT_CALLS": "3",
         "AI_CAPACITY_WAIT_SECONDS": "0.5",
@@ -44,6 +45,7 @@ def test_environment_limits_are_parsed_and_model_is_trimmed(monkeypatch):
     assert config.max_context_chars == 12000
     assert config.max_snapshot_age_seconds == 60
     assert config.max_steps == 4
+    assert config.search_timeout_seconds == 90
     assert config.max_output_tokens == 500
     assert config.max_concurrent_calls == 3
     assert config.capacity_wait_seconds == 0.5

@@ -504,3 +504,423 @@ After a market search, a generic “kaunsa sasta hai?” / “cheapest” follow
 its saved observations with the **current clock** and never redispatches search
 tasks. Expired prices lose their cheapest claim. Explicit ordinal/previous product
 references continue to use saved-product comparison instead.
+
+## Live model connection (optional, provider-neutral)
+
+Install `python -m pip install -e './ai[chat]'`. `ChatProvider` implements all three
+protocols: `DecisionProvider.decide`, `Interpreter.interpret`, and
+`DetailInterpreter.extract`. It speaks the Chat Completions JSON wire format;
+compatible providers can be changed through trusted configuration without changing
+conversation/orchestration code. This does not imply every provider/model supports
+this format. No provider is selected automatically, and the old Gemini adapter
+and default offline `create_ai()` behavior are unchanged.
+
+Set these server environment variables explicitly (do not commit real keys):
+
+```text
+AI_CHAT_ENDPOINT=https://your-trusted-provider.example/v1/chat/completions
+AI_CHAT_MODEL=your-available-model-id
+AI_CHAT_API_KEY=your-server-key
+AI_CHAT_RESPONSE_MODE=json_object
+AI_CHAT_TOKEN_PARAMETER=max_completion_tokens
+```
+
+`AI_CHAT_API_KEY` is optional for endpoints that do not require bearer auth. Use
+`max_tokens` instead of `max_completion_tokens` only if your chosen endpoint
+requires that field. If it lacks JSON mode, explicitly set response mode `text`;
+application JSON/schema validation still applies, but output reliability depends
+on the model. There is no automatic downgrade, endpoint switch or retry. This
+adapter requires HTTPS, including for any self-hosted/local service; no direct
+plain-HTTP local endpoint support is provided. Endpoint configuration is trusted
+server configuration, never supplied by a model, extension client or retailer.
+
+```python
+from shopping_ai import Conversation, Orchestrator, ShoppingAI
+from shopping_ai.providers.chat import ChatProvider, ChatSettings
+
+async with ChatProvider(ChatSettings.from_env()) as model:
+    ai = ShoppingAI(model, model.config)
+    dialogue = Conversation(
+        Orchestrator(ai),
+        interpreter=model,
+        detail_interpreter=model,
+        stores=trusted_store_configs,
+    )
+    # Use dialogue.start/respond/accept_market_receipt with authenticated
+    # principals and persisted conversation-version CAS as documented above.
+```
+
+Keep this async context alive for the worker/application lifetime to reuse its
+connection pool, then close it during shutdown. Do not reuse a client across
+separate event loops. Transport concurrency applies across all three protocols
+on this provider instance; multi-worker limits still need backend coordination.
+An injected HTTP client belongs to its caller and must be closed by that caller.
+The default owned client ignores environment proxies and never follows redirects.
+
+For an **opt-in live text-only smoke test**, run `python ai/examples/live_chat.py`.
+It may incur model-provider charges. It wires real intent and detail extraction
+into the same conversation flow but supplies no store adapters or browser executor;
+it cannot claim a website was searched. Type `exit` to finish. We have not run a
+live model request during this implementation. Tests use HTTPX MockTransport and
+verify real request/response construction, grounding and dialogue integration.
+
+JSON mode guarantees neither our business rules nor exact schema conformance;
+this adapter includes the schema in the system prompt, validates returned JSON
+locally, then keeps the existing source-evidence checks and user confirmation.
+Truncated/refused/tool-call outputs fail closed. Responses are capped at 64 KiB,
+requests have capacity/deadline limits, and auth/rate-limit/network errors use
+redacted stable codes. No native model tools execute. Relevant user text, draft
+fields (including postcode), and allowlisted product observations are sent to the
+configured model service; provider retention policies remain the deployer's choice.
+No raw HTML, cookies, browser credentials or principal identifiers are added by
+this adapter. API keys remain in server-side authorization headers.
+
+Wire-format reference: [Chat Completions API](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create).
+The implementation uses portable JSON-object/text responses with local validation,
+not vendor-enforced strict JSON Schema or a vendor-specific SDK.
+
+## Voice pipeline integration
+
+`VoiceConversation` composes existing conversation/orchestration with replaceable
+async `Transcriber` and `Synthesizer` protocols:
+
+```text
+bounded audio clip -> STT -> validated transcript -> Conversation.respond
+-> owned conversation reply/state -> TTS -> bounded speech audio
+```
+
+This is an implemented pipeline, **not a bundled STT/TTS service**. Supply adapters
+for your selected services or a local engine. No microphone capture, audio decoding,
+playback, voice cloning, browser recording permissions, network endpoint or audio
+storage is implemented here. Tests use explicitly fake speech adapters; no real
+speech recognition, synthesis or end-to-end microphone demo has been verified.
+
+```python
+from shopping_ai import AudioClip, VoiceConversation, VoiceTurn
+
+voice = VoiceConversation(dialogue, transcriber=stt_adapter, synthesizer=tts_adapter)
+result = await voice.respond(
+    state,
+    authenticated_principal,
+    VoiceTurn(request_id="unique-turn-id", audio=AudioClip(format="webm", data=recorded_bytes)),
+    expected_version=state.version,
+)
+```
+
+`VoiceTurn` shares `ConversationContext` with text turns, so a trusted caller may
+also supply product snapshots, current browser target, available tools and an exact
+mutation authorization. The STT adapter receives **only audio and language**, not
+these permissions, principal IDs or browser credentials. The transcript becomes
+the current user message; all existing source checks, explicit search confirmation
+and mutation policy still apply. Never grant cart permission merely because an
+STT/model output requests it.
+
+Ownership, version, request replay, context and audio bounds are checked before
+transcription. Input/output audio is limited to 5 MB and supported format labels
+wav/webm/ogg/mp3; labels and byte limits do not prove valid or safe decoded media.
+The speech adapter must validate content, duration/decoder limits and format support.
+The AI library does not write raw recordings to disk, and audio bytes are excluded
+from model serialization/repr. User transcripts remain normal conversation history;
+apply retention/deletion rules in future persistence and speech-service adapters.
+
+When STT provides confidence below the configurable threshold (default 0.75), no
+conversation step or TTS is run; ask the user to repeat or type. Missing confidence
+is treated as unavailable, not an automatic rejection or a guarantee of correctness.
+Different recognizers have different confidence calibration. A stop button should
+use the existing authenticated text cancellation path immediately rather than wait
+for audio recognition. Voice “stop” also reaches that same path after transcription.
+
+`VoiceReply.status=complete` means the audio pipeline produced a reply and speech;
+inspect `reply.status` for the actual shopping task status. It does not mean an
+item was added or websites were searched. Transcription/conversation failures return
+no checkpoint. **Synthesis failure preserves `result.reply`**, including the updated
+conversation state and any pending proposals. Persist it normally. Retry only
+`voice.speak(result.reply, authenticated_principal)`; never replay the user turn to
+retry speech. The same `speak` method can render receipts/progress replies from
+`accept_result` and `accept_market_receipt` without repeating STT or planning.
+
+Persist every returned checkpoint with backend owner checks and version CAS before
+browser dispatch or playback. A repeated stale candidate must not redispatch tasks.
+Discard returned audio if the user stopped or a newer conversation version has
+superseded it. Browser action deadlines still apply after TTS latency. Where needed,
+use text conversation and separate `speak` calls so state can be persisted before
+synthesis. No speech result authorizes browser execution.
+
+Both stages have configured timeout and bounded per-instance capacity/wait.
+Async cancellation propagates and releases permits; the caller must cancel the
+old request and stop playback for barge-in. Distributed scheduling, durable replay
+protection and transport disconnect handling remain backend/extension work.
+
+### Compatible live STT/TTS adapters
+
+Install `python -m pip install -e './ai[chat,speech]'`. The optional `SpeechProvider`
+implements both speech protocols against compatible HTTPS audio APIs: multipart
+`POST /audio/transcriptions` and JSON `POST /audio/speech`. STT and TTS can have
+separate endpoints, models and credentials. No vendor/model/voice is chosen for you.
+Configure only trusted server endpoints:
+
+```text
+AI_STT_ENDPOINT=https://your-stt-service.example/v1/audio/transcriptions
+AI_STT_MODEL=your-stt-model
+AI_STT_API_KEY=your-stt-server-key
+AI_TTS_ENDPOINT=https://your-tts-service.example/v1/audio/speech
+AI_TTS_MODEL=your-tts-model
+AI_TTS_API_KEY=your-tts-server-key
+AI_TTS_VOICE=your-supported-voice
+AI_TTS_FORMAT=wav
+```
+
+Keys are optional for services without bearer auth. `AI_TTS_FORMAT` supports wav
+or mp3. Model/voice/language support depends on your configured service; these
+adapters do not translate arbitrary vendor APIs. Credentials are not interchangeable
+unless you deliberately configure them that way. No automatic .env loading occurs.
+
+```python
+from shopping_ai.providers.speech import SpeechProvider, SpeechSettings
+from shopping_ai.voice import VoiceConversation
+
+async with SpeechProvider(SpeechSettings.from_env()) as speech:
+    voice = VoiceConversation(dialogue, transcriber=speech, synthesizer=speech)
+    # Call voice.respond or voice.speak using owned checkpoints as above.
+```
+
+Keep this context alive for the application lifetime and close it on shutdown.
+The adapter reuses a bounded connection pool, ignores environment proxies, refuses
+redirects, and does not retry failed requests. Both request/response bodies are
+bounded, and external errors become redacted stable codes. STT uploads the actual
+bounded clip with a fixed filename/content type and requests JSON text. `en` maps
+to English and `hi-Latn` maps to Hindi recognition; Hindi STT may output Devanagari.
+The voice bridge normalizes only whole explicit Hindi stop/confirm utterances;
+it does not transliterate product/model/variant data. Natural Hindi interpretation
+requires the configured dialogue model. Latin-script Hindi pronunciation is not
+independently verified and depends on the selected TTS model.
+
+This plain STT response supplies no calibrated utterance confidence, so it returns
+`confidence=None`. Do not assume the low-confidence gate can detect recognition
+errors without a recognizer-specific confidence adapter. Missing or invalid text
+fails closed. TTS accepts nonempty text up to 4,096 characters and returns bounded
+mp3/wav audio; longer replies preserve the text checkpoint and report speech
+failure, with no silent truncation or replay. The response MIME type and a small
+format-header sanity check reject obvious non-audio output, **not** every invalid
+codec payload. Decoding, duration/resource limits, playback validation and recording
+permissions remain the extension/service adapter's responsibility.
+
+Opt-in one-turn smoke test (may incur STT/model/TTS charges):
+
+```sh
+python ai/examples/live_voice.py /path/to/recording.webm --output /path/to/reply.wav
+```
+
+Also configure the `AI_CHAT_*` variables from the live text section. The output
+extension must match `AI_TTS_FORMAT`; existing output files are never overwritten.
+The script reads a bounded input and writes audio only when all stages succeed.
+It supplies no live store/browser adapter or durable session, so it is a speech
+integration smoke test, not a shopping completion test. Produced speech is
+AI-generated; identify it as such in the eventual playback UI.
+
+No live transcription/synthesis request has been run here. MockTransport tests
+verify multipart payloads, separate credential routing, binary output, voice flow,
+invalid responses, timeouts/capacity, size limits, redirects and failure handling.
+Audio and reply text are sent to the configured services; their retention policies
+are separate from this package's in-memory behavior.
+
+API wire references: [transcriptions](https://developers.openai.com/api/reference/resources/audio/subresources/transcriptions/methods/create)
+and [speech](https://developers.openai.com/api/reference/resources/audio/subresources/speech/methods/create).
+
+### Search deadlines and partial-result settlement
+
+Every search and issued `SearchTask` now carries the same aware `deadline_at`.
+`AIConfig.search_timeout_seconds` / `AI_SEARCH_TIMEOUT_SECONDS` controls the total
+search window (default 120 seconds, allowed 1–600), separately from individual
+model/STT/TTS request deadlines and evidence freshness. `plan_search` also accepts
+an explicit `timeout_seconds` for standalone use. Enforce task deadlines before
+browser dispatch; the deadline is not permission to keep a background tab running.
+
+`accept_search_receipt` now **requires an explicit trusted `now`**. At or beyond
+the search deadline, it rejects late receipts. Clock values before search creation
+or naive timestamps are rejected. The caller must use its server clock, never a
+model/client-provided time. Receipt status `timed_out` is reserved for the lifecycle
+settler and cannot be submitted through the browser-receipt API.
+
+At deadline, call `Conversation.expire_market_search(state, principal,
+expected_version=state.version)` and persist its checkpoint with CAS. A future
+backend scheduler should invoke it even while the user is idle. The method invokes
+the pure `expire_search` helper: it retains returned evidence and creates a bounded
+timed-out receipt for each unreturned store. Settlement is idempotent at the market
+checkpoint level; it never reruns searches. Ownership and version checks apply to
+settlement as well. A browser worker must separately cancel queued/in-flight work;
+changing an AI checkpoint does not stop Chrome.
+
+`respond` and `begin_market_search` also settle an overdue pending search before
+handling new work, so users cannot get stuck behind an abandoned search forever.
+Ranking an overdue checkpoint returns partial coverage immediately, even before
+explicit settlement. Existing prices still have to pass their independent freshness
+window. Missing/failed/blocked/timed-out stores are named in the result; no confirmed
+cheapest claim is made with unresolved coverage. New searches receive new IDs and
+reject old receipts. There are no automatic retries, timers, background jobs or
+provider-switch fallbacks inside the AI package.
+
+Checkpoint validation now rejects duplicate tasks/stores, mismatched deadlines,
+unknown/duplicate receipt tasks and receipts bound to another search/owner/session/
+delivery context. These are data-integrity checks, not authentication or a database
+lock. Legacy demo checkpoints lacking `deadline_at` must be recreated; do not invent
+a deadline on untrusted checkpoint data. The eventual persistence adapter should
+version its stored checkpoint schema before migrating production sessions.
+
+### Verified offer → visible navigation → fresh selected product
+
+A user can request `open cheapest`, `cheapest offer kholo`, or `open second offer`.
+The caller must attach a current visible `BrowserTarget` to the text/voice turn.
+`Meaning.intent=open_offer` is only a routing proposal: the application also requires
+an explicit supported English/Hinglish open command and refuses negated/combined
+cart/purchase requests. The model never supplies a navigation URL.
+
+`ConversationReply.status=ready_to_navigate` contains an `OfferNavigation` in
+`reply.navigation` and in `state.pending_navigation`. It is a **proposal**, not a
+successful page opening. The URL is exactly the fresh verified offer's URL from
+search evidence. Generic cheapest-open requests require a unique confirmed winner;
+ties, incomplete coverage or unknown costs ask for an explicit offer. Ordinal choices
+bind to stored displayed offer IDs, so expired filtering cannot silently shift
+“second offer” to a different listing. Expired selected evidence requires refresh.
+
+Persist state with CAS, then have the future extension executor navigate the same
+foreground user tab. Enforce its source tab/document binding, URL allowlist,
+foreground visibility and deadline before executing; never open a hidden browser.
+Navigation has its own short deadline, bounded by model-step timeout and the
+remaining offer-freshness window. No new cart grant or mutation permission is issued.
+Actual navigation/scrolling/typing remain extension work, not performed by this package.
+
+After observing the actual page, send `NavigationReceipt` to
+`Conversation.accept_navigation_receipt(state, principal, receipt,
+expected_version=state.version)`. A successful receipt includes action/search/owner/
+session binding, exact final URL, a visible target in the same tab, canonical observed
+identity and a fresh `ProductSnapshot` with the same document/time. Wrong variant,
+URL, tab, timestamps or expired receipts are rejected. Redirects are not silently
+trusted; the current adapter requires the exact issued offer URL. Browser receipts
+must come from the trusted normalizer/executor, never fabricated by an LLM.
+
+Only verified receipt evidence selects the new product, after which existing product
+questions/variant/cart policy can use its fresh snapshot. A changed/unknown listed
+price, currency or stock invalidates the affected store's cached search receipt;
+its old lowest-price claim cannot continue. Refresh the market search to restore
+coverage. Failed navigation selects nothing. Stop clears pending navigation;
+late/duplicate receipts cannot revive it. New user work settles an expired proposal
+without automatically replaying it. Pending navigation blocks replacement search or
+cart tasks but permits saved-evidence questions. Voice can speak both the proposal
+and verified result using the same existing bridge.
+
+## Single integration entry point
+
+`shopping_ai.runtime.AssistantRuntime` routes all implemented AI events through the
+same Conversation/VoiceConversation instance. It is an in-process application
+boundary, **not an HTTP/WebSocket server, authentication layer or database**. No
+frontend/backend files were changed. Existing lower-level APIs remain available.
+
+| Event kind | Payload | Existing transition |
+|---|---|---|
+| `text` | `turn: ConversationTurn` | Interpret/respond; stop/cancel are normal text turns |
+| `audio` | `turn: VoiceTurn` | STT → the same dialogue → TTS |
+| `market_result` | `receipt: SearchReceipt` | Bind/store observations and rank offers |
+| `navigation_result` | `receipt: NavigationReceipt` | Verify opened offer and select fresh product |
+| `browser_result` | `result: BrowserResult` | Verify read/variant/cart evidence |
+| `advance` | no extra fields | Plan the next step after an observation |
+| `resume` | `target: BrowserTarget` | Explicitly resume a paused browser run |
+| `expire` | `scope: browser` or `market` | Settle the corresponding deadline |
+
+The discriminated `AssistantEvent` union rejects unsupported event kinds and extra
+fields. `EVENTS.json_schema()` exposes the contract programmatically; no duplicate
+hand-maintained JSON schema files are generated. Principal, saved state and expected
+version are separate trusted arguments, never inferred from event text. Audio is
+binary data supplied by the upload/stream adapter; it is not automatically base64
+decoded from JSON. Audio output stays excluded from metadata serialization and
+must be transported separately by the future backend.
+
+```python
+from shopping_ai import ConversationTurn
+from shopping_ai.runtime import TextEvent, live_runtime
+from shopping_ai.providers.chat import ChatSettings
+from shopping_ai.providers.speech import SpeechSettings
+
+async with live_runtime(
+    ChatSettings.from_env(),
+    speech=SpeechSettings.from_env(),
+    stores=trusted_store_configs,
+) as assistant:
+    initial = await assistant.start(authenticated_principal)
+    # Persist initial.state under its owner before handling subsequent turns.
+    result = await assistant.handle(
+        saved_state,
+        authenticated_principal,
+        TextEvent(turn=ConversationTurn(request_id="unique-id", message="search websites")),
+        expected_version=saved_state.version,
+        speak=True,
+    )
+    checkpoint = result.state
+    reply = result.conversation_reply
+    # Persist checkpoint using CAS before dispatching reply.action,
+    # reply.search_tasks, reply.navigation, or playing speech.
+```
+
+`live_runtime` explicitly wires one ChatProvider into intent interpretation, detail
+extraction and grounded decisions, plus an optional SpeechProvider into STT/TTS.
+It owns their connection-pool lifecycle and closes them on shutdown or exception.
+Keep one context per worker/event loop and separate saved checkpoints per user.
+It does not start network calls during construction. `AI_PROVIDER` applies to the
+legacy `create_ai` factory, not this explicit live wiring. To run fully offline,
+construct `AssistantRuntime(existing_offline_conversation, optional_fake_voice)`.
+
+Outputs have `kind=text` with ConversationReply or `kind=voice` with VoiceReply.
+Python properties `result.conversation_reply` and `result.state` provide a common
+view without duplicating checkpoints in serialized output. If STT fails before
+conversation processing, both properties are None: keep the previous saved state.
+If only TTS fails, the conversation checkpoint is present and must still be saved.
+Use `assistant.voice.speak(reply, principal)` to retry speech only.
+
+For non-audio events, `speak=True` also speaks receipt progress/final responses.
+Voice must be configured before such work is attempted. Ownership/version errors
+are raised before any provider work. Pending browser actions reject extra advance
+events with `BROWSER_RESULT_REQUIRED`; wait for their receipt instead. This does
+not replace durable worker deduplication: use action IDs or `(search_id, task_id)`
+as dispatch keys, CAS state updates, and reject stale queued work in the executor.
+The runtime does not dispatch anything automatically or persist state for you.
+
+An offline integration test exercises detail collection → search receipts → chosen
+offer → verified navigation receipt → cart baseline → proposed add → verified cart
+quantity with spoken progress/final results. It tests **simulated observations and
+fake speech**, not real ecommerce execution or live microphone/provider quality.
+
+## Repeatable model readiness and quality evaluation
+
+```sh
+python -m shopping_ai.evaluate --check
+python -m shopping_ai.evaluate --check --voice
+python -m shopping_ai.evaluate
+python -m shopping_ai.evaluate --live
+```
+
+`--check` validates required environment variable names, settings shape and optional
+HTTP dependency availability without network traffic. `--voice` additionally checks
+speech configuration. It never prints configured values or API keys. Exit 2 means
+missing/invalid setup. `ready_to_attempt_live_test` means configuration looks usable,
+not that credentials, model access, endpoints or speech quality have been verified.
+API keys remain optional for compatible endpoints without bearer authentication.
+
+The default command runs ten fixed English/Hinglish intent/detail cases using the
+offline fallback. The current baseline is **9/10**: explicitly labelled details work,
+while one natural-language complete-detail extraction case does not. This is a
+known quality limitation, not a passing natural-language assistant benchmark.
+The command intentionally exits 1 if any case fails; do not weaken expected results
+to hide unsupported behavior. Passing unit tests and benchmark coverage are separate.
+
+`--live` explicitly sends ten sequential model requests using configured ChatProvider
+settings and may incur provider charges. It is not run automatically by tests or
+imports. Reports include per-case IDs/outcomes and aggregate exact-match counts;
+provider exception bodies/model-generated content are not logged. Detail proposals
+also pass source-evidence validation. No live model evaluation was performed during
+implementation because endpoint/model configuration is absent in this workspace.
+
+These are a small reproducible smoke benchmark, not a statistically representative
+quality measurement, security proof, latency/load benchmark, live ecommerce test or
+speech evaluation. Run with the actual chosen model before claiming natural-language
+capability, then expand cases from observed user failures. Real browser and microphone
+acceptance testing still require their respective executor/UI integrations.
