@@ -144,7 +144,7 @@ class MarketSearch(Contract):
             raise ValueError("Duplicate search stores")
         if len({task.store.origin for task in self.tasks}) != len(self.tasks):
             raise ValueError("Duplicate store origins")
-        seen = set()
+        seen, offer_ids, snapshot_ids = set(), set(), set()
         for receipt in self.receipts:
             if receipt.task_id not in tasks or receipt.task_id in seen:
                 raise ValueError("Invalid or duplicate checkpoint receipt")
@@ -161,6 +161,15 @@ class MarketSearch(Contract):
             ):
                 raise ValueError("Checkpoint receipt belongs to another search")
             seen.add(receipt.task_id)
+            origin = urlsplit(tasks[receipt.task_id].store.origin)
+            for offer in receipt.offers:
+                url = urlsplit(offer.url)
+                if (url.scheme, url.netloc) != (origin.scheme, origin.netloc) or url.fragment:
+                    raise ValueError("Checkpoint offer origin mismatch")
+                if offer.offer_id in offer_ids or offer.snapshot_id in snapshot_ids:
+                    raise ValueError("Duplicate checkpoint offer evidence")
+                offer_ids.add(offer.offer_id)
+                snapshot_ids.add(offer.snapshot_id)
         return self
 
 
@@ -169,18 +178,62 @@ class RankedOffer(Contract):
     offer: Offer
     total: Annotated[Decimal, Field(ge=0, allow_inf_nan=False)]
 
+    @model_validator(mode="after")
+    def observed_total(self):
+        if self.offer.total is None or self.total != self.offer.total:
+            raise ValueError("Ranked total must equal observed price plus costs")
+        return self
+
+
+ExclusionReason = Literal[
+    "identity_mismatch",
+    "currency_mismatch",
+    "out_of_stock",
+    "stock_unknown",
+    "future_observation",
+    "predates_search",
+    "stale_observation",
+    "unknown_total_cost",
+]
+
+
+class OfferExclusion(Contract):
+    store_id: Identifier
+    offer_id: Identifier
+    reasons: tuple[ExclusionReason, ...] = Field(min_length=1, max_length=8)
+
 
 class MarketResult(Contract):
     search_id: Identifier
     status: Literal["searching", "complete", "partial"]
     ranked: tuple[RankedOffer, ...]
     excluded_offer_ids: tuple[Identifier, ...]
+    exclusions: tuple[OfferExclusion, ...] = Field(default_factory=tuple, max_length=120)
     unresolved_store_ids: tuple[Identifier, ...]
     # All tied cheapest offers; empty while unfinished or any possible competitor
     # has unobserved costs. Never a global internet-wide cheapest claim.
     cheapest_offer_ids: tuple[Identifier, ...]
     message: str
     speech_text: str
+
+    @model_validator(mode="after")
+    def evidence_partition(self):
+        rejected = tuple(item.offer_id for item in self.exclusions)
+        ranked_ids = [item.offer.offer_id for item in self.ranked]
+        if rejected != self.excluded_offer_ids or len(set(rejected)) != len(rejected):
+            raise ValueError("Excluded offer IDs must match their reasons")
+        if len(set(ranked_ids)) != len(ranked_ids) or set(ranked_ids) & set(rejected):
+            raise ValueError("Ranked and excluded evidence must be distinct")
+        if not set(self.cheapest_offer_ids) <= set(ranked_ids):
+            raise ValueError("Cheapest offers must belong to ranked evidence")
+        if self.status != "complete" and self.cheapest_offer_ids:
+            raise ValueError("Incomplete coverage cannot have confirmed cheapest offers")
+        if self.status == "complete":
+            minimum = min((item.total for item in self.ranked), default=None)
+            winners = tuple(item.offer.offer_id for item in self.ranked if item.total == minimum)
+            if self.cheapest_offer_ids != winners:
+                raise ValueError("Cheapest IDs must retain every observed minimum-price tie")
+        return self
 
 
 def plan_search(
@@ -266,6 +319,10 @@ def accept_search_receipt(
     seen_snapshots = {o.snapshot_id for r in state.receipts for o in r.offers}
     origin = urlsplit(tasks[receipt.task_id].store.origin)
     for offer in receipt.offers:
+        if offer.observed_at > now:
+            raise ValueError("FUTURE_OFFER_EVIDENCE")
+        if offer.observed_at < state.created_at:
+            raise ValueError("OFFER_PREDATES_SEARCH")
         url = urlsplit(offer.url)
         if (url.scheme, url.netloc) != (origin.scheme, origin.netloc) or url.fragment:
             raise ValueError("OFFER_ORIGIN_MISMATCH")
@@ -337,20 +394,37 @@ def rank_offers(
     tasks = {task.task_id: task for task in state.tasks}
     completed = {r.task_id for r in state.receipts if r.status == "complete"}
     unresolved = tuple(t.store.store_id for t in state.tasks if t.task_id not in completed)
-    ranked, excluded = [], []
+    ranked, excluded, exclusions = [], [], []
     uncertain = False
     for receipt in state.receipts:
         for offer in receipt.offers:
             age = (now - offer.observed_at).total_seconds()
-            eligible = (
-                state.identity.matches(offer.identity)
-                and offer.currency == state.currency
-                and offer.in_stock is True
-                and 0 <= age <= config.max_snapshot_age_seconds
-                and offer.observed_at >= state.created_at
-            )
-            if not eligible or offer.total is None:
+            reasons = []
+            if not state.identity.matches(offer.identity):
+                reasons.append("identity_mismatch")
+            if offer.currency != state.currency:
+                reasons.append("currency_mismatch")
+            if offer.in_stock is False:
+                reasons.append("out_of_stock")
+            elif offer.in_stock is None:
+                reasons.append("stock_unknown")
+            if age < 0:
+                reasons.append("future_observation")
+            elif age > config.max_snapshot_age_seconds:
+                reasons.append("stale_observation")
+            if offer.observed_at < state.created_at:
+                reasons.append("predates_search")
+            if offer.total is None:
+                reasons.append("unknown_total_cost")
+            if reasons:
                 excluded.append(offer.offer_id)
+                exclusions.append(
+                    OfferExclusion(
+                        store_id=tasks[receipt.task_id].store.store_id,
+                        offer_id=offer.offer_id,
+                        reasons=tuple(reasons),
+                    )
+                )
                 # A mismatched variant or unavailable offer cannot win. Other
                 # unknown evidence prevents a definitive cheapest claim.
                 if state.identity.matches(offer.identity) and offer.in_stock is not False:
@@ -431,6 +505,12 @@ def rank_offers(
             f"(price {item.offer.price:.2f} + delivery {item.offer.shipping:.2f} "
             f"+ extra tax/fees {item.offer.extra_tax_and_fees:.2f})."
         )
+    if excluded:
+        message += (
+            f" {len(excluded)} offers exclude hue; reasons structured results mein hain."
+            if hi
+            else f" {len(excluded)} offers excluded; see structured evidence reasons."
+        )
     if len(ranked) > 5:
         message += (
             " Baaki offers structured results mein hain."
@@ -442,6 +522,7 @@ def rank_offers(
         status=status,
         ranked=tuple(ranked),
         excluded_offer_ids=tuple(excluded),
+        exclusions=tuple(exclusions),
         unresolved_store_ids=unresolved,
         cheapest_offer_ids=cheapest,
         message=message,

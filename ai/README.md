@@ -1037,3 +1037,34 @@ no content is silently truncated or user turn replayed.
 Tests verify the generated summary is exactly what reaches the speech adapter.
 This verifies deterministic text integration, not actual pronunciation or audio
 quality; those remain dependent on the eventual selected service.
+
+## Offer evidence integrity and exclusion explanations
+
+A newly submitted offer must have been observed after search creation and no later
+than the trusted receipt-processing clock. Future or pre-search timestamps reject
+the receipt without advancing state or consuming its task; a corrected receipt may
+then be submitted. Do not send retailer publication dates or model-generated times
+as `observed_at`; the trusted browser normalizer records when it actually observed
+the page. This prevents a future-dated observation from simply aging into eligibility.
+Existing stale evidence remains excluded when ranking with the current clock.
+
+`MarketResult.exclusions` pairs each excluded offer ID/store with explicit reasons:
+identity/variant mismatch, currency mismatch, out of stock, unknown stock, future
+observation, pre-search observation, stale evidence, or unknown total cost. Multiple
+reasons can apply. Existing `excluded_offer_ids` remain available and must match
+this structured list. Detailed display text points to the reasons without changing
+spoken cheapest/partial-coverage claims. Exclusion never invents a replacement
+price, shipping charge, stock status or exchange rate.
+
+Owned search checkpoints now also reject duplicate offer/snapshot IDs and links
+outside the issuing store's exact HTTPS origin during revalidation/restoration.
+Normalizers must assign globally distinct evidence IDs across stores within a
+search; raw retailer IDs without store/source namespacing are insufficient.
+Derived ranking contracts check that totals equal observed price + shipping + fees,
+that ranked/excluded IDs do not overlap, and that a complete result retains every
+minimum-price tie. Partial results still cannot contain confirmed cheapest offers.
+
+These checks enforce consistency of supplied observations; they do not establish
+that retailer claims are independently true or authenticate the submitting client.
+Browser receipts still require a trusted, owner-bound executor/normalizer. No live
+store extraction or provider selection was added in this change.

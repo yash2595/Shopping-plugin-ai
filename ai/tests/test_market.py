@@ -106,7 +106,6 @@ def test_rank_total_not_advertised_price_and_keep_ties(now):
         {"shipping": None},
         {"extra_tax_and_fees": None},
         {"in_stock": None},
-        {"observed_at": "2020-01-01T00:00:00Z"},
         {"currency": "USD"},
     ],
 )
@@ -192,9 +191,10 @@ def test_offer_links_cannot_escape_store(now, url):
 
 def test_future_prices_and_expired_prices_do_not_win(now):
     state = plan(now)
-    state = accept(state, receipt(state, 0, now + timedelta(seconds=5)))
+    with pytest.raises(ValueError, match="FUTURE_OFFER_EVIDENCE"):
+        accept(state, receipt(state, 0, now + timedelta(seconds=5)))
+    state = accept(state, receipt(state, 0, now))
     state = accept(state, receipt(state, 1, now))
-    assert not rank_offers(state, now=now, config=AIConfig()).cheapest_offer_ids
     assert not rank_offers(state, now=now + timedelta(days=1), config=AIConfig()).ranked
 
 
@@ -598,3 +598,85 @@ def test_market_summary_is_the_text_sent_to_speech_adapter(now):
     assert spoken == [reply.market_result.speech_text]
     assert spoken[0] != reply.message and "https://" not in spoken[0]
     assert reply.market_result.ranked[0].offer.url.startswith("https://")
+
+
+@pytest.mark.parametrize(
+    "updates,reasons",
+    [
+        ({"shipping": None}, {"unknown_total_cost"}),
+        ({"extra_tax_and_fees": None}, {"unknown_total_cost"}),
+        ({"currency": "USD"}, {"currency_mismatch"}),
+        ({"in_stock": None}, {"stock_unknown"}),
+        ({"in_stock": False}, {"out_of_stock"}),
+        ({"identity": identity(condition="used")}, {"identity_mismatch"}),
+    ],
+)
+def test_exclusions_explain_each_unranked_offer(now, updates, reasons):
+    state = plan(now)
+    state = accept(state, receipt(state, 0, now, **updates))
+    state = accept(state, receipt(state, 1, now))
+    result = rank_offers(state, now=now, config=AIConfig())
+    assert result.excluded_offer_ids == ("offer0",)
+    assert result.exclusions[0].store_id == "a"
+    assert result.exclusions[0].offer_id == "offer0"
+    assert set(result.exclusions[0].reasons) == reasons
+    assert result.ranked[0].offer.offer_id == "offer1"
+
+
+def test_stale_evidence_reports_reasons_without_reviving_prices(now):
+    state = plan(now)
+    state = accept(state, receipt(state, 0, now))
+    state = accept(state, receipt(state, 1, now))
+    later = now + timedelta(seconds=AIConfig().max_snapshot_age_seconds + 1)
+    result = rank_offers(state, now=later, config=AIConfig())
+    assert not result.ranked and not result.cheapest_offer_ids
+    assert len(result.exclusions) == 2
+    assert all(item.reasons == ("stale_observation",) for item in result.exclusions)
+
+
+def test_presearch_and_future_timestamps_are_rejected_without_consuming_task(now):
+    state = plan(now)
+    for observed, code in (
+        (now - timedelta(microseconds=1), "OFFER_PREDATES_SEARCH"),
+        (now + timedelta(microseconds=1), "FUTURE_OFFER_EVIDENCE"),
+    ):
+        with pytest.raises(ValueError, match=code):
+            accept(state, receipt(state, 0, observed))
+    assert state.version == 0 and not state.receipts
+    corrected = accept(state, receipt(state, 0, now))
+    assert corrected.version == 1 and len(corrected.receipts) == 1
+
+
+def test_restored_checkpoint_rejects_duplicate_or_foreign_offer_evidence(now):
+    from shopping_ai.market import MarketSearch
+
+    state = plan(now)
+    state = accept(state, receipt(state, 0, now))
+    state = accept(state, receipt(state, 1, now))
+    for changes in (
+        {"offer_id": "offer0"},
+        {"snapshot_id": "snap0"},
+        {"url": "https://evil.example/p"},
+    ):
+        data = state.model_dump()
+        second = state.receipts[1]
+        offer = Offer.model_validate(second.offers[0].model_dump() | changes)
+        second = SearchReceipt.model_validate(second.model_dump() | {"offers": (offer,)})
+        data["receipts"] = (state.receipts[0], second)
+        with pytest.raises(ValueError):
+            MarketSearch.model_validate(data)
+
+
+def test_derived_ranking_contract_cannot_invent_totals_or_drop_ties(now):
+    from shopping_ai.market import MarketResult, RankedOffer
+
+    state = plan(now)
+    state = accept(state, receipt(state, 0, now))
+    state = accept(state, receipt(state, 1, now))
+    result = rank_offers(state, now=now, config=AIConfig())
+    with pytest.raises(ValueError, match="observed price plus costs"):
+        RankedOffer.model_validate(result.ranked[0].model_dump() | {"total": "1"})
+    with pytest.raises(ValueError, match="retain every observed"):
+        MarketResult.model_validate(result.model_dump() | {"cheapest_offer_ids": ("offer0",)})
+    with pytest.raises(ValueError, match="match their reasons"):
+        MarketResult.model_validate(result.model_dump() | {"excluded_offer_ids": ("unknown",)})
