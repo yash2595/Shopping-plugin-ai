@@ -1,0 +1,49 @@
+{
+  "request_id": "demo_cart",
+  "message": "Black wala ek cart mein daal do",
+  "product": {
+    "snapshot_id": "snapshot_1",
+    "product_id": "earbuds_42",
+    "document_id": "doc_1",
+    "title": "Demo Earbuds",
+    "observed_at": "2026-10-18T16:30:00Z",
+    "selected_variant_id": "black",
+    "variants": [
+      {
+        "variant_id": "black",
+        "label": "Black"
+      },
+      {
+        "variant_id": "blue",
+        "label": "Blue"
+      }
+    ],
+    "price": "1499.00",
+    "currency": "INR",
+    "in_stock": true,
+    "specs": {
+      "Battery": "Up to 30 hours (retailer claim)"
+    }
+  },
+  "available_tools": [
+    "read_product",
+    "read_cart",
+    "select_variant",
+    "add_to_cart"
+  ],
+  "authorization": {
+    "product_id": "earbuds_42",
+    "document_id": "doc_1",
+    "variant_id": "black",
+    "quantity": 1,
+    "mode": "ensure_quantity",
+    "max_unit_price": "1999.00",
+    "currency": "INR",
+    "expires_at": "2026-10-18T16:32:00Z",
+    "request_id": "demo_cart",
+    "allowed_tools": [
+      "select_variant",
+      "add_to_cart"
+    ]
+  }
+}

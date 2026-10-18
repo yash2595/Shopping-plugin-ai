@@ -1,0 +1,31 @@
+{
+  "request_id": "demo_question",
+  "message": "Iska price aur colour kya hai?",
+  "product": {
+    "snapshot_id": "snapshot_1",
+    "product_id": "earbuds_42",
+    "document_id": "doc_1",
+    "title": "Demo Earbuds",
+    "observed_at": "2026-10-18T16:30:00Z",
+    "selected_variant_id": "black",
+    "variants": [
+      {
+        "variant_id": "black",
+        "label": "Black"
+      },
+      {
+        "variant_id": "blue",
+        "label": "Blue"
+      }
+    ],
+    "price": "1499.00",
+    "currency": "INR",
+    "in_stock": true,
+    "specs": {
+      "Battery": "Up to 30 hours (retailer claim)"
+    }
+  },
+  "available_tools": [
+    "read_product"
+  ]
+}
