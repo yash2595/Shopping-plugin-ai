@@ -170,11 +170,64 @@ def test_changed_price_invalidates_cached_store_ranking(setup, now):
         NavigationReceipt.model_validate(item.model_dump() | {"product": product}),
     )
     assert verified.state.products[-1].price == 200
+    assert verified.offer_verification.base_price_difference == Decimal("100")
+    assert "Previous base price INR 100.00; current INR 200.00" in verified.message
+    assert "increased: INR 100.00" in verified.speech_text
     assert verified.state.active_market.receipts[0].status == "failed"
     assert not verified.state.market_display_ids
     followup = say(dialogue, principal, verified.state, target, "cheapest")
     assert followup.market_result.status == "partial"
     assert not followup.market_result.cheapest_offer_ids
+
+
+@pytest.mark.parametrize(
+    "changes,delta,expected",
+    [
+        ({"price": "80"}, Decimal("-20"), "decreased: INR 20.00"),
+        ({"currency": "USD"}, None, "current USD 100.00"),
+        ({"price": None, "currency": None}, None, "current unknown"),
+        ({"in_stock": False}, Decimal("0"), "current out of stock"),
+        ({"in_stock": None}, Decimal("0"), "current unknown"),
+    ],
+)
+def test_page_change_explanations_preserve_unknowns_and_do_not_convert_currency(
+    setup, now, changes, delta, expected
+):
+    dialogue, principal, state, target = setup
+    pending = say(dialogue, principal, state, target)
+    item = receipt(pending.navigation, now)
+    product = ProductSnapshot.model_validate(item.product.model_dump() | changes)
+    verified = accept(
+        dialogue,
+        principal,
+        pending,
+        NavigationReceipt.model_validate(item.model_dump() | {"product": product}),
+    )
+    report = verified.offer_verification
+    assert report.changed and report.base_price_difference == delta
+    assert report.proposal == pending.navigation and report.product == product
+    assert expected in verified.speech_text
+    assert "fresh delivered total is not verified" in verified.speech_text
+    assert not verified.search_tasks and verified.action is None
+    assert verified.state.active_market.receipts[0].status == "failed"
+    if changes.get("currency") == "USD":
+        assert "increased" not in verified.message and "decreased" not in verified.message
+
+
+def test_unchanged_page_report_roundtrips_and_rejects_unowned_snapshot(setup, now):
+    from shopping_ai.conversation import ConversationReply
+
+    dialogue, principal, state, target = setup
+    pending = say(dialogue, principal, state, target)
+    verified = accept(dialogue, principal, pending, receipt(pending.navigation, now))
+    report = verified.offer_verification
+    assert not report.changed and report.base_price_difference == 0
+    assert report.explanation("en") == ""
+    assert ConversationReply.model_validate_json(verified.model_dump_json()) == verified
+    fake = report.model_dump()
+    fake["product"]["snapshot_id"] = "unobserved"
+    with pytest.raises(ValueError, match="owned search and selected page"):
+        ConversationReply.model_validate(verified.model_dump() | {"offer_verification": fake})
 
 
 def test_expired_hidden_and_cancelled_navigation_do_not_complete(setup, now):

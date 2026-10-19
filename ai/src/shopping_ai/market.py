@@ -125,6 +125,7 @@ class MarketSearch(Contract):
     version: Annotated[int, Field(strict=True, ge=0)] = 0
     identity: ProductIdentity
     currency: Currency
+    max_total: Money | None = None
     delivery_context: ShortText  # e.g. delivery postcode; no full address needed
     created_at: AwareDatetime
     deadline_at: AwareDatetime
@@ -194,16 +195,18 @@ ExclusionReason = Literal[
     "predates_search",
     "stale_observation",
     "unknown_total_cost",
+    "over_budget",
 ]
 
 
 class OfferExclusion(Contract):
     store_id: Identifier
     offer_id: Identifier
-    reasons: tuple[ExclusionReason, ...] = Field(min_length=1, max_length=8)
+    reasons: tuple[ExclusionReason, ...] = Field(min_length=1, max_length=9)
 
 
 class MarketResult(Contract):
+    max_total: Money | None = None
     search_id: Identifier
     status: Literal["searching", "complete", "partial"]
     ranked: tuple[RankedOffer, ...]
@@ -218,6 +221,8 @@ class MarketResult(Contract):
 
     @model_validator(mode="after")
     def evidence_partition(self):
+        if self.max_total is not None and any(item.total > self.max_total for item in self.ranked):
+            raise ValueError("Ranked offers cannot exceed the observed total budget")
         rejected = tuple(item.offer_id for item in self.exclusions)
         ranked_ids = [item.offer.offer_id for item in self.ranked]
         if rejected != self.excluded_offer_ids or len(set(rejected)) != len(rejected):
@@ -247,6 +252,7 @@ def plan_search(
     stores: tuple[Store, ...],
     now: datetime,
     timeout_seconds: int = 120,
+    max_total: Money | None = None,
 ) -> MarketSearch:
     if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 600:
         raise ValueError("Search timeout must be an integer in 1-600 seconds")
@@ -263,6 +269,7 @@ def plan_search(
         session_id=session_id,
         identity=identity,
         currency=currency,
+        max_total=max_total,
         delivery_context=delivery_context,
         created_at=now,
         deadline_at=now + timedelta(seconds=timeout_seconds),
@@ -381,6 +388,29 @@ def expire_search(
     )
 
 
+def update_budget(
+    state: MarketSearch,
+    max_total: Money | None,
+    *,
+    owner_id: str,
+    session_id: str,
+    expected_version: int,
+) -> MarketSearch:
+    state = MarketSearch.model_validate(state.model_dump())
+    if (state.owner_id, state.session_id) != (owner_id, session_id):
+        raise ValueError("SEARCH_OWNER_MISMATCH")
+    if state.version != expected_version:
+        raise ValueError("SEARCH_VERSION_CONFLICT")
+    updated = MarketSearch.model_validate(
+        state.model_dump()
+        | {
+            "max_total": max_total,
+            "version": state.version + 1,
+        }
+    )
+    return state if updated.max_total == state.max_total else updated
+
+
 def rank_offers(
     state: MarketSearch,
     *,
@@ -400,7 +430,8 @@ def rank_offers(
         for offer in receipt.offers:
             age = (now - offer.observed_at).total_seconds()
             reasons = []
-            if not state.identity.matches(offer.identity):
+            matches = state.identity.matches(offer.identity)
+            if not matches:
                 reasons.append("identity_mismatch")
             if offer.currency != state.currency:
                 reasons.append("currency_mismatch")
@@ -416,6 +447,21 @@ def rank_offers(
                 reasons.append("predates_search")
             if offer.total is None:
                 reasons.append("unknown_total_cost")
+            # Unknown nonnegative fees cannot rescue a base price already above
+            # the cap. Stale/cross-currency evidence cannot prove budget failure.
+            over_budget = (
+                state.max_total is not None
+                and matches
+                and offer.currency == state.currency
+                and 0 <= age <= config.max_snapshot_age_seconds
+                and offer.observed_at >= state.created_at
+                and (
+                    offer.price > state.max_total
+                    or (offer.total is not None and offer.total > state.max_total)
+                )
+            )
+            if over_budget:
+                reasons.append("over_budget")
             if reasons:
                 excluded.append(offer.offer_id)
                 exclusions.append(
@@ -427,7 +473,7 @@ def rank_offers(
                 )
                 # A mismatched variant or unavailable offer cannot win. Other
                 # unknown evidence prevents a definitive cheapest claim.
-                if state.identity.matches(offer.identity) and offer.in_stock is not False:
+                if matches and offer.in_stock is not False and not over_budget:
                     uncertain = True
                 continue
             ranked.append(
@@ -476,6 +522,14 @@ def rank_offers(
             if hi
             else "No fresh, exact-match offers with verified total costs are available."
         )
+    if state.max_total is not None:
+        if not ranked and any("over_budget" in item.reasons for item in exclusions):
+            message = (
+                "Returned observations mein budget ke andar verified eligible offer nahi mila."
+                if hi
+                else "No verified eligible offer within budget in the returned observations."
+            )
+        message += f" Single-offer total budget: {state.currency} {state.max_total:.2f}."
     disclaimer = (
         " Conditional discounts deduct nahi kiye. Prices diye gaye delivery context ke liye hain."
         if hi
@@ -519,6 +573,7 @@ def rank_offers(
         )
     return MarketResult(
         search_id=state.search_id,
+        max_total=state.max_total,
         status=status,
         ranked=tuple(ranked),
         excluded_offer_ids=tuple(excluded),

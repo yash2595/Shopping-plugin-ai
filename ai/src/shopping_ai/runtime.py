@@ -9,7 +9,7 @@ from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime
 from typing import Annotated, Literal
 
-from pydantic import Field, TypeAdapter
+from pydantic import Field, TypeAdapter, model_validator
 
 from shopping_ai.browser import BrowserResult, BrowserTarget
 from shopping_ai.checkpoint import dump_checkpoint, load_checkpoint
@@ -25,13 +25,20 @@ from shopping_ai.engine import ShoppingAI
 from shopping_ai.intents import Interpreter
 from shopping_ai.market import SearchReceipt, Store
 from shopping_ai.market_dialogue import DetailInterpreter
-from shopping_ai.models import Contract
+from shopping_ai.models import Contract, Identifier
 from shopping_ai.navigation import NavigationReceipt
 from shopping_ai.orchestrator import Orchestrator, Principal
 from shopping_ai.providers.base import DecisionProvider
 from shopping_ai.providers.chat import ChatProvider, ChatSettings
 from shopping_ai.providers.speech import SpeechProvider, SpeechSettings
-from shopping_ai.voice import Synthesizer, Transcriber, VoiceConversation, VoiceReply, VoiceTurn
+from shopping_ai.voice import (
+    AudioClip,
+    Synthesizer,
+    Transcriber,
+    VoiceConversation,
+    VoiceReply,
+    VoiceTurn,
+)
 
 
 class TextEvent(Contract):
@@ -42,6 +49,11 @@ class TextEvent(Contract):
 class AudioEvent(Contract):
     kind: Literal["audio"] = "audio"
     turn: VoiceTurn
+
+
+class CancelEvent(Contract):
+    kind: Literal["cancel"] = "cancel"
+    request_id: Identifier
 
 
 class BrowserEvent(Contract):
@@ -76,6 +88,7 @@ class ExpireEvent(Contract):
 AssistantEvent = Annotated[
     TextEvent
     | AudioEvent
+    | CancelEvent
     | BrowserEvent
     | MarketEvent
     | NavigationEvent
@@ -116,6 +129,21 @@ class VoiceOutput(Contract):
 AssistantOutput = Annotated[TextOutput | VoiceOutput, Field(discriminator="kind")]
 
 
+class SpeechOutput(Contract):
+    """Playback-only result: no state update or dispatchable browser proposals."""
+
+    conversation_id: Identifier
+    version: Annotated[int, Field(strict=True, ge=0)]
+    status: Literal["complete", "error"]
+    audio: AudioClip | None = None
+
+    @model_validator(mode="after")
+    def coherent(self):
+        if (self.status == "complete") != (self.audio is not None):
+            raise ValueError("Complete speech output requires audio")
+        return self
+
+
 class AssistantRuntime:
     def __init__(self, conversation: Conversation, voice: VoiceConversation | None = None):
         if voice is not None and voice.conversation is not conversation:
@@ -146,6 +174,36 @@ class AssistantRuntime:
         if self.voice is None:
             raise ValueError("VOICE_NOT_CONFIGURED")
         return self.voice
+
+    async def render_speech(
+        self,
+        state: ConversationState,
+        principal: Principal,
+        reply: ConversationReply,
+        *,
+        expected_version: int,
+    ) -> SpeechOutput:
+        """Render a persisted current reply; never rerun STT, intent or actions.
+
+        State/reply must come from trusted caller storage. This method cannot
+        establish a database commit or prevent a concurrent newer turn during TTS.
+        Compare returned version to current storage again before playback.
+        """
+        state = ConversationState.model_validate(state.model_dump(warnings=False))
+        if state.principal != principal:
+            raise ConversationError("CONVERSATION_ACCESS_DENIED")
+        if state.version != expected_version:
+            raise ConversationError("STALE_CONVERSATION_VERSION")
+        reply = ConversationReply.model_validate(reply.model_dump(warnings=False))
+        if reply.state != state:
+            raise ConversationError("SPEECH_REPLY_STATE_MISMATCH")
+        rendered = await self._require_voice().speak(reply, principal)
+        return SpeechOutput(
+            conversation_id=state.conversation_id,
+            version=state.version,
+            status="complete" if rendered.audio is not None else "error",
+            audio=rendered.audio,
+        )
 
     async def _output(
         self,
@@ -181,6 +239,7 @@ class AssistantRuntime:
         *,
         expected_version: int,
         speak: bool = False,
+        defer_speech: bool = False,
     ) -> AssistantOutput:
         # Check ownership before any provider work or dispatch-specific behavior.
         state = ConversationState.model_validate(state.model_dump(warnings=False))
@@ -189,6 +248,8 @@ class AssistantRuntime:
         if state.version != expected_version:
             raise ConversationError("STALE_CONVERSATION_VERSION")
         event = EVENTS.validate_python(event)
+        if defer_speech and (speak or not isinstance(event, AudioEvent)):
+            raise ValueError("Deferred speech requires an audio event without speak=True")
         if isinstance(event, AudioEvent):
             return VoiceOutput(
                 reply=await self._require_voice().respond(
@@ -196,6 +257,7 @@ class AssistantRuntime:
                     principal,
                     event.turn,
                     expected_version=expected_version,
+                    defer_speech=defer_speech,
                 )
             )
         if speak:
@@ -204,6 +266,13 @@ class AssistantRuntime:
         conversation = self.conversation
         if isinstance(event, TextEvent):
             reply = await conversation.respond(state, principal, event.turn, **kwargs)
+        elif isinstance(event, CancelEvent):
+            reply = await conversation.respond(
+                state,
+                principal,
+                ConversationTurn(request_id=event.request_id, message="stop"),
+                **kwargs,
+            )
         elif isinstance(event, BrowserEvent):
             reply = conversation.accept_result(state, principal, event.result, **kwargs)
         elif isinstance(event, MarketEvent):

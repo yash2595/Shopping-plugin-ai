@@ -19,7 +19,11 @@ from shopping_ai.intents import (
     Meaning,
     Requirements,
     SlotName,
+    explicit_mutation_request,
     explicit_open_request,
+    explicit_refresh_request,
+    requirements_supported,
+    unsupported_compound_request,
 )
 from shopping_ai.market import (
     MarketResult,
@@ -32,6 +36,7 @@ from shopping_ai.market import (
     expire_search,
     plan_search,
     rank_offers,
+    update_budget,
 )
 from shopping_ai.market_answers import MarketAnswer, answer_market
 from shopping_ai.market_dialogue import (
@@ -52,6 +57,7 @@ from shopping_ai.models import (
 from shopping_ai.navigation import (
     NavigationReceipt,
     OfferNavigation,
+    OfferPageVerification,
     propose_navigation,
     verify_navigation,
 )
@@ -160,6 +166,7 @@ class ConversationReply(Contract):
     search_tasks: tuple[SearchTask, ...] = Field(default_factory=tuple, max_length=6)
     market_result: MarketResult | None = None
     market_answer: MarketAnswer | None = None
+    offer_verification: OfferPageVerification | None = None
 
     @model_validator(mode="after")
     def action_binding(self) -> Self:
@@ -170,6 +177,21 @@ class ConversationReply(Contract):
         ):
             raise ValueError("Navigation cannot dispatch other browser work")
         market = self.state.active_market
+        if self.offer_verification:
+            report = self.offer_verification
+            if (
+                market is None
+                or report.proposal.search_id != market.search_id
+                or (report.proposal.owner_id, report.proposal.session_id)
+                != (self.state.principal.owner_id, self.state.principal.session_id)
+                or report.product not in self.state.products
+                or report.product.product_id != self.state.selected_id
+                or self.state.pending_navigation is not None
+                or self.status != "complete"
+            ):
+                raise ValueError(
+                    "Offer verification must match this owned search and selected page"
+                )
         if self.search_tasks and (
             self.status != "ready_for_search"
             or market is None
@@ -239,6 +261,7 @@ class Conversation:
         self.orchestrator = orchestrator
         self.interpreter = interpreter or BasicInterpreter()
         self.detail_interpreter = detail_interpreter or OfflineDetailInterpreter()
+        self._intent_capacity = asyncio.Semaphore(orchestrator.ai.config.max_concurrent_calls)
         self._detail_capacity = asyncio.Semaphore(orchestrator.ai.config.max_concurrent_calls)
         self.stores = tuple(Store.model_validate(store.model_dump()) for store in stores)
         if self.stores and (
@@ -274,6 +297,7 @@ class Conversation:
         search_tasks: tuple[SearchTask, ...] = (),
         market_result: MarketResult | None = None,
         market_answer: MarketAnswer | None = None,
+        offer_verification: OfferPageVerification | None = None,
         **updates,
     ) -> ConversationReply:
         if market_result is not None:
@@ -309,6 +333,7 @@ class Conversation:
             search_tasks=search_tasks,
             market_result=market_result,
             market_answer=market_answer,
+            offer_verification=offer_verification,
         )
 
     def start(
@@ -367,6 +392,7 @@ class Conversation:
             stores=stores,
             now=self.orchestrator.ai.clock(),
             timeout_seconds=self.orchestrator.ai.config.search_timeout_seconds,
+            max_total=state.requirements.budget,
         )
         return self._reply(
             state,
@@ -471,6 +497,20 @@ class Conversation:
             return ConversationState.model_validate(state.model_dump() | {"active_market": market})
         return state
 
+    async def _interpret(self, message: str, awaiting: SlotName | None) -> Meaning:
+        config = self.orchestrator.ai.config
+        try:
+            async with asyncio.timeout(config.capacity_wait_seconds):
+                await self._intent_capacity.acquire()
+        except TimeoutError:
+            raise ProviderError("INTENT_CAPACITY", retryable=True) from None
+        try:
+            async with asyncio.timeout(config.timeout_seconds):
+                raw = await self.interpreter.interpret(message, awaiting)
+            return Meaning.model_validate(raw.model_dump(warnings=False))
+        finally:
+            self._intent_capacity.release()
+
     async def respond(
         self,
         state: ConversationState,
@@ -519,12 +559,22 @@ class Conversation:
             state.active_market is not None
             and len(state.active_market.receipts) < len(state.active_market.tasks)
         )
+        if unsupported_compound_request(turn.message):
+            return self._reply(
+                state,
+                "needs_input",
+                self._text(
+                    state,
+                    "Please give one task at a time: search/compare, open an offer, "
+                    "select a variant, or add to cart. The combined request needs clarification.",
+                    "Ek baar mein ek task batao: search/compare, offer kholo, variant select "
+                    "karo, ya cart mein add karo. Combined request clear karni hogi.",
+                ),
+            )
         if state.market_draft is not None and not busy:
             return await self._collect_market_details(state, turn.message)
         try:
-            async with asyncio.timeout(self.orchestrator.ai.config.timeout_seconds):
-                raw = await self.interpreter.interpret(turn.message, state.awaiting)
-            meaning = Meaning.model_validate(raw.model_dump(warnings=False))
+            meaning = await self._interpret(turn.message, state.awaiting)
         except TimeoutError:
             return self._reply(
                 state,
@@ -535,7 +585,17 @@ class Conversation:
                     "Request samajhne mein timeout hua. Dobara try karo.",
                 ),
             )
-        except ProviderError:
+        except ProviderError as exc:
+            if exc.code == "INTENT_CAPACITY":
+                return self._reply(
+                    state,
+                    "error",
+                    self._text(
+                        state,
+                        "Request understanding is busy. Please retry shortly.",
+                        "Abhi requests zyada hain. Thodi der mein dobara try karo.",
+                    ),
+                )
             return self._reply(
                 state,
                 "error",
@@ -543,6 +603,20 @@ class Conversation:
                     state,
                     "The request could not be understood. Please retry.",
                     "Request samajh nahi aayi. Dobara try karo.",
+                ),
+            )
+        if meaning.intent in {"add_to_cart", "select_variant"} and not explicit_mutation_request(
+            turn.message, meaning.intent
+        ):
+            return self._reply(
+                state,
+                "needs_input",
+                self._text(
+                    state,
+                    "Please explicitly request adding to cart or selecting a variant. "
+                    "Questions or negated requests do not authorize a change.",
+                    "Cart mein add karne ya variant select karne ka clear request do. "
+                    "Sawaal ya mana karne se page change nahi hoga.",
                 ),
             )
         if meaning.intent in {"greeting", "help"}:
@@ -561,6 +635,8 @@ class Conversation:
             "market_coverage",
             "market_exclusions",
             "market_costs",
+            "market_savings",
+            "market_availability",
         }:
             return self._reply(
                 state,
@@ -581,7 +657,49 @@ class Conversation:
                     "Kya dhoondhna, samajhna ya change karna hai? Abhi koi action nahi kiya.",
                 ),
             )
+        if not requirements_supported(meaning.slots, turn.message, state.awaiting):
+            return self._reply(
+                state,
+                "needs_input",
+                self._text(
+                    state,
+                    "Please state the product preferences and budget explicitly. "
+                    "I could not verify the interpreted requirements from your message.",
+                    "Product preferences aur budget clearly batao. Message se interpreted "
+                    "requirements verify nahi hue.",
+                ),
+            )
         patch = meaning.slots.model_dump(exclude_none=True)
+        identity_changed = False
+        if state.active_market is not None:
+            attributes = state.active_market.identity.attributes
+            for key in ("category", "colour", "size"):
+                if key not in patch:
+                    continue
+                aliases = {"colour", "color"} if key == "colour" else {key}
+                observed = [
+                    value
+                    for label, value in attributes.items()
+                    if key != "category" and label.strip().casefold() in aliases
+                ]
+                previous = getattr(state.requirements, key)
+                if not observed and previous is not None:
+                    observed = [previous]
+                proposed = " ".join(patch[key].casefold().split())
+                if not observed or any(
+                    " ".join(value.casefold().split()) != proposed for value in observed
+                ):
+                    identity_changed = True
+        if identity_changed and busy:
+            return self._reply(
+                state,
+                "paused",
+                self._text(
+                    state,
+                    "A task is active. Stop or finish it before changing product preferences.",
+                    "Task active hai. Preferences badalne se pehle use roko ya complete karo.",
+                ),
+            )
         sources = state.slot_sources | {key: turn.request_id for key in patch}
         state = ConversationState.model_validate(
             state.model_dump()
@@ -590,6 +708,53 @@ class Conversation:
                 "slot_sources": sources,
             }
         )
+        if identity_changed and meaning.intent == "select_variant":
+            state = ConversationState.model_validate(
+                state.model_dump()
+                | {"active_market": None, "market_display_ids": (), "market_draft": None}
+            )
+        elif identity_changed and meaning.intent != "market_search":
+            return self._reply(
+                state,
+                "needs_input",
+                self._text(
+                    state,
+                    "Product preferences changed. Previous offers and product references "
+                    "are cleared. "
+                    "Start a new cross-store search and confirm the exact product/variant details.",
+                    "Preferences badli hain. Purane offers aur product references clear hain. "
+                    "Nayi search shuru karke exact product/variant details confirm karo.",
+                ),
+                active_market=None,
+                market_display_ids=(),
+                market_draft=None,
+                active_run=None,
+                products=(),
+                selected_id=None,
+                previous_id=None,
+                awaiting=None,
+            )
+        if meaning.intent == "requirements" and set(patch) == {"budget"} and state.active_market:
+            market = update_budget(
+                state.active_market,
+                state.requirements.budget,
+                owner_id=principal.owner_id,
+                session_id=principal.session_id,
+                expected_version=state.active_market.version,
+            )
+            result = rank_offers(
+                market,
+                now=self.orchestrator.ai.clock(),
+                config=self.orchestrator.ai.config,
+                language=state.language,
+            )
+            return self._reply(
+                state,
+                "complete",
+                result.message,
+                active_market=market,
+                market_result=result,
+            )
         if meaning.intent == "requirements":
             for slot, en, hi in [
                 ("category", "What product do you need?", "Kaunsa product chahiye?"),
@@ -623,7 +788,13 @@ class Conversation:
                     "previous_id": state.previous_id if state.previous_id in ids else None,
                 }
             )
-        if meaning.intent in {"market_coverage", "market_exclusions", "market_costs"}:
+        if meaning.intent in {
+            "market_coverage",
+            "market_exclusions",
+            "market_costs",
+            "market_savings",
+            "market_availability",
+        }:
             return self._market_question(state, meaning, busy=busy)
         if meaning.intent == "open_offer":
             if not explicit_open_request(turn.message):
@@ -637,6 +808,29 @@ class Conversation:
                     ),
                 )
             return self._open_offer(state, meaning, turn.target)
+        if meaning.intent == "market_refresh":
+            market = state.active_market
+            if not explicit_refresh_request(turn.message) or market is None or not self.stores:
+                return self._reply(
+                    state,
+                    "needs_input",
+                    self._text(
+                        state,
+                        "Use 'refresh prices' for a saved confirmed search with configured stores. "
+                        "To change product or delivery details, start a new cross-store search.",
+                        "Saved confirmed search aur configured stores ke liye "
+                        "'refresh prices' bolo. Product ya delivery details badalne ke liye "
+                        "nayi cross-store search shuru karo.",
+                    ),
+                )
+            return self.begin_market_search(
+                state,
+                principal,
+                identity=market.identity,
+                delivery_context=market.delivery_context,
+                stores=self.stores,
+                expected_version=state.version,
+            )
         if meaning.intent == "market_search":
             draft = MarketDraft()
             state = ConversationState.model_validate(
@@ -644,6 +838,8 @@ class Conversation:
             )
             return await self._collect_market_details(state, turn.message, initial=True)
         if meaning.intent == "compare":
+            if state.active_market is not None and meaning.comparison_indices is not None:
+                return self._compare_market_offers(state, meaning, busy=busy)
             if (
                 state.active_market is not None
                 and meaning.reference == "selected"
@@ -813,6 +1009,36 @@ class Conversation:
         run = await self.orchestrator.advance(run, principal, expected_version=run.version)
         return self._run_reply(state, run)
 
+    def _compare_market_offers(
+        self, state: ConversationState, meaning: Meaning, *, busy: bool
+    ) -> ConversationReply:
+        indices = meaning.comparison_indices
+        if any(index > len(state.market_display_ids) for index in indices):
+            return self._reply(
+                state,
+                "needs_input",
+                self._text(
+                    state,
+                    "Choose two offers from the last displayed search results.",
+                    "Last displayed search results se do offers choose karo.",
+                ),
+            )
+        result, answer = answer_market(
+            state.active_market,
+            "comparison",
+            pair_ids=tuple(state.market_display_ids[index - 1] for index in indices),
+            now=self.orchestrator.ai.clock(),
+            config=self.orchestrator.ai.config,
+            language=state.language,
+        )
+        return self._reply(
+            state,
+            "needs_input" if answer.status == "needs_input" else "chat" if busy else "complete",
+            answer.message,
+            market_result=result,
+            market_answer=answer,
+        )
+
     def _market_question(
         self,
         state: ConversationState,
@@ -966,11 +1192,8 @@ class Conversation:
         if previous not in {p.product_id for p in products}:
             previous = None
         market = state.active_market
-        changed = (
-            product.price != action.offer.price
-            or product.currency != action.offer.currency
-            or product.in_stock is not True
-        )
+        verification = OfferPageVerification(proposal=action, product=product)
+        changed = verification.changed
         if changed:
             # Contradicted listing evidence must not keep winning in cached rankings.
             receipts = tuple(
@@ -992,11 +1215,7 @@ class Conversation:
             "Requested offer ka page verify ho gaya. Fresh product evidence select ho gaya hai.",
         )
         if changed:
-            message += self._text(
-                state,
-                " Price/availability changed or is unknown; refresh cross-store prices.",
-                " Price/availability badli hai ya unknown hai; cross-store prices refresh karo.",
-            )
+            message += " " + verification.explanation(state.language)
         return self._reply(
             state,
             "complete",
@@ -1008,6 +1227,7 @@ class Conversation:
             previous_id=previous,
             market_display_ids=() if changed else state.market_display_ids,
             facts=product_facts(product)[:10],
+            offer_verification=verification,
         )
 
     async def _collect_market_details(

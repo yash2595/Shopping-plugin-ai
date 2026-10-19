@@ -57,7 +57,7 @@ class VoiceTurn(ConversationContext):
 
 
 class VoiceReply(Contract):
-    status: Literal["complete", "needs_input", "error"]
+    status: Literal["ready", "complete", "needs_input", "error"]
     message: str
     reply: ConversationReply | None = None
     audio: AudioClip | None = None
@@ -65,7 +65,10 @@ class VoiceReply(Contract):
 
     @model_validator(mode="after")
     def coherent(self):
-        if self.status == "complete":
+        if self.status == "ready":
+            if self.reply is None or self.audio is not None or self.failed_stage is not None:
+                raise ValueError("Ready voice turn requires a reply awaiting synthesis")
+        elif self.status == "complete":
             if self.reply is None or self.audio is None or self.failed_stage is not None:
                 raise ValueError("Complete voice turn requires reply and audio")
         elif self.audio is not None or self.failed_stage is None:
@@ -103,6 +106,7 @@ class VoiceConversation:
         turn: VoiceTurn,
         *,
         expected_version: int,
+        defer_speech: bool = False,
     ) -> VoiceReply:
         state = ConversationState.model_validate(state.model_dump(warnings=False))
         # Authorize and validate before sending audio to any external adapter.
@@ -181,6 +185,8 @@ class VoiceConversation:
                     message="The voice request could not be processed.",
                     failed_stage="conversation",
                 )
+            if defer_speech:
+                return VoiceReply(status="ready", message=reply.message, reply=reply)
             return await self.speak(reply, principal)
         finally:
             self._capacity.release()

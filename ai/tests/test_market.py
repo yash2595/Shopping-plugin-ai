@@ -680,3 +680,298 @@ def test_derived_ranking_contract_cannot_invent_totals_or_drop_ties(now):
         MarketResult.model_validate(result.model_dump() | {"cheapest_offer_ids": ("offer0",)})
     with pytest.raises(ValueError, match="match their reasons"):
         MarketResult.model_validate(result.model_dump() | {"excluded_offer_ids": ("unknown",)})
+
+
+def set_budget(state, amount):
+    from shopping_ai.market import update_budget
+
+    return update_budget(
+        state,
+        amount,
+        owner_id=state.owner_id,
+        session_id=state.session_id,
+        expected_version=state.version,
+    )
+
+
+def test_budget_uses_total_including_shipping_and_accepts_exact_boundary(now):
+    state = set_budget(plan(now), "100")
+    state = accept(state, receipt(state, 0, now, price="90", shipping="20"))
+    state = accept(state, receipt(state, 1, now, price="95", shipping="5"))
+    result = rank_offers(state, now=now, config=AIConfig())
+    assert result.max_total == Decimal("100")
+    assert result.cheapest_offer_ids == ("offer1",)
+    assert result.ranked[0].total == Decimal("100")
+    assert result.exclusions[0].reasons == ("over_budget",)
+    assert "INR 100.00" in result.speech_text
+
+
+def test_all_over_budget_offers_produce_no_recommendation(now):
+    state = set_budget(plan(now), "99")
+    state = accept(state, receipt(state, 0, now))
+    state = accept(state, receipt(state, 1, now))
+    result = rank_offers(state, now=now, config=AIConfig())
+    assert result.status == "complete"
+    assert not result.ranked and not result.cheapest_offer_ids
+    assert "within budget" in result.message and "lowest verified" not in result.speech_text
+    assert all("over_budget" in item.reasons for item in result.exclusions)
+
+
+def test_unknown_fees_do_not_rescue_an_over_budget_base_price(now):
+    state = set_budget(plan(now), "200")
+    state = accept(state, receipt(state, 0, now, price="300", shipping=None))
+    state = accept(state, receipt(state, 1, now, price="100"))
+    result = rank_offers(state, now=now, config=AIConfig())
+    assert result.status == "complete" and result.cheapest_offer_ids == ("offer1",)
+    assert set(result.exclusions[0].reasons) == {"unknown_total_cost", "over_budget"}
+
+
+def test_unknown_fees_below_budget_remain_unresolved(now):
+    state = set_budget(plan(now), "200")
+    state = accept(state, receipt(state, 0, now, price="100", shipping=None))
+    state = accept(state, receipt(state, 1, now, price="150"))
+    result = rank_offers(state, now=now, config=AIConfig())
+    assert result.status == "partial" and not result.cheapest_offer_ids
+    assert "over_budget" not in result.exclusions[0].reasons
+
+
+def test_conditional_coupon_never_makes_an_offer_fit_budget(now):
+    state = set_budget(plan(now), "200")
+    state = accept(
+        state, receipt(state, 0, now, price="210", conditional_discount_note="Bank card 30 off")
+    )
+    state = accept(state, receipt(state, 1, now))
+    result = rank_offers(state, now=now, config=AIConfig())
+    assert result.cheapest_offer_ids == ("offer1",)
+    assert result.exclusions[0].reasons == ("over_budget",)
+
+
+def test_stale_and_foreign_currency_values_cannot_prove_budget_failure(now):
+    state = set_budget(plan(now), "50")
+    state = accept(state, receipt(state, 0, now, currency="USD"))
+    state = accept(state, receipt(state, 1, now))
+    result = rank_offers(state, now=now, config=AIConfig())
+    assert result.exclusions[0].reasons == ("currency_mismatch",)
+    stale = rank_offers(state, now=now + timedelta(days=1), config=AIConfig())
+    assert all("over_budget" not in item.reasons for item in stale.exclusions)
+    assert stale.status == "partial" and not stale.cheapest_offer_ids
+
+
+def test_budget_change_requires_owner_and_current_market_version(now):
+    from shopping_ai.market import update_budget
+
+    state = plan(now)
+    for changes in ({"owner_id": "other"}, {"session_id": "other"}, {"expected_version": 1}):
+        with pytest.raises(ValueError):
+            update_budget(
+                state,
+                "100",
+                **(
+                    dict(
+                        owner_id=state.owner_id,
+                        session_id=state.session_id,
+                        expected_version=state.version,
+                    )
+                    | changes
+                ),
+            )
+    with pytest.raises(ValueError):
+        set_budget(state, "-1")
+    updated = set_budget(state, "100")
+    assert updated.version == state.version + 1 and state.max_total is None
+    assert set_budget(updated, "100") == updated
+
+
+def test_dialogue_budget_changes_rerank_same_evidence_without_new_search(now):
+    from shopping_ai import ConversationTurn
+    from shopping_ai.checkpoint import dump_checkpoint, load_checkpoint
+
+    conversation, principal, state = dialogue(now)
+    reply = begin(conversation, principal, state, now)
+    for index in range(2):
+        reply = conversation.accept_market_receipt(
+            reply.state,
+            principal,
+            receipt(reply.state.active_market, index, now, price=str(100 + index * 50)),
+            expected_version=reply.state.version,
+        )
+    original = reply.state.active_market
+    for index, (budget, expected) in enumerate((("90", ()), ("120", ("offer0",)))):
+        reply = asyncio.run(
+            conversation.respond(
+                reply.state,
+                principal,
+                ConversationTurn(
+                    request_id=f"budget{index}",
+                    message=f"budget {budget}",
+                ),
+                expected_version=reply.state.version,
+            )
+        )
+        assert reply.market_result.cheapest_offer_ids == expected
+        assert reply.state.active_market.max_total == Decimal(budget)
+        assert reply.state.active_market.search_id == original.search_id
+        assert reply.state.active_market.deadline_at == original.deadline_at
+        assert reply.state.active_market.receipts == original.receipts
+        assert not reply.search_tasks and reply.action is None and reply.navigation is None
+    restored = load_checkpoint(
+        dump_checkpoint(reply.state, principal),
+        principal,
+        conversation_id=reply.state.conversation_id,
+        expected_version=reply.state.version,
+    )
+    assert restored.active_market.max_total == Decimal("120")
+
+
+def test_new_search_inherits_budget_but_pending_search_cannot_be_overwritten(now):
+    from shopping_ai import ConversationTurn
+
+    conversation, principal, state = dialogue(now)
+    saved = asyncio.run(
+        conversation.respond(
+            state,
+            principal,
+            ConversationTurn(request_id="budget", message="budget 100"),
+            expected_version=state.version,
+        )
+    )
+    reply = begin(conversation, principal, saved.state, now)
+    assert reply.state.active_market.max_total == Decimal("100")
+    pending = asyncio.run(
+        conversation.respond(
+            reply.state,
+            principal,
+            ConversationTurn(request_id="changed", message="budget 200"),
+            expected_version=reply.state.version,
+        )
+    )
+    assert pending.status == "paused"
+    assert pending.state.requirements.budget == Decimal("100")
+    assert pending.state.active_market == reply.state.active_market
+
+
+@pytest.mark.parametrize("message", ["refresh prices", "dobara search karo", "search again"])
+def test_refresh_creates_new_evidence_cycle_and_rejects_old_receipts(now, message):
+    from shopping_ai import ConversationTurn
+
+    conversation, principal, state = dialogue(now)
+    conversation.stores = tuple(task.store for task in plan(now).tasks)
+    reply = begin(conversation, principal, state, now)
+    for index in range(2):
+        reply = conversation.accept_market_receipt(
+            reply.state,
+            principal,
+            receipt(reply.state.active_market, index, now),
+            expected_version=reply.state.version,
+        )
+    old = reply.state.active_market
+    conversation.orchestrator.ai.clock = lambda: now + timedelta(days=1)
+    refreshed = asyncio.run(
+        conversation.respond(
+            reply.state,
+            principal,
+            ConversationTurn(request_id="refresh", message=message),
+            expected_version=reply.state.version,
+        )
+    )
+    new = refreshed.state.active_market
+    assert refreshed.status == "ready_for_search"
+    assert len(refreshed.search_tasks) == 2 and not new.receipts
+    assert new.identity == old.identity and new.delivery_context == old.delivery_context
+    assert new.max_total == old.max_total
+    assert new.search_id != old.search_id
+    assert {(new.search_id, t.task_id) for t in new.tasks}.isdisjoint(
+        (old.search_id, t.task_id) for t in old.tasks
+    )
+    assert new.created_at == now + timedelta(days=1)
+    assert new.deadline_at > new.created_at
+    assert not refreshed.state.market_display_ids
+    assert refreshed.navigation is None and refreshed.action is None
+    with pytest.raises(ValueError):
+        conversation.accept_market_receipt(
+            refreshed.state,
+            principal,
+            receipt(old, 0, now),
+            expected_version=refreshed.state.version,
+        )
+    duplicate = asyncio.run(
+        conversation.respond(
+            refreshed.state,
+            principal,
+            ConversationTurn(request_id="again", message=message),
+            expected_version=refreshed.state.version,
+        )
+    )
+    assert duplicate.status == "paused" and not duplicate.search_tasks
+    assert duplicate.state.active_market == new
+
+
+def test_refresh_requires_saved_search_and_does_not_accept_negated_or_compound_requests(now):
+    from shopping_ai import ConversationTurn
+
+    conversation, principal, state = dialogue(now)
+    result = asyncio.run(
+        conversation.respond(
+            state,
+            principal,
+            ConversationTurn(request_id="refresh", message="refresh prices"),
+            expected_version=state.version,
+        )
+    )
+    assert result.status == "needs_input" and not result.search_tasks
+    for message in (
+        "don't refresh prices",
+        "refresh prices and add to cart",
+        "refresh prices under 50",
+    ):
+        meaning = asyncio.run(BasicInterpreter().interpret(message, None))
+        assert meaning.intent != "market_refresh"
+
+
+def test_refresh_settles_overdue_search_and_preserves_budget(now):
+    from shopping_ai import ConversationTurn
+    from shopping_ai.intents import Requirements
+
+    conversation, principal, state = dialogue(now)
+    conversation.stores = tuple(task.store for task in plan(now).tasks)
+    state = state.model_copy(update={"requirements": Requirements(budget="125")})
+    pending = begin(conversation, principal, state, now)
+    old = pending.state.active_market
+    conversation.orchestrator.ai.clock = lambda: old.deadline_at
+    refreshed = asyncio.run(
+        conversation.respond(
+            pending.state,
+            principal,
+            ConversationTurn(request_id="refresh", message="refresh prices"),
+            expected_version=pending.state.version,
+        )
+    )
+    assert refreshed.status == "ready_for_search"
+    assert refreshed.state.active_market.max_total == Decimal("125")
+    assert refreshed.state.active_market.search_id != old.search_id
+    assert not refreshed.state.active_market.receipts
+
+
+def test_model_cannot_refresh_from_an_unrelated_or_negated_message(now):
+    from shopping_ai import ConversationTurn
+    from shopping_ai.intents import Meaning
+
+    class WrongInterpreter:
+        async def interpret(self, message, awaiting):
+            return Meaning(intent="market_refresh")
+
+    conversation, principal, state = dialogue(now)
+    conversation.stores = tuple(task.store for task in plan(now).tasks)
+    conversation.interpreter = WrongInterpreter()
+    pending = begin(conversation, principal, state, now)
+    conversation.orchestrator.ai.clock = lambda: pending.state.active_market.deadline_at
+    rejected = asyncio.run(
+        conversation.respond(
+            pending.state,
+            principal,
+            ConversationTurn(request_id="no-refresh", message="don't refresh prices"),
+            expected_version=pending.state.version,
+        )
+    )
+    assert rejected.status == "needs_input" and not rejected.search_tasks
+    assert rejected.state.active_market.search_id == pending.state.active_market.search_id

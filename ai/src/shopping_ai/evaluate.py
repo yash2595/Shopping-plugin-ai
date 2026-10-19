@@ -139,6 +139,23 @@ async def evaluate(
     )
 
 
+async def evaluate_scenarios() -> EvaluationReport:
+    from shopping_ai.scenarios import run_scenarios
+
+    cases = tuple(
+        CaseResult(case_id=name, task="integration_scenario", passed=passed, outcome=outcome)
+        for name, passed, outcome in await run_scenarios()
+    )
+    return EvaluationReport(
+        mode="offline-scenarios",
+        cases=cases,
+        passed=sum(case.passed for case in cases),
+        total=len(cases),
+        scope="Fixed simulated runtime journeys with checkpoint codec roundtrips; "
+        "not live retailer, model/speech quality, database durability or load validation.",
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_mutually_exclusive_group()
@@ -147,6 +164,9 @@ def main():
     )
     modes.add_argument(
         "--live", action="store_true", help="Run 10 model requests; may incur provider charges"
+    )
+    modes.add_argument(
+        "--scenarios", action="store_true", help="Run fixed offline simulated runtime journeys"
     )
     parser.add_argument(
         "--voice", action="store_true", help="Also check STT/TTS config; requires --check"
@@ -160,6 +180,8 @@ def main():
         raise SystemExit(0 if report.status == "ready_to_attempt_live_test" else 2)
 
     async def run():
+        if args.scenarios:
+            return await evaluate_scenarios()
         if not args.live:
             return await evaluate(BasicInterpreter(), OfflineDetailInterpreter(), mode="offline")
         setup = check_setup()

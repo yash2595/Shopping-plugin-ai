@@ -1,6 +1,7 @@
 """Read-only offer navigation proposals and trusted visible-browser receipts."""
 
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Annotated, Literal
 from uuid import uuid4
 
@@ -54,6 +55,63 @@ class NavigationReceipt(Contract):
         if self.status == "failed" and any(value is not None for value in fields):
             raise ValueError("Failed navigation cannot contain a verified product")
         return self
+
+
+class OfferPageVerification(Contract):
+    """Grounded listing-to-page comparison, created only after receipt verification."""
+
+    proposal: OfferNavigation
+    product: ProductSnapshot
+
+    @property
+    def changed(self) -> bool:
+        old = self.proposal.offer
+        return (old.price, old.currency, old.in_stock) != (
+            self.product.price,
+            self.product.currency,
+            self.product.in_stock,
+        )
+
+    @property
+    def base_price_difference(self) -> Decimal | None:
+        if self.product.price is None or self.product.currency != self.proposal.offer.currency:
+            return None
+        return self.product.price - self.proposal.offer.price
+
+    def explanation(self, language: Literal["en", "hi-Latn"]) -> str:
+        old, new = self.proposal.offer, self.product
+        hi = language == "hi-Latn"
+        rows = []
+        if (old.price, old.currency) != (new.price, new.currency):
+            current = "unknown" if new.price is None else f"{new.currency} {new.price:.2f}"
+            rows.append(
+                ("Base price pehle " if hi else "Previous base price ")
+                + f"{old.currency} {old.price:.2f}; "
+                + ("ab " if hi else "current ")
+                + current
+                + "."
+            )
+            delta = self.base_price_difference
+            if delta is not None:
+                direction = (
+                    ("badha" if delta > 0 else "ghata")
+                    if hi
+                    else ("increased" if delta > 0 else "decreased")
+                )
+                rows.append(f"Base price {direction}: {old.currency} {abs(delta):.2f}.")
+        if old.in_stock != new.in_stock:
+            availability = {True: "in stock", False: "out of stock", None: "unknown"}
+            rows.append(
+                f"Stock: previous {availability[old.in_stock]}; "
+                f"current {availability[new.in_stock]}."
+            )
+        if rows:
+            rows.append(
+                "Fresh delivered total verify nahi hua; cross-store prices refresh karo."
+                if hi
+                else "A fresh delivered total is not verified; refresh cross-store prices."
+            )
+        return " ".join(rows)
 
 
 def propose_navigation(

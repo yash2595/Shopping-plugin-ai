@@ -1,6 +1,6 @@
 import asyncio
 
-from shopping_ai.evaluate import check_setup, evaluate
+from shopping_ai.evaluate import check_setup, evaluate, evaluate_scenarios
 from shopping_ai.intents import BasicInterpreter
 from shopping_ai.market_dialogue import MarketDraft, OfflineDetailInterpreter
 
@@ -78,3 +78,26 @@ def test_benchmark_redacts_provider_errors_and_checks_source_support():
         for case in report.cases
         if case.task == "details"
     )
+
+
+def test_simulated_scenarios_run_without_live_configuration(monkeypatch):
+    clear_config(monkeypatch)
+    report = asyncio.run(evaluate_scenarios())
+    assert report.mode == "offline-scenarios"
+    assert report.passed == report.total == 6
+    assert all(case.task == "integration_scenario" for case in report.cases)
+    assert "not live retailer" in report.scope
+
+
+def test_scenario_failures_are_redacted_and_do_not_skip_remaining_journeys(monkeypatch):
+    from shopping_ai.scenarios import Journey
+
+    async def broken(self):
+        raise RuntimeError("PRIVATE_PROVIDER_DETAIL")
+
+    monkeypatch.setattr(Journey, "budget_and_pair", broken)
+    report = asyncio.run(evaluate_scenarios())
+    assert report.total == 6 and report.passed == 5
+    assert report.cases[0].outcome == "scenario_or_schema_failure"
+    assert "PRIVATE_PROVIDER_DETAIL" not in report.model_dump_json()
+    assert all(case.passed for case in report.cases[1:])

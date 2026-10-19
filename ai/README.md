@@ -1107,3 +1107,327 @@ range/previous references ask for clarification. Compound cost+cart requests sta
 unclear in the fallback rather than silently dropping the action part. The shared
 offline market example now demonstrates cost and coverage follow-ups too. No live
 retailer or real-model quality claim is established by these offline tests.
+
+## Budget-aware offer comparison
+
+New searches copy `requirements.budget` into `MarketSearch.max_total`, expressed in
+the search currency. The cap applies to one offer's observed price + shipping +
+extra tax/fees; it is not a whole-cart or quantity budget and grants no permission
+to purchase. `MarketResult.max_total` exposes the applied cap to future consumers.
+
+Fresh, matching offers whose known total exceeds the cap receive an `over_budget`
+exclusion. A base price already above the cap also proves exclusion when fees are
+unknown, because charges are nonnegative. Unknown charges otherwise remain unknown
+and can prevent a confirmed cheapest claim. Conditional coupons never reduce the
+total, and stale prices or foreign currencies cannot prove budget compliance or
+failure. No exchange rate is assumed.
+
+After search tasks have settled, a budget-only requirements update reranks the
+saved observations with the current clock. It emits no new search/browser action
+and does not renew observation timestamps or task deadlines. Pending search,
+navigation or cart work retains its existing goal and budget. A higher budget must
+come from an explicit requirements update; the agent never relaxes it automatically.
+Display and speech include the applied single-offer cap. An empty eligible set is
+scoped to returned observations, not a claim that no affordable product exists.
+
+`update_budget` checks search owner/session/version and preserves evidence. Future
+backend integration must still persist the returned conversation state atomically.
+The optional checkpoint field defaults to `None` for older saved searches; restoring
+an old checkpoint does not retroactively apply a budget absent from that search.
+
+## Explicit price refresh
+
+Standalone requests such as `refresh prices`, `refresh cross-store prices`,
+`search again` or `dobara search karo` use `market_refresh`. The offline interpreter
+supports a small explicit phrase list; unsupported wording asks for clarification.
+The conversation independently checks this phrase even when a model proposes the
+intent. Negated or compound requests cannot silently trigger a refresh.
+
+A refresh reuses the saved confirmed identity and delivery context, current budget,
+and current trusted store configuration. It creates a new search ID, empty receipts
+and new observation/deadline window, clearing displayed-offer references. Task IDs
+are scoped to their search: dispatch deduplication must use at least
+`owner/session/search_id/task_id`, never `task_id` alone. Old-search receipts are
+rejected. The AI emits visible search tasks; actual store navigation and fresh
+extraction still require the extension executor.
+
+Pending search/navigation/cart work blocks refresh. An overdue search first settles
+its missing tasks, after which an explicit refresh may begin a new cycle. Missing
+saved search or missing store configuration produces clarification with no tasks.
+Product/variant/postcode changes require a new confirmed cross-store search rather
+than reusing the old identity. Persist the new state with CAS before dispatching;
+the existing duplicate-request and ownership/version checks continue to apply.
+
+## Grounded savings questions
+
+`market_savings` handles explicit savings/bachat questions through the same saved-
+evidence answer path and voice output. It compares the lowest currently eligible
+delivered total with the nearest eligible offer from another store. A displayed
+ordinal can select the comparison offer; a reference to the lowest offer uses its
+nearest other-store rival. Both offers must pass the existing identity, freshness,
+stock, currency, complete-cost and budget checks. Missing/ambiguous evidence asks
+for clarification instead of inventing savings; ties produce a zero difference.
+
+`MarketAnswer.savings_amount` is the Decimal difference between the two exact
+`source_offers` totals, ordered lower then higher. Validation rejects invented
+differences. Source IDs become the displayed ordinal context. Partial store coverage
+may still explain this observed pair, but speech retains the incomplete-search
+qualification and cannot confirm an overall cheapest offer. No coupon deduction,
+currency conversion, list-price discount or checkout saving guarantee is inferred.
+The answer emits no browser action, including while another task is pending.
+
+## Comparing two displayed store offers
+
+With an active market search, `compare first and second` resolves both indices
+against the saved `market_display_ids`, then answers `MarketAnswer.question =
+"comparison"`. It compares exactly those two offers, ordered by delivered total,
+with price/delivery/extra-fee rows and a grounded `savings_amount`. A third, cheaper
+offer is never substituted for either requested source. The current overall ranking
+remains separately available in `market_result`; pair results make no claim that
+either requested offer wins the whole search.
+
+Both requested offers must still be eligible under current freshness, currency,
+identity, stock, known-charge and budget rules. Missing indices or ineligible
+sources ask for clarification rather than falling back to saved product snapshots.
+Without an active market search, existing saved-product comparisons remain in use.
+The source pair becomes the next displayed ordinal context, ordered lower total
+first. Future UI integration must display that order with its exact source IDs.
+Comparison is read-only during pending tasks and does not grant cart/navigation
+permission. The offline fallback rejects compound pair comparison + action requests.
+
+## Explaining listing-to-page changes
+
+After a valid visible-navigation receipt, `ConversationReply.offer_verification`
+contains the original owned proposal/offer and the exact freshly selected product
+snapshot. Its Python helpers `changed`, `base_price_difference` and `explanation`
+derive the comparison from those observations. JSON contains the two source records;
+helpers are not serialized as independently editable values. Reply validation binds
+the report to the active owned search and selected snapshot. Failed or rejected
+receipts produce no verification report.
+
+Changed base price is explained with both observed values and an exact signed
+difference only when currencies match and the new price is known. Currency changes
+show both currencies without conversion; missing price or stock remains unknown.
+Stock changes distinguish out-of-stock from unknown availability. Display and voice
+use the same explanation. An unchanged page produces no invented change warning.
+
+The existing affected-store invalidation remains in place when price/currency/stock
+changes: old cached winners cannot remain confirmed. This does not launch a new
+search, add to cart or authorize a purchase. A product snapshot has no fresh shipping
+or fee breakdown, so the explanation explicitly avoids claiming a new delivered
+total and points to an explicit cross-store refresh. Reports describe caller-supplied
+verified receipts; real Chrome extraction still needs the extension executor.
+
+## Seller and observed stock questions
+
+`market_availability` routes seller/vendor questions and explicit offer/store stock
+questions to saved normalized observations. Plain current-product stock questions
+keep using the existing product path. Answers show up to five fresh exact-identity
+observations, including offers excluded from cost ranking: an unknown total, foreign
+currency or budget failure does not erase an observed seller/stock value. Availability
+does not establish price eligibility, seller authenticity or checkout availability.
+
+Boolean stock is preserved as observed in stock/out of stock; `None` stays unknown.
+An explicit ordinal resolves to the last displayed source ID. Missing/stale evidence
+asks for fresh observations instead of guessing a seller or stock count. The answer
+never claims a quantity, and incomplete requested-store coverage is disclosed.
+Seller labels are quoted and limited to 120 characters plus an ellipsis for display
+and speech; exact full values remain in `source_offers`. Speech reads the first row
+and points to further on-screen details. This keeps untrusted source text bounded
+without modifying its evidence record. No new browser/cart action is emitted.
+
+## Persisting voice decisions before synthesis
+
+For an audio event, `AssistantRuntime.handle(..., defer_speech=True)` runs STT and
+conversation logic once, then returns `VoiceReply.status = "ready"`, its normal
+conversation reply and no audio. The existing default combined voice path is
+unchanged. Deferred mode is audio-only and cannot be combined with `speak=True`.
+STT/interpretation failures retain their existing error behavior.
+
+The future backend should atomically persist the returned state **and trusted reply**
+with CAS before dispatching its proposals or synthesizing speech. After persistence,
+call `runtime.render_speech(current_state, principal, saved_reply,
+expected_version=current_state.version)`. This checks owner, version and exact reply
+state before TTS. Never accept a client-supplied reply as trusted speech content.
+The AI library does not perform or prove the database commit.
+
+`SpeechOutput` contains only conversation ID, version, complete/error status and
+optional audio. It contains no checkpoint, search task, navigation or cart proposal,
+so speech-only retries cannot cause those proposals to be dispatched again. Retry
+`render_speech` on synthesis failure instead of resubmitting the audio/user turn.
+Audio bytes stay excluded from JSON/log representations and need the existing binary
+transport handling. Read the latest stored version again before playback: a newer
+turn may arrive during TTS, and obsolete audio must be discarded by the caller.
+This is an integration contract, not implemented backend persistence or playback.
+
+## Offline integration scenario evaluation
+
+Run `python -m shopping_ai.evaluate --scenarios` for a separate JSON report of six
+fixed simulated journeys: budget changes + explicit pair comparison, refresh/late-
+receipt isolation, stale-source refusal, listing-to-page price change, and deferred
+voice with TTS-only retry, and shared-runtime session isolation. Each event's
+checkpoint is serialized and restored through
+the shared runtime codec. Speech bytes, sellers, offers and page receipts are fake;
+no credentials, live provider calls or real browser actions are used. Each journey
+has a 15-second deadline, and failures are reported without dumping exception text.
+Exit code is zero only when every journey passes; otherwise it is one.
+
+This evaluates integration invariants rather than natural-language/model quality.
+The original default intent/detail benchmark remains separate and still reports its
+known offline natural-detail extraction limitation. Six passing scenarios do not
+establish real retailer extraction, audible speech quality, database durability,
+concurrent-user capacity or production readiness. `--scenarios`, `--live` and
+`--check` are mutually exclusive; `--voice` remains a configuration-check option.
+
+## Grounding interpreted requirements in the current message
+
+Before merging any interpreted requirements, conversation checks the whole proposed
+patch against the current user message. Category/use-case/colour/size require a
+literal normalized phrase, with the existing explicit category aliases
+phone/mobile, earbuds/earphones and shoes/jute. A model cannot silently turn an
+ambiguous “bag” into a confirmed backpack or invent a colour/size. This is a
+conservative rule, not general semantic verification or multilingual translation.
+Unsupported paraphrases require a clearer explicit preference.
+
+Budget uses the same bounded Decimal parser as the offline interpreter: an explicit
+budget/INR cue or direct answer to a pending budget question, one unambiguous number,
+and supported `k`/comma/decimal formatting. Product specs alone, multiple ambiguous
+amounts, foreign-currency conversion and negated changes cannot establish a budget.
+This parser does not infer budgets from arbitrary natural language.
+
+If any proposed slot lacks support, the entire patch is rejected with clarification;
+saved requirements, slot sources and active goals remain unchanged. No search/cart/
+navigation work is dispatched. These checks apply equally to custom and compatible
+model interpreters and do not select an LLM provider. They establish source support
+for explicit values, not user intent confidence or purchase authorization.
+
+## Clarifying unsupported combined goals
+
+An explicit conjunction/alternative joining multiple recognized task families
+(search/compare/refresh, open, select, add-to-cart, purchase/payment, or a fact
+question) asks for one clear task before calling the interpreter/detail extractor.
+For example, “search websites and add to cart” cannot silently become just a search;
+“compare stores aur cheapest offer kholo” cannot silently become only navigation.
+The shared rule also applies to the offline interpreter. It does not depend on the
+model following a prompt correctly.
+
+Clarification preserves existing requirements, detail drafts and in-flight browser
+goals and emits no new proposals. Ordinary lists such as “compare first and second”
+or colour lists do not count as multiple task families. Existing internal multi-step
+execution of one goal (e.g. cart baseline then verified addition) is unchanged.
+This is a bounded English/Hinglish pattern check, not general semantic intent
+verification or a multi-goal planner; unsupported phrasing may still need explicit
+clarification. No checkout/payment execution capability is introduced.
+
+## Retiring results when product preferences change
+
+After a settled search, a grounded category/colour/size change cannot silently keep
+recommending the old model/variant. Colour (`colour`/`color`) and size are compared
+against exact confirmed identity attributes when present, otherwise saved preferences.
+Category uses saved category context; a newly introduced category without prior
+category evidence conservatively requires reconfirmation. Repeating the same
+normalized confirmed attribute does not retire the search. No fuzzy catalog mapping
+or assumption that a different variant has the same price is made.
+
+For a new preference goal, requirements remain saved but old market/displayed-offer
+references, selected/previous product snapshots and settled run context are cleared.
+The user must start a new cross-store search and confirm exact identity; refresh
+cannot resurrect the retired offers. Budget-only changes still rerank fresh evidence.
+Pending work blocks preference changes even when they accompany a read-only question.
+
+An explicit supported variant-selection request is handled separately: the old
+market ranking is retired, but current page evidence is retained so the existing
+authorized selection flow can run. It still needs a visible target, matching grant
+and trusted result receipt. No purchase or new search is inferred. An explicit new
+market-search intent keeps the normal exact-detail collection/confirmation flow.
+
+## Direct stop-button event
+
+The runtime accepts `{"kind": "cancel", "request_id": "unique-stop-request"}` for
+an authenticated caller's current conversation state/version. It uses the same
+existing cancellation transition as an explicit text `stop`, without invoking STT,
+intent interpretation or model decisions. Default output is text, so TTS is not a
+prerequisite for stopping. The normal ownership/version checks and duplicate-request
+protection apply before state is changed. Persist this result with CAS before
+notifying an executor or playing any response.
+
+Cancellation clears pending search/navigation/detail context and emits no new
+proposals. An in-flight cart run remains cancelled even when its matching late
+receipt arrives; observed outcomes are reconciled rather than replayed. This event
+does not undo an already executed cart mutation, physically interrupt Chrome, abort
+an unrelated provider call or stop audio playback. Those integrations must honour
+the persisted cancellation and discard obsolete versions. If another turn finishes
+concurrently, caller-side CAS decides which state can commit; never dispatch output
+from a losing state update. No frontend/backend implementation was added.
+
+## Shared-runtime isolation scenario
+
+The offline `shared_session_isolation` journey runs eight interleaved sessions on
+one runtime, including distinct sessions under the same owner. It deliberately
+reuses local request/offer IDs, assigns different budgets, roundtrips each checkpoint
+and checks that every search ID is distinct. Cross-session cancellation attempts
+and foreign receipt submissions must be rejected.
+
+Simulated interpreter/detail adapters yield to the event loop so the flows actually
+interleave. Configured intent/detail capacities of two are checked against observed
+peak in-flight calls, with all permits released after completion. This
+verifies process-local session separation and those capacity boundaries;
+it is not a throughput benchmark or a claim about every provider stage. Distributed
+workers, atomic database CAS, real provider quotas, browser resources and production
+load remain future integration/validation responsibilities.
+
+## Provider-independent intent capacity
+
+Conversation limits in-flight intent calls per runtime to `max_concurrent_calls`,
+including custom SDK adapters. Admission waits at most `capacity_wait_seconds`;
+overload returns a bounded retry response without invoking the interpreter or
+changing requirements/dispatching work. Admitted calls retain the existing
+`timeout_seconds` deadline. The permit is released after successful interpretation,
+provider/schema failure, timeout or coroutine cancellation. Stop/cancel and the
+explicit unsupported-compound check run before admission.
+
+Limits apply separately to stages, not as a global provider/account quota, and are
+process-local rather than distributed. Reuse one runtime per worker/event loop.
+Capacity errors return the normal advanced conversation checkpoint/history: persist
+it with CAS, and use a fresh request ID for a user retry; never replay an old action.
+Custom adapters must cooperate with asyncio cancellation/timeouts. They still need
+their own transport limits and resource lifecycle. No autoscaling, distributed
+queue, tenant fairness or production throughput guarantee is implied.
+
+## Explicit conversational mutation requests
+
+Conversation independently checks the current message before accepting interpreted
+`add_to_cart` or `select_variant` intent. A cart request needs explicit cart +
+add/daal/dal/put/rakho language; selection needs select/choose. Recognized negation,
+instruction/explanation questions and unsupported combined goals ask for clarification.
+For example, a model misclassifying “price kitna hai”, “don't add to cart” or “how do
+I add to cart?” cannot start an action run, even if a caller attached a grant.
+The offline interpreter applies the same check. Direct polite requests such as
+“can you add black to cart” remain supported.
+
+This is a conservative English/Hinglish command pattern with the explicit Hindi
+extensions below, at the conversation boundary,
+not general semantic verification, a consent mechanism or protection against every
+possible phrasing. Unsupported language requires a clearer request. Existing exact
+authorization, target/variant, stock/price, freshness and trusted-receipt checks remain
+mandatory. Lower-level `ShoppingAI`/orchestrator callers still provide independently
+authorized requests; this change does not replace their grant contract.
+
+## Explicit Hindi-script shopping commands
+
+The offline intent fallback and conversational mutation check recognize bounded
+Hindi cart/select vocabulary, e.g. “कार्ट में डाल दो”, “कार्ट में जोड़ें” and “नीला
+चुनें”. Devanagari combining marks participate in token boundaries, so an alias
+cannot match a prefix inside another Hindi word. Common exact black/blue/white/red/
+green colour words map to the existing English canonical colour slots, which are
+still matched against observed variant labels and the exact grant.
+
+Hindi negation/questions such as “मत”, “नहीं”, “कैसे” and “क्यों”, and explicit
+combined goals joined by “और”/“फिर”/“या”, do not authorize mutations. The offline
+decision demo supports these command paths using simulated observations; it remains
+a deterministic demo rather than a Hindi language model. A simulated STT transcript
+test exercises the same voice-to-cart-baseline path without rewriting the transcript.
+No real Hindi STT/TTS quality claim is established. General Hindi questions, natural
+product-detail extraction, arbitrary translation and unseen colour shades remain
+outside this small fallback vocabulary; model/variant/specification data is not
+automatically transliterated or inferred.

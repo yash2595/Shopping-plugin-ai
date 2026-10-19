@@ -6,9 +6,11 @@ from pydantic import ValidationError
 
 from shopping_ai import Conversation, ConversationTurn, Orchestrator, Principal, ShoppingAI
 from shopping_ai.browser import BrowserResult, BrowserTarget, CartLine, CartSnapshot
+from shopping_ai.config import AIConfig
 from shopping_ai.conversation import ConversationError, ConversationState
 from shopping_ai.intents import BasicInterpreter, Meaning, Requirements
 from shopping_ai.providers import MockProvider
+from shopping_ai.providers.base import ProviderError
 
 
 @pytest.fixture
@@ -37,6 +39,321 @@ def test_starts_with_greeting_without_provider(conversation, principal):
     assert reply.status == "chat"
     assert reply.action is None
     assert reply.state.version == 1
+
+
+def test_intent_capacity_is_bounded_and_cancellation_releases_the_permit(now):
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class BlockingInterpreter:
+            calls = 0
+
+            async def interpret(self, message, awaiting):
+                self.calls += 1
+                entered.set()
+                await release.wait()
+                return Meaning(intent="greeting")
+
+        adapter = BlockingInterpreter()
+        conversation = Conversation(
+            Orchestrator(
+                ShoppingAI(
+                    MockProvider(),
+                    AIConfig(max_concurrent_calls=1, capacity_wait_seconds=0.02),
+                    clock=lambda: now,
+                )
+            ),
+            adapter,
+        )
+        owner = Principal(owner_id="one", session_id="one")
+        other = Principal(owner_id="two", session_id="two")
+        state = conversation.start(owner, language="en").state
+        other_state = conversation.start(other, language="en").state
+        pending = asyncio.create_task(
+            conversation.respond(
+                state,
+                owner,
+                ConversationTurn(request_id="first", message="hi"),
+                expected_version=state.version,
+            )
+        )
+        await entered.wait()
+        try:
+            busy = await conversation.respond(
+                other_state,
+                other,
+                ConversationTurn(request_id="busy", message="hi"),
+                expected_version=other_state.version,
+            )
+            assert busy.status == "error" and "busy" in busy.message
+            assert adapter.calls == 1 and busy.state.requirements == other_state.requirements
+            assert busy.action is None and not busy.search_tasks
+            stopped = await conversation.respond(
+                state,
+                owner,
+                ConversationTurn(request_id="stop", message="stop"),
+                expected_version=state.version,
+            )
+            assert stopped.status == "cancelled" and adapter.calls == 1
+        finally:
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        release.set()
+        next_reply = await conversation.respond(
+            busy.state,
+            other,
+            ConversationTurn(request_id="retry", message="hi"),
+            expected_version=busy.state.version,
+        )
+        assert next_reply.status == "chat" and adapter.calls == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure", ["provider", "timeout", "schema"])
+def test_intent_failure_does_not_leak_capacity(now, failure):
+    async def scenario():
+        class FailingOnce:
+            calls = 0
+
+            async def interpret(self, message, awaiting):
+                self.calls += 1
+                if self.calls == 1:
+                    if failure == "provider":
+                        raise ProviderError("private-adapter-error")
+                    if failure == "timeout":
+                        await asyncio.Event().wait()
+                    return Meaning.model_construct(intent="invalid")
+                return Meaning(intent="greeting")
+
+        adapter = FailingOnce()
+        conversation = Conversation(
+            Orchestrator(
+                ShoppingAI(
+                    MockProvider(),
+                    AIConfig(max_concurrent_calls=1, timeout_seconds=0.02),
+                    clock=lambda: now,
+                )
+            ),
+            adapter,
+        )
+        principal = Principal(owner_id="owner", session_id="session")
+        state = conversation.start(principal).state
+        request = ConversationTurn(request_id="first", message="hi")
+        if failure == "schema":
+            with pytest.raises(ValueError):
+                await conversation.respond(
+                    state, principal, request, expected_version=state.version
+                )
+        else:
+            failed = await conversation.respond(
+                state, principal, request, expected_version=state.version
+            )
+            assert failed.status == "error" and "private-adapter-error" not in failed.message
+        recovered = await conversation.respond(
+            state,
+            principal,
+            ConversationTurn(request_id="second", message="hi"),
+            expected_version=state.version,
+        )
+        assert recovered.status == "chat" and adapter.calls == 2
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "intent,message",
+    [
+        ("add_to_cart", "price kitna hai"),
+        ("add_to_cart", "don't add to cart"),
+        ("add_to_cart", "how do I add to cart"),
+        ("add_to_cart", "what does add to cart mean"),
+        ("add_to_cart", "can I add to cart"),
+        ("select_variant", "why select blue"),
+        ("select_variant", "never choose black"),
+    ],
+)
+def test_wrong_mutation_intent_does_not_use_a_supplied_grant(
+    now, principal, state, product, grant, intent, message
+):
+    class WrongIntent:
+        async def interpret(self, message, awaiting):
+            return Meaning(intent=intent)
+
+    class MustNotDecide:
+        name = "test"
+
+        async def decide(self, context):
+            raise AssertionError("Unsupported mutation reached decision provider")
+
+    conversation = Conversation(
+        Orchestrator(ShoppingAI(MustNotDecide(), clock=lambda: now)), WrongIntent()
+    )
+    target = BrowserTarget(
+        tab_id=1, document_id=product.document_id, active=True, window_focused=True
+    )
+    reply = respond(
+        conversation,
+        principal,
+        state,
+        message,
+        "r1",
+        products=(product,),
+        target=target,
+        authorization=grant,
+        available_tools=("read_product", "read_cart", "select_variant", "add_to_cart"),
+    )
+    assert reply.status == "needs_input" and reply.action is None
+    assert reply.state.active_run is None and not reply.search_tasks
+    assert reply.state.requirements == state.requirements
+
+
+@pytest.mark.parametrize(
+    "message,intent",
+    [
+        ("can you add black to cart", "add_to_cart"),
+        ("please select blue", "select_variant"),
+        ("how do I add to cart", "unknown"),
+        ("what does select blue mean", "unknown"),
+    ],
+)
+def test_mutation_request_examples_distinguish_commands_from_instructions(message, intent):
+    assert asyncio.run(BasicInterpreter().interpret(message, None)).intent == intent
+
+
+@pytest.mark.parametrize(
+    "message,variant,tool",
+    [
+        ("काला वाला कार्ट में डाल दो", "black", "read_cart"),
+        ("कार्ट में जोड़ें", "black", "read_cart"),
+        ("नीला चुनें", "blue", "select_variant"),
+    ],
+)
+def test_explicit_hindi_commands_use_existing_grants_and_observed_variants(
+    conversation, principal, state, product, grant, message, variant, tool
+):
+    target = BrowserTarget(
+        tab_id=1, document_id=product.document_id, active=True, window_focused=True
+    )
+    reply = respond(
+        conversation,
+        principal,
+        state,
+        message,
+        "r1",
+        products=(product,),
+        target=target,
+        authorization=grant.model_copy(update={"variant_id": variant}),
+        available_tools=("read_product", "read_cart", "select_variant", "add_to_cart"),
+    )
+    assert reply.action is not None and reply.action.tool.name == tool
+    assert not reply.search_tasks
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "कार्ट में मत डालो",
+        "कार्ट में नहीं डालना",
+        "कैसे कार्ट में डालें",
+        "नीला मत चुनो",
+        "कीमत बताओ और कार्ट में डालो",
+        "नीला चुनो और कार्ट में डाल दो",
+    ],
+)
+def test_hindi_negations_questions_and_compound_actions_stay_unclear(message):
+    assert asyncio.run(BasicInterpreter().interpret(message, None)).intent == "unknown"
+
+
+def test_hindi_colour_aliases_respect_combining_mark_word_boundaries():
+    from shopping_ai.intents import requirements_supported
+
+    assert requirements_supported(Requirements(colour="blue"), "नीला चुनें", None)
+    assert not requirements_supported(Requirements(colour="blue"), "नीलापन", None)
+    assert not requirements_supported(Requirements(colour="green"), "ग्रीनहाउस", None)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "search websites and add to cart",
+        "compare stores aur cheapest offer kholo",
+        "select black then add to cart",
+        "find phone and buy it",
+        "price batao aur cart mein daal do",
+        "refresh prices and open cheapest",
+        "search websites or open first offer",
+    ],
+)
+def test_compound_goals_are_clarified_before_interpreter_or_state_updates(
+    conversation, principal, state, message
+):
+    class MustNotRun:
+        async def interpret(self, message, awaiting):
+            raise AssertionError("Unsupported compound reached interpreter")
+
+    dialogue = Conversation(conversation.orchestrator, MustNotRun())
+    reply = respond(dialogue, principal, state, message)
+    assert reply.status == "needs_input"
+    assert reply.state.requirements == state.requirements
+    assert reply.state.market_draft == state.market_draft
+    assert reply.state.active_run == state.active_run
+    assert not reply.search_tasks and reply.action is None and reply.navigation is None
+    assert asyncio.run(BasicInterpreter().interpret(message, None)).intent == "unknown"
+
+
+@pytest.mark.parametrize(
+    "message,intent",
+    [
+        ("compare first and second", "compare"),
+        ("black and blue headphones budget 2000", "requirements"),
+        ("open cheapest offer", "open_offer"),
+        ("black wala cart mein daal do", "add_to_cart"),
+    ],
+)
+def test_lists_and_single_goals_are_not_mistaken_for_combined_actions(message, intent):
+    assert asyncio.run(BasicInterpreter().interpret(message, None)).intent == intent
+
+
+def test_compound_request_during_detail_collection_preserves_draft(conversation, principal, state):
+    started = respond(conversation, principal, state, "search across websites")
+
+    class MustNotExtract:
+        async def extract(self, message, draft):
+            raise AssertionError("Combined action reached detail extractor")
+
+    conversation.detail_interpreter = MustNotExtract()
+    reply = respond(conversation, principal, started.state, "search phone and buy it", "compound")
+    assert reply.status == "needs_input"
+    assert reply.state.market_draft == started.state.market_draft
+    assert not reply.search_tasks and reply.action is None
+
+
+def test_compound_request_preserves_inflight_cart_goal(
+    conversation, principal, state, product, grant
+):
+    target = BrowserTarget(
+        tab_id=1, document_id=product.document_id, active=True, window_focused=True
+    )
+    pending = respond(
+        conversation,
+        principal,
+        state,
+        "Black wala cart mein daal do",
+        "r1",
+        products=(product,),
+        target=target,
+        authorization=grant,
+        available_tools=("read_product", "read_cart", "select_variant", "add_to_cart"),
+    )
+    assert pending.action is not None
+    reply = respond(
+        conversation, principal, pending.state, "search websites and add to cart", "combined"
+    )
+    assert reply.status == "needs_input" and reply.action is None
+    assert reply.state.active_run == pending.state.active_run
+    assert not reply.search_tasks and reply.navigation is None
 
 
 def test_gather_requirements_across_turns(conversation, principal, state):
@@ -304,10 +621,66 @@ def test_custom_interpreter_uses_generic_contract(conversation, principal, state
             )
 
     dialogue = Conversation(conversation.orchestrator, CustomInterpreter())
-    reply = respond(dialogue, principal, state, "Mujhe bada bag chahiye")
+    reply = respond(dialogue, principal, state, "Mujhe large backpack chahiye")
     assert reply.state.requirements.category == "backpack"
     assert reply.state.requirements.size == "large"
     assert reply.state.awaiting == "budget"
+
+
+@pytest.mark.parametrize(
+    "message,slots",
+    [
+        ("phone chahiye", Requirements(category="phone", budget="2000")),
+        ("budget 2000", Requirements(budget="5000")),
+        ("blue phone", Requirements(category="phone", colour="red")),
+        ("size medium", Requirements(size="large")),
+        ("128GB phone", Requirements(budget="128")),
+        ("budget $100", Requirements(budget="100")),
+        ("don't change budget 5000", Requirements(budget="5000")),
+        ("Mujhe bada bag chahiye", Requirements(category="backpack", size="large")),
+    ],
+)
+def test_model_slots_require_explicit_source_and_never_partially_update(
+    conversation, principal, state, message, slots
+):
+    class InventedSlots:
+        async def interpret(self, message, awaiting):
+            return Meaning(intent="requirements", slots=slots)
+
+    saved = respond(conversation, principal, state, "earbuds budget 1500")
+    dialogue = Conversation(conversation.orchestrator, InventedSlots())
+    reply = respond(dialogue, principal, saved.state, message, "unsupported")
+    assert reply.status == "needs_input"
+    assert reply.state.requirements == saved.state.requirements
+    assert reply.state.slot_sources == saved.state.slot_sources
+    assert reply.action is None and not reply.search_tasks and reply.navigation is None
+
+
+@pytest.mark.parametrize(
+    "message,slots",
+    [
+        ("mobile under 2k", Requirements(category="phone", budget="2000")),
+        ("earphones budget 2,000.50", Requirements(category="earbuds", budget="2000.50")),
+        (
+            "shoes for office, size UK 9",
+            Requirements(category="shoes", use_case="office", size="UK 9"),
+        ),
+    ],
+)
+def test_explicit_model_slots_keep_supported_aliases_and_decimal_budget(
+    conversation, principal, state, message, slots
+):
+    class SupportedSlots:
+        async def interpret(self, message, awaiting):
+            return Meaning(intent="requirements", slots=slots)
+
+    reply = respond(
+        Conversation(conversation.orchestrator, SupportedSlots()), principal, state, message
+    )
+    assert reply.state.requirements == slots
+    assert reply.state.slot_sources == {
+        key: "turn_1" for key in slots.model_dump(exclude_none=True)
+    }
 
 
 def test_concurrent_dialogues_do_not_mix_requirements(conversation):

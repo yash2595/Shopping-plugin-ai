@@ -57,6 +57,31 @@ def test_audio_to_transcript_conversation_and_speech(setup):
     assert "synthesized" not in repr(result)
 
 
+def test_hindi_transcript_reaches_authorized_action_without_translating_product_data(
+    setup, product, grant
+):
+    from shopping_ai.browser import BrowserTarget
+
+    voice, principal, state, stt, tts = setup
+    stt.text = "काला वाला कार्ट में डाल दो"
+    item = VoiceTurn(
+        request_id="r1",
+        audio=AudioClip(format="webm", data=b"input"),
+        products=(product,),
+        target=BrowserTarget(
+            tab_id=1, document_id=product.document_id, active=True, window_focused=True
+        ),
+        authorization=grant,
+        available_tools=("read_product", "read_cart", "select_variant", "add_to_cart"),
+    )
+    reply = asyncio.run(
+        voice.respond(state, principal, item, expected_version=state.version, defer_speech=True)
+    )
+    assert reply.status == "ready" and reply.reply.action.tool.name == "read_cart"
+    assert stt.calls == 1 and tts.calls == 0
+    assert reply.reply.state.active_run.request.message == stt.text
+
+
 def test_owner_version_and_replay_checked_before_stt(setup):
     voice, principal, state, stt, _ = setup
     other = Principal(owner_id="other", session_id="session")

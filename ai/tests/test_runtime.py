@@ -33,6 +33,232 @@ def stores():
     )
 
 
+def test_deferred_audio_persists_proposal_before_tts_and_retry_never_replays(now, product, grant):
+    class CountedSpeech(Speech):
+        stt_calls = 0
+        tts_calls = 0
+
+        async def transcribe(self, clip, *, language):
+            self.stt_calls += 1
+            return Transcript(text="Black wala cart mein daal do", confidence=0.99)
+
+        async def synthesize(self, text, *, language):
+            self.tts_calls += 1
+            if self.tts_calls == 1:
+                raise RuntimeError("private provider detail")
+            return await super().synthesize(text, language=language)
+
+    async def scenario():
+        conversation = Conversation(Orchestrator(ShoppingAI(MockProvider(), clock=lambda: now)))
+        speech = CountedSpeech()
+        runtime = AssistantRuntime(conversation, VoiceConversation(conversation, speech, speech))
+        principal = Principal(owner_id="owner", session_id="session")
+        state = (await runtime.start(principal)).state
+        target = BrowserTarget(
+            tab_id=7, document_id=product.document_id, active=True, window_focused=True
+        )
+        output = await runtime.handle(
+            state,
+            principal,
+            {
+                "kind": "audio",
+                "turn": {
+                    "request_id": "r1",
+                    "audio": AudioClip(format="webm", data=b"input"),
+                    "products": (product,),
+                    "target": target,
+                    "authorization": grant,
+                    "available_tools": (
+                        "read_product",
+                        "read_cart",
+                        "select_variant",
+                        "add_to_cart",
+                    ),
+                },
+            },
+            expected_version=state.version,
+            defer_speech=True,
+        )
+        assert output.reply.status == "ready" and output.reply.audio is None
+        reply = output.conversation_reply
+        assert reply.action.tool.name == "read_cart"
+        assert speech.stt_calls == 1 and speech.tts_calls == 0
+        saved = runtime.restore(
+            runtime.snapshot(reply.state, principal),
+            principal,
+            conversation_id=reply.state.conversation_id,
+            expected_version=reply.state.version,
+        )
+        failed = await runtime.render_speech(
+            saved, principal, reply, expected_version=saved.version
+        )
+        assert failed.status == "error" and failed.audio is None
+        spoken = await runtime.render_speech(
+            saved, principal, reply, expected_version=saved.version
+        )
+        assert spoken.status == "complete" and spoken.audio.data
+        assert spoken.version == saved.version and spoken.conversation_id == saved.conversation_id
+        assert set(spoken.model_dump()) == {"conversation_id", "version", "status", "audio"}
+        assert speech.stt_calls == 1 and speech.tts_calls == 2
+        assert saved.active_run == reply.state.active_run
+        assert saved.recent_request_ids == ("r1",)
+
+    asyncio.run(scenario())
+
+
+def test_playback_checks_current_owned_state_before_tts(now):
+    class CountedSpeech(Speech):
+        calls = 0
+
+        async def synthesize(self, text, *, language):
+            self.calls += 1
+            return await super().synthesize(text, language=language)
+
+    async def scenario():
+        conversation = Conversation(Orchestrator(ShoppingAI(MockProvider(), clock=lambda: now)))
+        speech = CountedSpeech()
+        runtime = AssistantRuntime(conversation, VoiceConversation(conversation, speech, speech))
+        principal = Principal(owner_id="owner", session_id="session")
+        reply = (await runtime.start(principal)).conversation_reply
+        state = reply.state
+        for who, version, candidate, code in (
+            (
+                Principal(owner_id="other", session_id="session"),
+                state.version,
+                reply,
+                "ACCESS_DENIED",
+            ),
+            (principal, state.version + 1, reply, "STALE_CONVERSATION_VERSION"),
+            (
+                principal,
+                state.version,
+                reply.model_copy(
+                    update={"state": state.model_copy(update={"conversation_id": "other"})}
+                ),
+                "SPEECH_REPLY_STATE_MISMATCH",
+            ),
+        ):
+            with pytest.raises(ValueError, match=code):
+                await runtime.render_speech(state, who, candidate, expected_version=version)
+        assert speech.calls == 0
+        newer = (
+            await runtime.handle(
+                state,
+                principal,
+                {"kind": "text", "turn": {"request_id": "new", "message": "hi"}},
+                expected_version=state.version,
+            )
+        ).state
+        with pytest.raises(ValueError, match="SPEECH_REPLY_STATE_MISMATCH"):
+            await runtime.render_speech(newer, principal, reply, expected_version=newer.version)
+        assert speech.calls == 0
+
+    asyncio.run(scenario())
+
+
+def test_direct_cancel_bypasses_interpreter_and_never_revives_late_cart_work(now, product, grant):
+    class MustNotInterpret:
+        async def interpret(self, message, awaiting):
+            raise AssertionError("Cancel must bypass the interpreter")
+
+    async def scenario():
+        conversation = Conversation(Orchestrator(ShoppingAI(MockProvider(), clock=lambda: now)))
+        runtime = AssistantRuntime(conversation)
+        principal = Principal(owner_id="owner", session_id="session")
+        target = BrowserTarget(
+            tab_id=7, document_id=product.document_id, active=True, window_focused=True
+        )
+        state = (await runtime.start(principal)).state
+        pending = await runtime.handle(
+            state,
+            principal,
+            {
+                "kind": "text",
+                "turn": {
+                    "request_id": "r1",
+                    "message": "Black wala cart mein daal do",
+                    "products": (product,),
+                    "target": target,
+                    "authorization": grant,
+                    "available_tools": (
+                        "read_product",
+                        "read_cart",
+                        "select_variant",
+                        "add_to_cart",
+                    ),
+                },
+            },
+            expected_version=state.version,
+        )
+        action = pending.conversation_reply.action
+        assert action is not None
+        conversation.interpreter = MustNotInterpret()
+        stopped = await runtime.handle(
+            pending.state,
+            principal,
+            {"kind": "cancel", "request_id": "stop-click"},
+            expected_version=pending.state.version,
+        )
+        assert stopped.conversation_reply.status == "cancelled"
+        assert (
+            stopped.conversation_reply.action is None
+            and not stopped.conversation_reply.search_tasks
+        )
+        assert stopped.state.active_run.status == "cancelled"
+        with pytest.raises(ValueError, match="DUPLICATE_TURN"):
+            await runtime.handle(
+                stopped.state,
+                principal,
+                {"kind": "cancel", "request_id": "stop-click"},
+                expected_version=stopped.state.version,
+            )
+        late = await runtime.handle(
+            stopped.state,
+            principal,
+            {
+                "kind": "browser_result",
+                "result": BrowserResult(
+                    action_id=action.action_id,
+                    run_id=action.run_id,
+                    session_id=principal.session_id,
+                    run_version=action.run_version,
+                    source_document_id=action.target.document_id,
+                    target=target,
+                    observed_at=now,
+                    outcome="observed",
+                    cart=CartSnapshot(observed_at=now, document_id=target.document_id, lines=()),
+                ),
+            },
+            expected_version=stopped.state.version,
+        )
+        assert late.conversation_reply.status == "cancelled"
+        assert late.conversation_reply.action is None
+
+    asyncio.run(scenario())
+
+
+def test_cancel_event_requires_owner_version_and_bounded_request_id(now):
+    async def scenario():
+        runtime = AssistantRuntime(
+            Conversation(Orchestrator(ShoppingAI(MockProvider(), clock=lambda: now)))
+        )
+        principal = Principal(owner_id="owner", session_id="session")
+        state = (await runtime.start(principal)).state
+        event = {"kind": "cancel", "request_id": "stop"}
+        for who, version, code in (
+            (Principal(owner_id="other", session_id="session"), state.version, "ACCESS_DENIED"),
+            (principal, state.version + 1, "STALE_CONVERSATION_VERSION"),
+        ):
+            with pytest.raises(ValueError, match=code):
+                await runtime.handle(state, who, event, expected_version=version)
+        for bad in ({"kind": "cancel"}, event | {"request_id": ""}, event | {"code": "execute"}):
+            with pytest.raises(ValueError):
+                await runtime.handle(state, principal, bad, expected_version=state.version)
+        assert state.recent_request_ids == ()
+
+    asyncio.run(scenario())
+
+
 def test_single_runtime_routes_discovery_navigation_and_verified_cart(now, product, grant):
     async def scenario():
         conversation = Conversation(

@@ -3,6 +3,7 @@
 import json
 
 from shopping_ai.context import BuiltContext
+from shopping_ai.intents import explicit_mutation_request
 from shopping_ai.models import ModelDecision, ToolProposal
 
 
@@ -13,7 +14,14 @@ class MockProvider:
         data = json.loads(context.payload)
         message = data["message"].lower()
         product = data["product"]
-        if any(word in message for word in ("cart", "select", "choose", "daal")):
+        cart_requested = any(
+            word in message for word in ("cart", "daal")
+        ) or explicit_mutation_request(message, "add_to_cart")
+        if (
+            cart_requested
+            or any(word in message for word in ("select", "choose"))
+            or explicit_mutation_request(message, "select_variant")
+        ):
             grant = data["authorization"]
             if not grant:
                 return ModelDecision(
@@ -26,7 +34,7 @@ class MockProvider:
                 tool = ToolProposal(
                     name="select_variant", product_id=grant["product_id"], variant_id=target
                 )
-            elif any(word in message for word in ("cart", "daal")):
+            elif cart_requested:
                 tool = ToolProposal(
                     name="add_to_cart",
                     product_id=grant["product_id"],
