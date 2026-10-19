@@ -33,6 +33,7 @@ from shopping_ai.market import (
     plan_search,
     rank_offers,
 )
+from shopping_ai.market_answers import MarketAnswer, answer_market
 from shopping_ai.market_dialogue import (
     DetailInterpreter,
     MarketDraft,
@@ -158,6 +159,7 @@ class ConversationReply(Contract):
     comparison: ComparisonResult | None = None
     search_tasks: tuple[SearchTask, ...] = Field(default_factory=tuple, max_length=6)
     market_result: MarketResult | None = None
+    market_answer: MarketAnswer | None = None
 
     @model_validator(mode="after")
     def action_binding(self) -> Self:
@@ -179,6 +181,16 @@ class ConversationReply(Contract):
             market is None or self.market_result.search_id != market.search_id
         ):
             raise ValueError("Market result must belong to the active search")
+        if self.market_answer:
+            if market is None or self.market_answer.search_id != market.search_id:
+                raise ValueError("Market answer must belong to this search")
+            observed = {
+                offer.offer_id: offer for receipt in market.receipts for offer in receipt.offers
+            }
+            if any(
+                observed.get(offer.offer_id) != offer for offer in self.market_answer.source_offers
+            ):
+                raise ValueError("Market answer must reference this search's exact observations")
         if self.action and self.search_tasks:
             raise ValueError("Cannot dispatch cart and search work together")
         if self.comparison:
@@ -261,14 +273,21 @@ class Conversation:
         comparison: ComparisonResult | None = None,
         search_tasks: tuple[SearchTask, ...] = (),
         market_result: MarketResult | None = None,
+        market_answer: MarketAnswer | None = None,
         **updates,
     ) -> ConversationReply:
         if market_result is not None:
             updates["market_display_ids"] = tuple(
                 item.offer.offer_id for item in market_result.ranked
             )
+        if market_answer is not None and market_answer.source_offers:
+            updates["market_display_ids"] = tuple(
+                offer.offer_id for offer in market_answer.source_offers
+            )
         speech = (
-            market_result.speech_text
+            market_answer.speech_text
+            if market_answer is not None
+            else market_result.speech_text
             if market_result is not None
             else comparison.speech(state.language)
             if comparison is not None
@@ -289,6 +308,7 @@ class Conversation:
             comparison=comparison,
             search_tasks=search_tasks,
             market_result=market_result,
+            market_answer=market_answer,
         )
 
     def start(
@@ -535,7 +555,13 @@ class Conversation:
                     "Product details ya variant/cart action mein help chahiye?",
                 ),
             )
-        if busy and meaning.intent not in {"product_question", "compare"}:
+        if busy and meaning.intent not in {
+            "product_question",
+            "compare",
+            "market_coverage",
+            "market_exclusions",
+            "market_costs",
+        }:
             return self._reply(
                 state,
                 "paused",
@@ -597,6 +623,8 @@ class Conversation:
                     "previous_id": state.previous_id if state.previous_id in ids else None,
                 }
             )
+        if meaning.intent in {"market_coverage", "market_exclusions", "market_costs"}:
+            return self._market_question(state, meaning, busy=busy)
         if meaning.intent == "open_offer":
             if not explicit_open_request(turn.message):
                 return self._reply(
@@ -784,6 +812,47 @@ class Conversation:
         run = self.orchestrator.start(principal, request, target)
         run = await self.orchestrator.advance(run, principal, expected_version=run.version)
         return self._run_reply(state, run)
+
+    def _market_question(
+        self,
+        state: ConversationState,
+        meaning: Meaning,
+        *,
+        busy: bool,
+    ) -> ConversationReply:
+        market = state.active_market
+        offer_id = None
+        if market is not None and meaning.reference == "ordinal":
+            if meaning.ordinal <= len(state.market_display_ids):
+                offer_id = state.market_display_ids[meaning.ordinal - 1]
+            else:
+                market = None
+        if market is None or meaning.reference == "previous":
+            return self._reply(
+                state,
+                "needs_input",
+                self._text(
+                    state,
+                    "A saved search and an unambiguous displayed offer reference are needed.",
+                    "Saved search aur clear displayed offer reference chahiye.",
+                ),
+            )
+        result, answer = answer_market(
+            market,
+            meaning.intent.removeprefix("market_"),
+            offer_id=offer_id,
+            now=self.orchestrator.ai.clock(),
+            config=self.orchestrator.ai.config,
+            language=state.language,
+        )
+        status = "needs_input" if answer.status == "needs_input" else "chat" if busy else "complete"
+        return self._reply(
+            state,
+            status,
+            answer.message,
+            market_result=result,
+            market_answer=answer,
+        )
 
     def _open_offer(
         self,

@@ -40,6 +40,9 @@ class Meaning(Contract):
         "compare",
         "market_search",
         "open_offer",
+        "market_coverage",
+        "market_exclusions",
+        "market_costs",
         "reviews",
         "unknown",
     ] = "unknown"
@@ -86,6 +89,12 @@ class BasicInterpreter:
             return Meaning(intent="greeting")
         if text in {"help", "madad", "kya kar sakte ho", "what can you do"}:
             return Meaning(intent="help")
+        if (
+            re.search(r"\b(why|kyu|kyun)\b", text)
+            and re.search(r"\b(cheapest|sasta|incomplete|partial)\b", text)
+            and not re.search(r"\b(open|kholo|cart|buy|pay)\b", text)
+        ):
+            return Meaning(intent="market_coverage")
         # An explicit negation must never become a cart or variant command.
         if re.search(r"\b(mat|nahi|nahin|don't|dont|not)\b", text):
             return Meaning()
@@ -166,7 +175,20 @@ class BasicInterpreter:
             if indices:
                 return Meaning()
             reference = "previous"
-        if re.search(r"\b(open|kholo|khol)\b", text):
+        market_question = (
+            "market_exclusions"
+            if re.search(r"\b(excluded|exclude|exclusions|hata)\b", text)
+            else "market_costs"
+            if re.search(r"\b(shipping|delivery|fees|tax|breakdown)\b", text)
+            else "market_coverage"
+            if re.search(r"\b(coverage|incomplete|partial)\b", text)
+            else None
+        )
+        if market_question:
+            if comparison_indices or re.search(r"\b(open|kholo|cart|buy|pay|select)\b", text):
+                return Meaning()
+            intent = market_question
+        elif re.search(r"\b(open|kholo|khol)\b", text):
             if comparison_indices or not explicit_open_request(message):
                 return Meaning()
             if not (is_compare or reference == "ordinal" or re.search(r"\boffer\b", text)):

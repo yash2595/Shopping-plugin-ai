@@ -89,6 +89,19 @@ async def main():
     print(result.message)
     for item in result.ranked:
         print(item.store_id, item.total, item.offer.url)
+    for message in ("shipping breakdown", "coverage"):
+        output = await assistant.handle(
+            output.state,
+            principal,
+            TextEvent(
+                turn=ConversationTurn(
+                    request_id=f"question{output.state.version}",
+                    message=message,
+                )
+            ),
+            expected_version=output.state.version,
+        )
+        print("Follow-up:", output.conversation_reply.message)
 
 
 if __name__ == "__main__":

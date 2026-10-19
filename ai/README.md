@@ -1068,3 +1068,42 @@ These checks enforce consistency of supplied observations; they do not establish
 that retailer claims are independently true or authenticate the submitting client.
 Browser receipts still require a trusted, owner-bound executor/normalizer. No live
 store extraction or provider selection was added in this change.
+
+## Grounded questions about saved search results
+
+Conversation now routes `market_costs`, `market_coverage` and `market_exclusions`
+through `answer_market`, which uses the current clock and saved normalized
+observations. The compatible LLM intent prompt understands these categories; the
+offline fallback supports explicit questions such as “shipping breakdown”,
+“delivery charge kitna hai”, “why cheapest not confirmed”, and “why offer excluded”.
+This does not turn the fallback into general natural-language understanding.
+
+`ConversationReply.market_answer` contains the question category, short speech,
+detailed text and up to five exact source offers. Reply validation checks these
+sources against this conversation's owned search evidence. `market_result` remains
+available with current ranking, coverage and exclusion reasons. Explanations need
+no additional model decision/browser call after normal intent routing; they never
+redispatch search/navigation/cart work or manufacture provider observations.
+
+Cost questions preserve observed zero separately from unknown shipping/tax/fees.
+They default to a unique confirmed winner where available, otherwise show a bounded
+set of matching fresh observations. An explicit ordinal resolves to the saved
+last-displayed offer ID, not a newly shifted ordering. If a cost/exclusion answer
+shows a source-offer list, that list becomes the next ordinal reference context.
+Unknown totals stay unknown and conditional coupons are not deducted. Showing an
+observed cost does not establish stock, eligibility or a checkout guarantee.
+Stale references require fresh evidence; cost questions cannot revive expired prices.
+
+Coverage answers show requested stores' observed/pending/failed statuses and explain
+missing evidence. Exclusion answers identify the actual source and reason, rather
+than inventing why a retailer failed. English/Hinglish messages and bounded speech
+are generated from the same evidence. Voice uses the answer-specific speech text,
+not an unrelated ranking summary. When several cost/reason rows are shown, speech
+explicitly points to the remaining on-screen rows.
+
+Saved-evidence questions are permitted while browser work is pending; unresolved
+work is retained, with no new action dispatch. Missing searches or ambiguous/out-of-
+range/previous references ask for clarification. Compound cost+cart requests stay
+unclear in the fallback rather than silently dropping the action part. The shared
+offline market example now demonstrates cost and coverage follow-ups too. No live
+retailer or real-model quality claim is established by these offline tests.
