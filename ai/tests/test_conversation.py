@@ -897,3 +897,106 @@ def test_two_conversations_under_same_owner_keep_separate_slots(conversation, pr
     assert second_reply.state.requirements.category == "shoes"
     assert first_reply.state.requirements.budget == Decimal("2000")
     assert second_reply.state.requirements.budget == Decimal("5000")
+
+
+@pytest.mark.parametrize(
+    "language,expected",
+    [
+        ("en", "complete cart"),
+        ("hi-Latn", "Poora cart"),
+    ],
+)
+def test_incomplete_cart_read_explains_pause_without_zero_or_success_claim(
+    conversation, principal, product, grant, now, language, expected
+):
+    state = conversation.start(principal, language=language).state
+    pending = pending_baseline(conversation, principal, state, product, grant)
+    failed = result_for(pending.state, now, 0).model_copy(
+        update={
+            "outcome": "failed",
+            "cart": None,
+            "error_code": "CART_COVERAGE_INCOMPLETE",
+        }
+    )
+    reply = conversation.accept_result(
+        pending.state,
+        principal,
+        failed,
+        expected_version=pending.state.version,
+    )
+    assert reply.status == "paused" and reply.action is None
+    assert expected in reply.message and "resume" in reply.message.lower()
+    assert reply.speech_text == reply.message
+    assert "CART_COVERAGE_INCOMPLETE" not in reply.message
+    assert "Verified cart" not in reply.message
+    assert reply.state.active_run.cart is None
+    assert not reply.state.active_run.recovery_required
+
+
+@pytest.mark.parametrize(
+    "language,expected",
+    [
+        ("en", "will not repeat the add"),
+        ("hi-Latn", "Add action dobara nahi"),
+    ],
+)
+def test_unknown_cart_update_explains_read_only_recovery(
+    conversation, principal, product, grant, now, language, expected
+):
+    state = conversation.start(principal, language=language).state
+    pending = pending_baseline(conversation, principal, state, product, grant)
+    baseline = conversation.accept_result(
+        pending.state,
+        principal,
+        result_for(pending.state, now, 0),
+        expected_version=pending.state.version,
+    )
+    add = asyncio.run(
+        conversation.advance(
+            baseline.state,
+            principal,
+            expected_version=baseline.state.version,
+        )
+    )
+    lost = result_for(add.state, now, 0).model_copy(
+        update={
+            "outcome": "unknown",
+            "cart": None,
+            "error_code": "PRIVATE_EXECUTOR_DETAIL",
+        }
+    )
+    reply = conversation.accept_result(
+        add.state,
+        principal,
+        lost,
+        expected_version=add.state.version,
+    )
+    assert reply.status == "paused" and reply.action is None
+    assert reply.state.active_run.recovery_required
+    assert expected in reply.message and "resume" in reply.message
+    assert "PRIVATE_EXECUTOR_DETAIL" not in reply.speech_text
+    assert "ACTION_UNKNOWN" not in reply.message
+    assert reply.message == reply.speech_text
+
+
+@pytest.mark.parametrize("code", ["PRIVATE_STORE_INTERNAL", "LOST_RECEIPT"])
+def test_unrecognized_read_failure_code_is_not_spoken_to_user(
+    conversation, principal, state, product, grant, now, code
+):
+    pending = pending_baseline(conversation, principal, state, product, grant)
+    failed = result_for(pending.state, now, 0).model_copy(
+        update={
+            "outcome": "failed",
+            "cart": None,
+            "error_code": code,
+        }
+    )
+    reply = conversation.accept_result(
+        pending.state,
+        principal,
+        failed,
+        expected_version=pending.state.version,
+    )
+    assert reply.status == "paused" and reply.action is None
+    assert code not in reply.message and "verify nahi hua" in reply.message
+    assert reply.state.active_run.pause_code == code

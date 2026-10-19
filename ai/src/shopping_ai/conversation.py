@@ -1374,6 +1374,61 @@ class Conversation:
             comparison=comparison,
         )
 
+    def _pause_message(self, state: ConversationState, run: RunState) -> str:
+        # Deterministic wording also feeds speech. Never echo executor-supplied codes.
+        if run.recovery_required:
+            return self._text(
+                state,
+                "The cart update is not confirmed. Bring the shopping tab to the foreground "
+                "and resume so I can check the cart. I will not repeat the add action.",
+                "Cart update confirm nahi hua hai. Shopping tab saamne laakar resume karo; "
+                "main cart check karunga. Add action dobara nahi karunga.",
+            )
+        messages = {
+            "CART_COVERAGE_INCOMPLETE": (
+                "I could not read the complete cart, so its quantity is unconfirmed. "
+                "Let the cart finish loading, then resume to check again.",
+                "Poora cart read nahi hua, isliye quantity confirm nahi hai. "
+                "Cart load hone do, phir resume karo taaki dobara check kar sakun.",
+            ),
+            "TAB_NOT_FOREGROUND": (
+                "Bring the shopping tab to the foreground, then resume to continue.",
+                "Shopping tab saamne lao, phir continue karne ke liye resume karo.",
+            ),
+            "ACTION_EXPIRED": (
+                "The page check timed out. Return to the shopping tab and resume to try again.",
+                "Page check ka time khatam ho gaya. Shopping tab par aakar resume karo.",
+            ),
+            "PRICE_LIMIT": (
+                "The current price exceeds your confirmed limit. Review the price "
+                "before confirming another cart request.",
+                "Current price tumhari confirmed limit se zyada hai. "
+                "Naya cart request confirm karne se pehle price check karo.",
+            ),
+            "VARIANT_NOT_VERIFIED": (
+                "I could not confirm the requested variant on the page. "
+                "Check the selection before continuing.",
+                "Page par requested variant confirm nahi hua. "
+                "Continue karne se pehle selection check karo.",
+            ),
+            "USER_PAUSED": (
+                "The task is paused. Resume when you are ready to continue.",
+                "Task pause hai. Taiyaar ho to continue karne ke liye resume karo.",
+            ),
+        }
+        return self._text(
+            state,
+            *messages.get(
+                run.pause_code,
+                (
+                    "I could not verify this step, so the task is paused. "
+                    "Check the shopping page before resuming.",
+                    "Ye step verify nahi hua, isliye task pause hai. "
+                    "Resume karne se pehle shopping page check karo.",
+                ),
+            ),
+        )
+
     def _run_reply(self, state: ConversationState, run: RunState) -> ConversationReply:
         if run.pending:
             progress = {
@@ -1415,11 +1470,7 @@ class Conversation:
                 "Observation mil gayi. Ab agla step check kar sakta hoon.",
             )
         if run.status == "paused":
-            message = self._text(
-                state,
-                f"Task paused ({run.pause_code}). No new action was dispatched.",
-                f"Task pause hai ({run.pause_code}). Koi naya action nahi bheja.",
-            )
+            message = self._pause_message(state, run)
         return self._reply(
             state,
             status,

@@ -711,6 +711,21 @@ Opt-in one-turn smoke test (may incur STT/model/TTS charges):
 python ai/examples/live_voice.py /path/to/recording.webm --output /path/to/reply.wav
 ```
 
+To answer about a freshly captured product, optionally supply both capture and
+stable product ID:
+
+```sh
+python ai/examples/live_voice.py /path/to/recording.webm --output /path/to/reply.wav --capture /path/to/capture.json --product-id stable-product-id
+```
+
+The shared bounded capture decoder and product adapter validate the file before
+opening live providers. STT then feeds the unchanged transcript and normalized
+current-product context into conversation, followed by TTS. Both file-demo modes
+provide no browser tool permissions or mutation authorization. A stale/contradictory
+capture must be recaptured, not stamped fresh. This path is tested with fake speech
+and offline decision adapters; actual STT/model/TTS quality still needs explicit
+configured live testing. No provider is selected or contacted automatically.
+
 Also configure the `AI_CHAT_*` variables from the live text section. The output
 extension must match `AI_TTS_FORMAT`; existing output files are never overwritten.
 The script reads a bounded input and writes audio only when all stages succeed.
@@ -1262,10 +1277,11 @@ This is an integration contract, not implemented backend persistence or playback
 
 ## Offline integration scenario evaluation
 
-Run `python -m shopping_ai.evaluate --scenarios` for a separate JSON report of six
+Run `python -m shopping_ai.evaluate --scenarios` for a separate JSON report of seven
 fixed simulated journeys: budget changes + explicit pair comparison, refresh/late-
 receipt isolation, stale-source refusal, listing-to-page price change, and deferred
-voice with TTS-only retry, and shared-runtime session isolation. Each event's
+voice with TTS-only retry, shared-runtime session isolation, and contradictory-page
+capture rejection followed by a corrected capture. Each event's
 checkpoint is serialized and restored through
 the shared runtime codec. Speech bytes, sellers, offers and page receipts are fake;
 no credentials, live provider calls or real browser actions are used. Each journey
@@ -1274,7 +1290,7 @@ Exit code is zero only when every journey passes; otherwise it is one.
 
 This evaluates integration invariants rather than natural-language/model quality.
 The original default intent/detail benchmark remains separate and still reports its
-known offline natural-detail extraction limitation. Six passing scenarios do not
+known offline natural-detail extraction limitation. Seven passing scenarios do not
 establish real retailer extraction, audible speech quality, database durability,
 concurrent-user capacity or production readiness. `--scenarios`, `--live` and
 `--check` are mutually exclusive; `--voice` remains a configuration-check option.
@@ -1431,3 +1447,229 @@ No real Hindi STT/TTS quality claim is established. General Hindi questions, nat
 product-detail extraction, arbitrary translation and unseen colour shades remain
 outside this small fallback vocabulary; model/variant/specification data is not
 automatically transliterated or inferred.
+
+## Product-page evidence adapter
+
+`page_evidence.CapturedPage` carries a trusted visible-browser target/document, URL,
+capture time, bounded HTML and independently observed title/price/currency/stock.
+`extract_product_snapshot(page, snapshot_id=..., product_id=..., now=...)` returns
+the existing `ProductSnapshot`, ready for an owned `BrowserResult` read-product
+receipt. The runtime's existing receipt checks remain mandatory. IDs/time/visible
+fields must come from the authenticated executor, never an LLM or client assertion.
+The adapter itself performs no fetching, navigation, scripts or model calls.
+
+The supported subset is one inline Schema.org Product and one Offer, either at the
+top level, in a top-level array, or in `@graph`. Product URL must match the capture
+(fragments ignored), and title must agree with the observed page title. Current
+price/currency are exposed only when the visible pair matches the direct Offer
+price/currency. Stock requires agreement with a known availability URI and explicit
+visible boolean; missing/unknown availability remains unknown. Metadata alone does
+not establish price or stock. Contradictions, multiple products/offers, AggregateOffer,
+duplicate JSON keys, nonfinite JSON numbers, external scripts, stale/future captures
+and bounded-size violations fail closed with stable error codes.
+
+No variants, selected variant, shipping/tax, seller authenticity or canonical market
+identity are inferred. This adapter cannot by itself produce a cheapest comparison
+or authorize cart mutations. Recommendation grids, arbitrary JSON-LD context/
+reference expansion, microdata, client-side rendering and store-specific selectors
+are outside the initial subset. HTML is excluded from default repr/model dumps;
+the caller still controls retention and authenticated capture provenance.
+
+A read-only HTTP smoke check on the public ScrapeMe Bulbasaur demo page matched
+HTML title/price/stock with its live JSON-LD and produced a grounded offline price/
+stock answer. This was HTML parsing with simulated browser IDs, not a Chrome-visible
+execution, live LLM/STT/TTS test or checkout verification. Offline tests additionally
+route normalized evidence through runtime read-product receipt → final AI response.
+References: https://schema.org/Product and https://schema.org/Offer.
+
+## Binding captured pages to pending product reads
+
+`build_product_read_result(run, principal, page, expected_run_version=...,
+snapshot_id=..., product_id=..., now=..., config=...)` wraps normalized page evidence
+in the existing `BrowserResult`. It verifies the current owned run/version before
+parsing HTML, requires a pending `read_product`, and checks exact tab/document plus
+capture time between action issuance and its deadline. Pass the runtime's own config
+and clock; do not generate timestamps or IDs from source text/model output.
+
+The helper copies action/run/session/version bindings from the pending checkpoint,
+not caller-supplied receipt IDs, and derives no mutation/cart evidence. Submit the
+result through `runtime.handle(..., BrowserEvent(result=...),
+expected_version=conversation_state.version)`; normal receipt validation, state
+advancement and persistence/CAS responsibilities still apply. The expected run
+version and expected conversation version refer to different checkpoints.
+
+An owned cancelled run may still record a matching in-window read result using the
+original action version, without reviving that run. Expired captures require a fresh
+read; this helper never retries or executes one. Ownership/version/target checks
+protect binding consistency, not capture authenticity: the future backend must load
+trusted current state and authenticate the extension/executor. The AI helper cannot
+prove that a submitted tab was actually visible or that DOM fields were honestly
+captured. No browser, database or transport implementation is added here.
+
+## Normalizing a captured cross-store offer
+
+`ObservedOfferDetails` carries independently observed identity, seller, document/time,
+delivery context, charge currency, optional shipping/tax/fees and conditional-discount
+note. `build_market_offer(search, principal, task_id, page, details,
+expected_search_version=..., offer_id=..., snapshot_id=..., now=..., config=...)`
+requires a current owned pending search task, the configured store origin, a fresh
+in-window capture and exact detail document/time/delivery scope. It reuses the
+visible-field/JSON-LD product checks rather than accepting a model-generated price.
+
+The initial supported identity subset requires explicit structured brand/model,
+NewCondition/UsedCondition/RefurbishedCondition, and seller name agreeing with the
+independent observations. Declared colour/size use their dedicated product fields;
+other declared variant attributes require explicit `additionalProperty` PropertyValue
+name/value pairs. Ambiguous properties, missing values and contradictory condition
+signals fail closed. Missing brand/model/variant cannot be guessed from a title.
+Many live sites omit these fields and will require a separate trusted store adapter;
+the earlier public demo-page smoke check did not establish cross-store support.
+
+Observed identity is never replaced with requested search identity. A corroborated
+different variant can remain an Offer that ranking explicitly excludes. Foreign
+currency likewise remains source evidence for exclusion, without conversion.
+Shipping/tax/fees remain `None` unless actually observed for that capture/delivery
+context, and conditional coupons are recorded without subtraction. The helper checks
+scope and currency, not the truth of externally supplied fee observations; only an
+authenticated visible executor should supply these records.
+
+The output is one Offer, not a completed SearchReceipt, an action, a state update or
+a cheapest claim. The caller must finish its store task, assemble the normal owned
+receipt and submit it through the existing runtime/CAS flow. Normal receipt duplicate
+and scope validation still applies. Tests exercise two captured offers through
+receipt acceptance and delivered-total ranking, including coupon non-deduction,
+unknown charges, different observed variant and contradictory identity evidence.
+
+## Page evidence in shared runtime journeys
+
+Scenario search setup now creates independent fixed page/visible-field/identity
+fixtures and calls `build_market_offer` before submitting each normal SearchReceipt.
+It no longer constructs ready-made Offers directly from requested search identity.
+Budget, refresh, comparison, navigation, deferred voice and interleaved-session checks
+therefore all pass through page normalization and checkpoint restoration first.
+
+The `capture_rejection` journey refreshes a search, supplies contradictory visible
+and structured prices, verifies no receipt/state/task was consumed, then submits
+corrected evidence through the runtime. A first successful store result still cannot
+confirm an overall cheapest offer while the other store is pending. Evaluation tests
+also force normalizer failure to ensure none of these journeys bypasses the adapter.
+All captures in this harness remain simulated; they validate integration and rejection
+behavior, not actual Chrome visibility, store completeness or retailer accuracy.
+
+## Captured evidence after offer navigation
+
+`build_navigation_result(proposal, principal, page, observed_identity,
+snapshot_id=..., product_id=..., now=..., config=...)` normalizes an actual opened
+page into the existing NavigationReceipt. It requires proposal ownership, exact URL
+and same tab, an in-window fresh capture, the expected canonical identity independently
+corroborated by structured brand/model/condition/attributes, and the same structured
+seller name. Changed/missing seller or identity does not silently verify the old offer.
+
+Price and stock come from the new visible/structured agreement; original search values
+are never used as a fallback. Submit through the normal runtime with the current
+conversation version so stale/cancelled/replaced proposals cannot select a page.
+Accepted changed/unknown price or stock reaches the existing verification explanation
+and cached-ranking invalidation path. The shared navigation-change scenario now uses
+this normalizer instead of constructing a ready-made fresh product/receipt.
+
+The helper does not navigate, fetch, authenticate executor data, infer a selected
+variant or verify new shipping/tax totals. It uses the same narrow explicit metadata
+subset as the market adapter; missing metadata needs a dedicated store adapter.
+Validation failure leaves caller state untouched and cannot prove navigation itself
+failed. The caller must report an appropriate failed/unverified result or obtain fresh
+evidence; never invent an opened receipt or automatically replay the navigation.
+
+## Running a saved capture locally
+
+The existing CLI now has a separate offline capture mode:
+
+```bash
+python -m shopping_ai.cli --capture /path/to/capture.json --product-id stable-product-id --message "price and stock"
+```
+
+Input is a `CapturedPage` JSON object, including raw `html`, real capture timestamp,
+target/document metadata and independently observed visible fields. To explicitly
+serialize a trusted capture for this local demo, use
+`page.model_dump(mode="json") | {"html": page.html}`; HTML remains excluded from
+ordinary logs/model dumps. The file is bounded to 8 MB, rejects duplicate keys and
+nonfinite numbers, and still passes all adapter freshness/ambiguity checks.
+
+Output contains the normalized product snapshot and grounded offline decision.
+Raw HTML is not printed. The mode always uses MockProvider, ignores live provider
+configuration and supplies no tool permissions or authorization; even a cart message
+cannot dispatch a change. This is a local read-only integration demo, not an
+authenticated executor endpoint or real-model quality check. Original AIRequest-file
+CLI usage is unchanged. `--capture` cannot be mixed with a request file or
+`--fresh-demo`: old captures are not relabelled as fresh. Invalid capture/input exits
+2 without echoing private file content; blocked/failed decisions exit 1.
+
+Captured pages may optionally include `variant_control`, an `ObservedVariantControl`
+record containing `control_id`, `document_id`, `observed_at`, observed `variants`,
+`selected_variant_id` and `price_variant_id`. Only a trusted store adapter may produce
+this record from live DOM options/selection after establishing that the control
+represents full purchasable variant IDs. A matching HTML `select` with `name="id"`
+is a consistency check, not proof of that meaning or capture authenticity.
+
+The initial subset requires one enabled single-select control, explicit closing
+option tags and exact ordered option IDs/labels. Disabled options, optgroups,
+multiple selection and incomplete/ambiguous controls are rejected. Swatches and
+multi-axis controls require a separate adapter. Document and observation time must
+match the page capture. A visible price requires an explicit binding to the live
+selected variant; the static HTML `selected` attribute never determines selection.
+Without this optional record, variants remain unknown. Observed selection feeds the
+existing product facts and mutation policy; it never creates authorization or proves
+cart success. No browser execution or real store variant coverage is demonstrated.
+
+The offline scenario suite also includes `captured_variant_cart`: an explicitly
+observed full variant is normalized from a synthetic capture, supplied with a
+separate caller authorization, and passed through conversation/runtime cart
+orchestration. It checks the baseline read, add proposal and matching final cart
+receipt, with checkpoint codec roundtrips between events. The HTML default differs
+from the live selection to check that it is not used as selection evidence.
+Regression checks reject normalization bypass and incorrect final quantity. All
+cart receipts are simulated; this does not exercise Chrome clicks or a retailer cart.
+
+`build_cart_read_result(run, principal, cart, target, coverage="complete", expected_run_version=..., now=...)`
+binds an independently observed `CartSnapshot` to a pending `read_cart` action.
+The required `coverage` declaration accepts only `complete` for receipt construction;
+`partial` and `unknown` raise `CART_COVERAGE_INCOMPLETE` without consuming the action.
+A populated partial cart is also insufficient for exact quantity verification.
+
+For transport, `CapturedCart` contains `target`, `cart` and required `coverage`.
+`decode_captured_cart(payload)` accepts at most 262,144 bytes of strict JSON and
+validates document agreement, distinct item/variant lines and strict quantities.
+It preserves partial/unknown coverage for the caller to request a complete read;
+it never upgrades it. Duplicate JSON keys, nonfinite values and malformed/oversized
+records produce a stable redacted error. Supply the decoded fields to the builder.
+The simulated baseline-read journey exercises this codec before binding the receipt.
+It checks ownership, current run version, visible tab/document, cart document,
+action window and observation age, then preserves the original action version in
+the receipt. Submit that receipt through the runtime using the current conversation
+version. A cancelled run can retain a pending read receipt without resuming work.
+
+The caller's trusted executor must establish complete cart coverage before supplying
+lines: an empty snapshot means a confirmed empty cart, not a failed selector or an
+unloaded page. Exact product/variant mappings must come from its store adapter.
+This helper accepts structured observations, performs no HTML extraction, creates
+no authorization and cannot generate an `add_to_cart` mutation receipt. The offline
+captured-variant cart scenario uses it for the baseline read only.
+
+The `lost_cart_receipt` offline journey extends the captured-variant cart scenario:
+its simulated add returns `unknown`, leaving a paused recovery checkpoint. Automatic
+advance is rejected. An explicit resume permits only a bound `read_cart`; an absent
+item leaves recovery paused and a later explicit resume/read with the matching
+quantity completes verification. No second add proposal is dispatched in recovery.
+Each event crosses the checkpoint codec. This tests existing recovery orchestration
+through the runtime and cart-read adapter; it does not implement durable delivery,
+Chrome cancellation or exactly-once execution in a real browser.
+
+Paused conversation replies use deterministic English/Hinglish explanations for
+incomplete cart reads, foreground requirements, timeouts, price limits and unverified
+variant selection. Unknown executor reason codes remain in the owned run checkpoint
+and are not interpolated into displayed/spoken text. When cart recovery is required,
+the reply says the update is unconfirmed and asks for a foreground tab plus explicit
+resume for a cart check, without repeating the add action. These messages use existing
+pause/resume transitions and do not authorize or dispatch work themselves. A rejected
+partial capture leaves its read pending; callers may wait for complete evidence within
+the action window, or submit a bound failed read receipt with
+`CART_COVERAGE_INCOMPLETE` to enter the existing paused state.

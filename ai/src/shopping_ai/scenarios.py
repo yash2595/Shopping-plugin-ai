@@ -1,17 +1,29 @@
 """Fixed simulated integration journeys; no retailer, model or speech-service calls."""
 
 import asyncio
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
-from shopping_ai.browser import BrowserTarget
+from shopping_ai.browser import BrowserResult, BrowserTarget, CartLine, CartSnapshot
 from shopping_ai.config import AIConfig
 from shopping_ai.intents import BasicInterpreter
-from shopping_ai.market import Offer, SearchReceipt, Store
+from shopping_ai.market import ProductIdentity, SearchReceipt, Store
 from shopping_ai.market_dialogue import OfflineDetailInterpreter
-from shopping_ai.models import ProductSnapshot
-from shopping_ai.navigation import NavigationReceipt
-from shopping_ai.orchestrator import Principal
+from shopping_ai.models import MutationAuthorization
+from shopping_ai.orchestrator import OrchestrationError, Principal
+from shopping_ai.page_evidence import (
+    CapturedCart,
+    CapturedPage,
+    ObservedOfferDetails,
+    ObservedVariantControl,
+    PageEvidenceError,
+    build_cart_read_result,
+    build_market_offer,
+    build_navigation_result,
+    decode_captured_cart,
+    extract_product_snapshot,
+)
 from shopping_ai.providers import MockProvider
 from shopping_ai.runtime import AssistantRuntime, create_runtime
 from shopping_ai.voice import AudioClip, Transcript
@@ -120,6 +132,19 @@ class Journey:
         self.original_receipt = None
         for index, task in enumerate(reply.search_tasks):
             market = self.state.active_market
+            page, details = self.capture_offer(task, index)
+            offer = build_market_offer(
+                market,
+                self.principal,
+                task.task_id,
+                page,
+                details,
+                expected_search_version=market.version,
+                offer_id=f"offer{index}",
+                snapshot_id=f"snapshot{index}",
+                now=self.now,
+                config=self.runtime.conversation.orchestrator.ai.config,
+            )
             receipt = SearchReceipt(
                 search_id=market.search_id,
                 owner_id=self.principal.owner_id,
@@ -127,21 +152,7 @@ class Journey:
                 task_id=task.task_id,
                 delivery_context=market.delivery_context,
                 status="complete",
-                offers=(
-                    Offer(
-                        offer_id=f"offer{index}",
-                        snapshot_id=f"snapshot{index}",
-                        identity=market.identity,
-                        url=task.store.origin + "/product/one",
-                        seller="Simulated seller",
-                        observed_at=self.now,
-                        in_stock=True,
-                        price="999" if index == 0 else "1049",
-                        currency="INR",
-                        shipping="100" if index == 0 else "0",
-                        extra_tax_and_fees="0",
-                    ),
-                ),
+                offers=(offer,),
             )
             if index == 0:
                 self.original_receipt = receipt
@@ -149,6 +160,115 @@ class Journey:
         require(
             output.conversation_reply.market_result.cheapest_offer_ids == ("offer1",),
             "delivered_total_winner_incorrect",
+        )
+
+    def capture_offer(self, task, index, *, price=None):
+        """Independent fixed source fixture, never a copy of requested identity."""
+        url = task.store.origin + "/product/one"
+        price = price if price is not None else "999" if index == 0 else "1049"
+        metadata = {
+            "@context": "https://schema.org",
+            "@type": "Product",
+            "url": url,
+            "name": "Example Phone One",
+            "brand": {"@type": "Brand", "name": "Example"},
+            "model": "Phone One",
+            "color": "black",
+            "additionalProperty": [{"@type": "PropertyValue", "name": "storage", "value": "128GB"}],
+            "offers": {
+                "@type": "Offer",
+                "url": url,
+                "price": price,
+                "priceCurrency": "INR",
+                "availability": "https://schema.org/InStock",
+                "itemCondition": "https://schema.org/NewCondition",
+                "seller": {"@type": "Organization", "name": "Simulated seller"},
+            },
+        }
+        page = CapturedPage(
+            target=BrowserTarget(
+                tab_id=7 + index,
+                document_id=f"market-page{index}",
+                active=True,
+                window_focused=True,
+            ),
+            url=url,
+            observed_at=self.now,
+            html='<script type="application/ld+json">' + json.dumps(metadata) + "</script>",
+            visible_title="Example Phone One",
+            visible_price=price,
+            visible_currency="INR",
+            visible_stock=True,
+        )
+        details = ObservedOfferDetails(
+            document_id=page.target.document_id,
+            observed_at=self.now,
+            identity=ProductIdentity(
+                brand="Example",
+                model="Phone One",
+                attributes={"storage": "128GB", "colour": "black"},
+                condition="new",
+            ),
+            seller="Simulated seller",
+            delivery_context="201001",
+            currency="INR",
+            shipping="100" if index == 0 else "0",
+            extra_tax_and_fees="0",
+        )
+        return page, details
+
+    async def capture_rejection(self):
+        await self.say("refresh prices")
+        market = self.state.active_market
+        task = market.tasks[0]
+        page, details = self.capture_offer(task, 0)
+        before = self.state
+        try:
+            build_market_offer(
+                market,
+                self.principal,
+                task.task_id,
+                page.model_copy(update={"visible_price": Decimal("1")}),
+                details,
+                expected_search_version=market.version,
+                offer_id="corrected",
+                snapshot_id="corrected",
+                now=self.now,
+            )
+        except PageEvidenceError as exc:
+            require(str(exc) == "VISIBLE_PRICE_MISMATCH", "unexpected_capture_rejection")
+        else:
+            raise ScenarioFailure("contradictory_capture_accepted")
+        require(self.state == before and not market.receipts, "rejection_consumed_task")
+        offer = build_market_offer(
+            market,
+            self.principal,
+            task.task_id,
+            page,
+            details,
+            expected_search_version=market.version,
+            offer_id="corrected",
+            snapshot_id="corrected",
+            now=self.now,
+        )
+        reply = await self.send(
+            {
+                "kind": "market_result",
+                "receipt": SearchReceipt(
+                    search_id=market.search_id,
+                    owner_id=self.principal.owner_id,
+                    session_id=self.principal.session_id,
+                    task_id=task.task_id,
+                    delivery_context="201001",
+                    status="complete",
+                    offers=(offer,),
+                ),
+            }
+        )
+        require(
+            len(self.state.active_market.receipts) == 1
+            and not reply.conversation_reply.market_result.cheapest_offer_ids,
+            "corrected_capture_not_scoped_to_pending_search",
         )
 
     async def budget_and_pair(self):
@@ -204,31 +324,24 @@ class Journey:
         target = BrowserTarget(tab_id=7, document_id="before", active=True, window_focused=True)
         proposal = (await self.say("open cheapest", target=target)).navigation
         require(proposal is not None, "navigation_not_proposed")
-        product = ProductSnapshot(
+        page, details = self.capture_offer(self.state.active_market.tasks[1], 1, price="1200")
+        page = page.model_copy(
+            update={"target": target.model_copy(update={"document_id": "after"})}
+        )
+        receipt = build_navigation_result(
+            proposal,
+            self.principal,
+            page,
+            details.identity,
             snapshot_id="opened",
             product_id="phone",
-            document_id="after",
-            title="Simulated phone",
-            observed_at=self.now,
-            price="1200",
-            currency="INR",
-            in_stock=True,
+            now=self.now,
+            config=self.runtime.conversation.orchestrator.ai.config,
         )
         opened = await self.send(
             {
                 "kind": "navigation_result",
-                "receipt": NavigationReceipt(
-                    action_id=proposal.action_id,
-                    search_id=proposal.search_id,
-                    owner_id=self.principal.owner_id,
-                    session_id=self.principal.session_id,
-                    status="opened",
-                    observed_at=self.now,
-                    url=proposal.offer.url,
-                    target=target.model_copy(update={"document_id": "after"}),
-                    identity=proposal.offer.identity,
-                    product=product,
-                ),
+                "receipt": receipt,
             }
         )
         require(
@@ -270,6 +383,166 @@ class Journey:
             set(spoken.model_dump()) == {"conversation_id", "version", "status", "audio"},
             "playback_output_contains_dispatch_data",
         )
+
+    async def lost_cart_receipt(self):
+        await self.captured_variant_cart(recover=True)
+
+    async def captured_variant_cart(self, *, recover=False):
+        # New conversation: comparison setup must not supply cart permission or identity.
+        page, _ = self.capture_offer(self.state.active_market.tasks[0], 0)
+        self.persist((await self.runtime.start(self.principal, language="en")).state)
+        control = ObservedVariantControl(
+            control_id="variants",
+            document_id=page.target.document_id,
+            observed_at=self.now,
+            variants=(
+                {"variant_id": "black", "label": "Black"},
+                {"variant_id": "blue", "label": "Blue"},
+            ),
+            selected_variant_id="black",
+            price_variant_id="black",
+        )
+        page = page.model_copy(
+            update={
+                "html": page.html + '<select id="variants" name="id">'
+                '<option value="black">Black</option>'
+                '<option value="blue" selected>Blue</option></select>',
+                "variant_control": control,
+            }
+        )
+        snapshot = extract_product_snapshot(
+            page,
+            snapshot_id="cart-page",
+            product_id="p42",
+            now=self.now,
+        )
+        request_id = f"turn{self.state.version}"
+        grant = MutationAuthorization(
+            request_id=request_id,
+            allowed_tools=["add_to_cart"],
+            product_id="p42",
+            document_id=page.target.document_id,
+            variant_id="black",
+            quantity=1,
+            mode="ensure_quantity",
+            max_unit_price="1100",
+            currency="INR",
+            expires_at=self.now + timedelta(seconds=60),
+        )
+        reply = await self.say(
+            "Black wala cart mein daal do",
+            products=(snapshot,),
+            target=page.target,
+            available_tools=("read_cart", "add_to_cart"),
+            authorization=grant,
+        )
+        require(
+            reply.action is not None and reply.action.tool.name == "read_cart",
+            "cart_baseline_missing",
+        )
+        for quantity in (0, 1):
+            action = self.state.active_run.pending
+            require(action is not None, "missing_cart_action")
+            expected = "read_cart" if quantity == 0 else "add_to_cart"
+            require(action.tool.name == expected, "unexpected_cart_action")
+            if quantity == 1 and recover:
+                lost = BrowserResult(
+                    action_id=action.action_id,
+                    run_id=action.run_id,
+                    session_id=self.principal.session_id,
+                    run_version=action.run_version,
+                    source_document_id=action.target.document_id,
+                    target=action.target,
+                    observed_at=self.now,
+                    outcome="unknown",
+                    error_code="LOST_RECEIPT",
+                )
+                await self.send({"kind": "browser_result", "result": lost})
+                require(self.state.active_run.status == "paused", "unknown_add_not_paused")
+                require(self.state.active_run.recovery_required, "recovery_marker_missing")
+                # Neither an automatic advance nor repeated recovery may replay the add.
+                try:
+                    await self.send({"kind": "advance"})
+                except OrchestrationError:
+                    pass
+                else:
+                    raise ScenarioFailure("paused_run_advanced")
+                require(self.state.active_run.pending is None, "paused_add_replayed")
+                for observed_quantity in (0, 1):
+                    await self.send({"kind": "resume", "target": page.target})
+                    await self.send({"kind": "advance"})
+                    action = self.state.active_run.pending
+                    require(
+                        action is not None and action.tool.name == "read_cart",
+                        "recovery_replayed_mutation",
+                    )
+                    read = build_cart_read_result(
+                        self.state.active_run,
+                        self.principal,
+                        CartSnapshot(
+                            observed_at=self.now,
+                            document_id=page.target.document_id,
+                            lines=()
+                            if observed_quantity == 0
+                            else (CartLine(product_id="p42", variant_id="black", quantity=1),),
+                        ),
+                        page.target,
+                        coverage="complete",
+                        expected_run_version=self.state.active_run.version,
+                        now=self.now,
+                    )
+                    output = await self.send({"kind": "browser_result", "result": read})
+                    if observed_quantity == 0:
+                        require(
+                            self.state.active_run.status == "paused",
+                            "unconfirmed_cart_reported_success",
+                        )
+                        require(
+                            self.state.active_run.pending is None, "empty_recovery_replayed_add"
+                        )
+                break
+            receipt = BrowserResult(
+                action_id=action.action_id,
+                run_id=action.run_id,
+                session_id=self.principal.session_id,
+                run_version=action.run_version,
+                source_document_id=action.target.document_id,
+                target=action.target,
+                observed_at=self.now,
+                outcome="observed",
+                cart=CartSnapshot(
+                    observed_at=self.now,
+                    document_id=page.target.document_id,
+                    lines=()
+                    if quantity == 0
+                    else (CartLine(product_id="p42", variant_id="black", quantity=1),),
+                ),
+            )
+            if quantity == 0:
+                capture = decode_captured_cart(
+                    CapturedCart(
+                        target=receipt.target,
+                        cart=receipt.cart,
+                        coverage="complete",
+                    )
+                    .model_dump_json()
+                    .encode()
+                )
+                receipt = build_cart_read_result(
+                    self.state.active_run,
+                    self.principal,
+                    capture.cart,
+                    capture.target,
+                    coverage=capture.coverage,
+                    expected_run_version=self.state.active_run.version,
+                    now=self.now,
+                )
+            output = await self.send({"kind": "browser_result", "result": receipt})
+            if quantity == 0:
+                require(self.state.active_run.status != "succeeded", "premature_cart_success")
+                await self.send({"kind": "advance"})
+        require(output.conversation_reply.status == "complete", "cart_not_complete")
+        require("Verified cart" in output.conversation_reply.message, "cart_not_verified")
 
     async def shared_session_isolation(self):
         class YieldingInterpreter(BasicInterpreter):
@@ -356,6 +629,9 @@ async def run_scenarios() -> tuple[tuple[str, bool, str], ...]:
         "navigation_change",
         "deferred_voice_retry",
         "shared_session_isolation",
+        "capture_rejection",
+        "captured_variant_cart",
+        "lost_cart_receipt",
     ):
         journey = Journey()
         try:

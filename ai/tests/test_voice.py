@@ -82,6 +82,132 @@ def test_hindi_transcript_reaches_authorized_action_without_translating_product_
     assert reply.reply.state.active_run.request.message == stt.text
 
 
+@pytest.fixture
+def voice_capture_file(tmp_path):
+    import json
+    from datetime import UTC, datetime
+
+    url = "https://store.example/product/demo"
+    metadata = {
+        "@type": "Product",
+        "name": "Demo",
+        "url": url,
+        "offers": {
+            "@type": "Offer",
+            "price": "100",
+            "priceCurrency": "INR",
+            "availability": "https://schema.org/InStock",
+        },
+    }
+    path = tmp_path / "capture.json"
+    path.write_text(
+        json.dumps(
+            {
+                "target": {
+                    "tab_id": 1,
+                    "document_id": "page",
+                    "active": True,
+                    "window_focused": True,
+                },
+                "url": url,
+                "observed_at": datetime.now(UTC).isoformat(),
+                "html": '<script type="application/ld+json">' + json.dumps(metadata) + "</script>",
+                "visible_title": "Demo",
+                "visible_price": "100",
+                "visible_currency": "INR",
+                "visible_stock": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def voice_example():
+    import importlib.util
+    from pathlib import Path
+
+    path = Path(__file__).resolve().parents[1] / "examples" / "live_voice.py"
+    spec = importlib.util.spec_from_file_location("voice_example", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_file_voice_example_uses_page_context_without_action_permissions(
+    tmp_path, monkeypatch, voice_capture_file, capsys
+):
+    from contextlib import asynccontextmanager
+    from datetime import UTC, datetime
+    from types import SimpleNamespace
+
+    from shopping_ai.runtime import AssistantRuntime
+
+    module = voice_example()
+    stt, tts = STT(text="price and stock"), TTS()
+    conversation = Conversation(
+        Orchestrator(ShoppingAI(MockProvider(), clock=lambda: datetime.now(UTC)))
+    )
+    runtime = AssistantRuntime(conversation, VoiceConversation(conversation, stt, tts))
+    outputs = []
+    turns = []
+    original = runtime.handle
+
+    async def tracked(*args, **kwargs):
+        turns.append(args[2].turn)
+        output = await original(*args, **kwargs)
+        outputs.append(output)
+        return output
+
+    runtime.handle = tracked
+
+    @asynccontextmanager
+    async def fake_runtime(*args, **kwargs):
+        yield runtime
+
+    monkeypatch.setattr(module, "live_runtime", fake_runtime)
+    monkeypatch.setattr(module.ChatSettings, "from_env", lambda: object())
+    monkeypatch.setattr(
+        module.SpeechSettings, "from_env", lambda: SimpleNamespace(output_format="wav")
+    )
+    source, output = tmp_path / "input.webm", tmp_path / "output.wav"
+    source.write_bytes(b"input")
+    asyncio.run(module.run(source, output, capture=voice_capture_file, product_id="demo"))
+    assert output.read_bytes() == b"synthesized-demo-not-real-audio"
+    assert stt.calls == tts.calls == 1
+    assert len(outputs) == 1 and outputs[0].conversation_reply.action is None
+    assert turns[0].products[0].product_id == "demo" and not turns[0].available_tools
+    assert turns[0].authorization is None
+    assert outputs[0].state.selected_id == "demo"
+    assert "INR 100.00" in capsys.readouterr().out
+
+
+def test_stale_voice_capture_is_rejected_before_live_configuration(
+    tmp_path, monkeypatch, voice_capture_file
+):
+    import json
+    from datetime import UTC, datetime, timedelta
+
+    module = voice_example()
+    data = json.loads(voice_capture_file.read_text())
+    data["observed_at"] = (datetime.now(UTC) - timedelta(days=1)).isoformat()
+    voice_capture_file.write_text(json.dumps(data))
+
+    def forbidden():
+        raise AssertionError("Stale capture reached live configuration")
+
+    monkeypatch.setattr(module.SpeechSettings, "from_env", forbidden)
+    with pytest.raises(ValueError, match="STALE_PAGE_CAPTURE"):
+        asyncio.run(
+            module.run(
+                tmp_path / "input.webm",
+                tmp_path / "output.wav",
+                capture=voice_capture_file,
+                product_id="demo",
+            )
+        )
+
+
 def test_owner_version_and_replay_checked_before_stt(setup):
     voice, principal, state, stt, _ = setup
     other = Principal(owner_id="other", session_id="session")

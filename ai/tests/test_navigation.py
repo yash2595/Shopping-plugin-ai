@@ -1,4 +1,5 @@
 import asyncio
+import json
 from decimal import Decimal
 
 import pytest
@@ -8,6 +9,7 @@ from shopping_ai.browser import BrowserTarget
 from shopping_ai.market import Offer, ProductIdentity, SearchReceipt, Store
 from shopping_ai.models import ProductSnapshot
 from shopping_ai.navigation import NavigationReceipt
+from shopping_ai.page_evidence import CapturedPage, PageEvidenceError, build_navigation_result
 from shopping_ai.providers import MockProvider
 
 
@@ -105,6 +107,133 @@ def receipt(action, now, **updates):
         )
         | updates
     )
+
+
+def captured_page(action, now, *, price="100", stock=True):
+    metadata = {
+        "@type": "Product",
+        "name": "Example One",
+        "url": action.offer.url,
+        "brand": {"@type": "Brand", "name": "Example"},
+        "model": "One",
+        "color": "black",
+        "offers": {
+            "@type": "Offer",
+            "seller": {"@type": "Organization", "name": action.offer.seller},
+            "price": price or "100",
+            "priceCurrency": "INR",
+            "itemCondition": "https://schema.org/NewCondition",
+            "availability": "https://schema.org/InStock"
+            if stock
+            else "https://schema.org/OutOfStock",
+        },
+    }
+    return CapturedPage(
+        target=BrowserTarget(
+            tab_id=action.source.tab_id,
+            document_id="captured-page",
+            active=True,
+            window_focused=True,
+        ),
+        url=action.offer.url,
+        observed_at=now,
+        html='<script type="application/ld+json">' + json.dumps(metadata) + "</script>",
+        visible_title="Example One",
+        visible_price=price,
+        visible_currency="INR" if price is not None else None,
+        visible_stock=stock,
+    )
+
+
+@pytest.mark.parametrize(
+    "price,stock,changed",
+    [("100", True, False), ("200", True, True), (None, True, True), ("100", False, True)],
+)
+def test_captured_navigation_page_reaches_selection_and_change_explanation(
+    setup, now, price, stock, changed
+):
+    dialogue, principal, state, target = setup
+    pending = say(dialogue, principal, state, target)
+    page = captured_page(pending.navigation, now, price=price, stock=stock)
+    normalized = build_navigation_result(
+        pending.navigation,
+        principal,
+        page,
+        pending.navigation.offer.identity,
+        snapshot_id="page",
+        product_id="one",
+        now=now,
+    )
+    verified = accept(dialogue, principal, pending, normalized)
+    assert verified.state.selected_id == "one"
+    assert verified.offer_verification.changed is changed
+    assert verified.state.products[-1].price == (Decimal(price) if price is not None else None)
+    assert verified.state.products[-1].document_id == page.target.document_id
+    assert verified.state.products[-1].selected_variant_id is None
+    assert verified.action is None and verified.navigation is None
+
+
+@pytest.mark.parametrize(
+    "change,code",
+    [
+        ("owner", "NAVIGATION_CAPTURE_ACCESS_DENIED"),
+        ("tab", "NAVIGATION_CAPTURE_TARGET_MISMATCH"),
+        ("url", "NAVIGATION_CAPTURE_TARGET_MISMATCH"),
+        ("expired", "NAVIGATION_CAPTURE_OUTSIDE_WINDOW"),
+        ("variant", "NAVIGATION_OBSERVED_IDENTITY_MISMATCH"),
+    ],
+)
+def test_navigation_normalizer_rejects_wrong_scope_without_consuming_pending_goal(
+    setup, now, change, code
+):
+    dialogue, principal, state, target = setup
+    pending = say(dialogue, principal, state, target)
+    action = pending.navigation
+    page = captured_page(action, now)
+    identity = action.offer.identity
+    current = now
+    if change == "owner":
+        principal = principal.model_copy(update={"owner_id": "other"})
+    elif change == "tab":
+        page = page.model_copy(update={"target": page.target.model_copy(update={"tab_id": 99})})
+    elif change == "url":
+        page = page.model_copy(update={"url": action.offer.url + "?different=1"})
+    elif change == "expired":
+        current = action.expires_at
+    else:
+        identity = identity.model_copy(update={"attributes": {"colour": "blue"}})
+    with pytest.raises(PageEvidenceError, match=code):
+        build_navigation_result(
+            action, principal, page, identity, snapshot_id="page", product_id="one", now=current
+        )
+    assert pending.state.pending_navigation == action
+
+
+@pytest.mark.parametrize(
+    "before,after,code",
+    [
+        ('"color": "black"', '"color": "blue"', "OBSERVED_VARIANT_UNVERIFIED"),
+        ('"name": "seller"', '"name": "different seller"', "NAVIGATION_SELLER_UNVERIFIED"),
+    ],
+)
+def test_navigation_metadata_cannot_hide_different_variant_or_seller(
+    setup, now, before, after, code
+):
+    dialogue, principal, state, target = setup
+    pending = say(dialogue, principal, state, target)
+    page = captured_page(pending.navigation, now)
+    assert before in page.html
+    page = page.model_copy(update={"html": page.html.replace(before, after)})
+    with pytest.raises(PageEvidenceError, match=code):
+        build_navigation_result(
+            pending.navigation,
+            principal,
+            page,
+            pending.navigation.offer.identity,
+            snapshot_id="page",
+            product_id="one",
+            now=now,
+        )
 
 
 def accept(dialogue, principal, pending, item):

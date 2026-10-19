@@ -84,7 +84,7 @@ def test_simulated_scenarios_run_without_live_configuration(monkeypatch):
     clear_config(monkeypatch)
     report = asyncio.run(evaluate_scenarios())
     assert report.mode == "offline-scenarios"
-    assert report.passed == report.total == 6
+    assert report.passed == report.total == 9
     assert all(case.task == "integration_scenario" for case in report.cases)
     assert "not live retailer" in report.scope
 
@@ -97,7 +97,80 @@ def test_scenario_failures_are_redacted_and_do_not_skip_remaining_journeys(monke
 
     monkeypatch.setattr(Journey, "budget_and_pair", broken)
     report = asyncio.run(evaluate_scenarios())
-    assert report.total == 6 and report.passed == 5
+    assert report.total == 9 and report.passed == 8
     assert report.cases[0].outcome == "scenario_or_schema_failure"
     assert "PRIVATE_PROVIDER_DETAIL" not in report.model_dump_json()
     assert all(case.passed for case in report.cases[1:])
+
+
+def test_scenario_preparation_cannot_bypass_page_evidence_normalization(monkeypatch):
+    from shopping_ai import scenarios
+    from shopping_ai.page_evidence import PageEvidenceError
+
+    def rejected(*args, **kwargs):
+        raise PageEvidenceError("VISIBLE_PRICE_MISMATCH")
+
+    monkeypatch.setattr(scenarios, "build_market_offer", rejected)
+    report = asyncio.run(evaluate_scenarios())
+    assert report.total == 9 and report.passed == 0
+    assert all(case.outcome == "scenario_or_schema_failure" for case in report.cases)
+
+
+def test_captured_cart_scenario_cannot_bypass_variant_normalization(monkeypatch):
+    from shopping_ai import scenarios
+    from shopping_ai.page_evidence import PageEvidenceError
+
+    original = scenarios.extract_product_snapshot
+
+    def reject_variant(page, **kwargs):
+        if page.variant_control is not None:
+            raise PageEvidenceError("VARIANT_OPTIONS_MISMATCH")
+        return original(page, **kwargs)
+
+    monkeypatch.setattr(scenarios, "extract_product_snapshot", reject_variant)
+    report = asyncio.run(evaluate_scenarios())
+    failed = [case for case in report.cases if not case.passed]
+    assert [case.case_id for case in failed] == ["captured_variant_cart", "lost_cart_receipt"]
+    assert report.passed == 7 and report.total == 9
+
+
+def test_captured_cart_scenario_does_not_claim_success_for_wrong_quantity(monkeypatch):
+    from shopping_ai import scenarios
+
+    original = scenarios.CartLine
+
+    def wrong_quantity(**kwargs):
+        return original(**(kwargs | {"quantity": 2}))
+
+    monkeypatch.setattr(scenarios, "CartLine", wrong_quantity)
+    report = asyncio.run(evaluate_scenarios())
+    failed = [case for case in report.cases if not case.passed]
+    assert [case.case_id for case in failed] == ["captured_variant_cart", "lost_cart_receipt"]
+    assert report.passed == 7 and report.total == 9
+
+
+def test_lost_cart_receipt_recovery_uses_bound_read_adapter(monkeypatch):
+    from shopping_ai import scenarios
+    from shopping_ai.page_evidence import PageEvidenceError
+
+    original = scenarios.build_cart_read_result
+    recovery_reads = []
+
+    def observe_recovery(run, principal, cart, target, **kwargs):
+        if run.recovery_required:
+            recovery_reads.append(cart.quantity_of("p42", "black"))
+        return original(run, principal, cart, target, **kwargs)
+
+    monkeypatch.setattr(scenarios, "build_cart_read_result", observe_recovery)
+    report = asyncio.run(evaluate_scenarios())
+    assert report.passed == report.total == 9
+    assert recovery_reads == [0, 1]
+
+    def reject_recovery(run, *args, **kwargs):
+        if run.recovery_required:
+            raise PageEvidenceError("READ_TARGET_MISMATCH")
+        return original(run, *args, **kwargs)
+
+    monkeypatch.setattr(scenarios, "build_cart_read_result", reject_recovery)
+    report = asyncio.run(evaluate_scenarios())
+    assert [case.case_id for case in report.cases if not case.passed] == ["lost_cart_receipt"]
