@@ -1,0 +1,25 @@
+@import "tailwindcss";
+@import "./index.css";
+
+:root,
+html,
+body,
+#root {
+  width: 280px;
+  height: 280px;
+  margin: 0;
+  overflow: hidden;
+  background: transparent !important;
+}
+
+.orb-overlay-surface {
+  position: relative;
+  width: 96px;
+  height: 96px;
+  background: transparent;
+}
+
+.orb-overlay-surface--focused {
+  width: 280px;
+  height: 280px;
+}
