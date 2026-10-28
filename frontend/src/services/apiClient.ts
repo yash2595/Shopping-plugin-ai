@@ -6,6 +6,11 @@
  * fallback. Does NOT use localStorage for sensitive authentication bearer tokens.
  */
 
+import type {
+  ClaimedRuntimeWork, RuntimeCapabilities, RuntimeConfirmation, RuntimeEvent, RuntimeReceipt, RuntimeReply,
+  RuntimeTarget, RuntimeWork,
+} from '../types/assistant'
+
 export interface RegisterResponse {
   access_token: string
   token_type: string
@@ -140,6 +145,7 @@ export interface ApiClientConfig {
   baseUrl?: string
   customFetch?: typeof fetch
   tokenProvider?: TokenProvider
+  allowAnonymousRegistration?: boolean
 }
 
 // In-memory fallback if Electron IPC is not accessible (e.g. unit tests or standalone browser mode)
@@ -182,11 +188,13 @@ export class ShoppingApiClient {
   public readonly baseUrl: string
   private readonly fetchFn: typeof fetch
   private readonly tokenProvider: TokenProvider
+  private readonly allowAnonymousRegistration: boolean
 
   constructor(config: ApiClientConfig = {}) {
     this.baseUrl = (config.baseUrl || 'http://localhost:8000').replace(/\/+$/, '')
     this.fetchFn = config.customFetch || (typeof fetch !== 'undefined' ? fetch.bind(globalThis) : (undefined as unknown as typeof fetch))
     this.tokenProvider = config.tokenProvider || defaultTokenProvider
+    this.allowAnonymousRegistration = config.allowAnonymousRegistration ?? true
   }
 
   /**
@@ -197,6 +205,9 @@ export class ShoppingApiClient {
     const existing = await this.tokenProvider.get()
     if (existing && existing.trim().length > 0) {
       return existing.trim()
+    }
+    if (!this.allowAnonymousRegistration) {
+      throw new AuthError('Sign in is required')
     }
 
     try {
@@ -235,7 +246,12 @@ export class ShoppingApiClient {
    * Clears the current auth token from the secure vault.
    */
   async logout(): Promise<void> {
-    await this.tokenProvider.clear()
+    const token = await this.tokenProvider.get()
+    try {
+      if (token) await this.authenticatedRequest('/v1/auth/logout', { method: 'POST', token })
+    } finally {
+      await this.tokenProvider.clear()
+    }
   }
 
   /**
@@ -321,7 +337,9 @@ export class ShoppingApiClient {
     options: {
       method: string
       token: string
-      body?: string
+      body?: BodyInit
+      contentType?: string
+      headers?: Record<string, string>
     }
   ): Promise<Response> {
     let response: Response
@@ -329,9 +347,10 @@ export class ShoppingApiClient {
       response = await this.fetchFn(`${this.baseUrl}${path}`, {
         method: options.method,
         headers: {
-          'Content-Type': 'application/json',
+          'Content-Type': options.contentType || 'application/json',
           Accept: 'application/json',
           Authorization: `Bearer ${options.token}`,
+          ...options.headers,
         },
         body: options.body,
       })
@@ -351,7 +370,7 @@ export class ShoppingApiClient {
         }
       }
 
-      if (response.status === 401 || response.status === 403) {
+      if (response.status === 401) {
         // Clear cached token if server rejects it
         await this.tokenProvider.clear()
         throw new AuthError(`Authentication failed: HTTP ${response.status}`, detail)
@@ -366,6 +385,90 @@ export class ShoppingApiClient {
     }
 
     return response
+  }
+
+  // IDs and versions come from committed replies. Keep event/claim IDs stable on
+  // retries; the client deliberately does not retry or renumber browser mutations.
+  private runtimePath(conversationId: string, suffix = ''): string {
+    return `/v1/ai/conversations/${encodeURIComponent(conversationId)}${suffix}`
+  }
+
+  private async runtimeJson<T>(path: string, method: string, body?: unknown): Promise<T> {
+    const token = await this.bootstrapAuth()
+    const response = await this.authenticatedRequest(path, {
+      method, token, ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    })
+    return await response.json() as T
+  }
+
+  async getAiCapabilities(): Promise<RuntimeCapabilities> {
+    return this.runtimeJson('/v1/ai/capabilities', 'GET')
+  }
+
+  async startAiConversation(sessionId: string, language: 'en' | 'hi-Latn' = 'hi-Latn'): Promise<RuntimeReply> {
+    return this.runtimeJson(`/v1/ai/sessions/${encodeURIComponent(sessionId)}/conversation`, 'POST', { language })
+  }
+
+  async getAiConversation(conversationId: string): Promise<RuntimeReply> {
+    return this.runtimeJson(this.runtimePath(conversationId), 'GET')
+  }
+
+  async sendAiEvent(conversationId: string, event: RuntimeEvent): Promise<RuntimeReply> {
+    return this.runtimeJson(this.runtimePath(conversationId, '/events'), 'POST', event)
+  }
+
+  async confirmAiAction(conversationId: string, confirmation: RuntimeConfirmation): Promise<RuntimeReply> {
+    return this.runtimeJson(this.runtimePath(conversationId, '/confirmations'), 'POST', confirmation)
+  }
+
+  async getAiWork(conversationId: string): Promise<RuntimeWork[]> {
+    return this.runtimeJson(this.runtimePath(conversationId, '/work'), 'GET')
+  }
+
+  async claimAiWork(conversationId: string, dispatchId: string, claim: {
+    claim_id: string; expected_version: number; target: RuntimeTarget; origin: string
+  }): Promise<ClaimedRuntimeWork> {
+    return this.runtimeJson(this.runtimePath(conversationId, `/work/${encodeURIComponent(dispatchId)}/claim`), 'POST', claim)
+  }
+
+  async submitAiReceipt(conversationId: string, dispatchId: string, receipt: RuntimeReceipt): Promise<RuntimeReply> {
+    return this.runtimeJson(this.runtimePath(conversationId, `/work/${encodeURIComponent(dispatchId)}/receipts`), 'POST', receipt)
+  }
+
+  async deleteAiConversation(conversationId: string): Promise<void> {
+    const token = await this.bootstrapAuth()
+    await this.authenticatedRequest(this.runtimePath(conversationId), { method: 'DELETE', token })
+  }
+
+  async sendAiAudio(conversationId: string, eventId: string, version: number, audio: Blob,
+    context?: { target: RuntimeTarget; origin: string }): Promise<RuntimeReply> {
+    if (audio.size === 0 || audio.size > 5_000_000) throw new ApiError('Audio size is invalid', 413)
+    const type = audio.type.split(';')[0]
+    if (!['audio/wav', 'audio/webm', 'audio/ogg', 'audio/mpeg'].includes(type)) {
+      throw new ApiError('Audio type is unsupported', 415)
+    }
+    if (context && (!context.target.active || !context.target.window_focused)) {
+      throw new ApiError('Audio context requires a foreground page', 409)
+    }
+    const query = context ? '?' + new URLSearchParams({ tab_id: String(context.target.tab_id),
+      document_id: context.target.document_id, origin: context.origin }) : ''
+    const token = await this.bootstrapAuth()
+    const response = await this.authenticatedRequest(this.runtimePath(conversationId, '/audio' + query), {
+      method: 'POST', token, body: audio, contentType: type,
+      headers: { 'X-Event-ID': eventId, 'X-Expected-Version': String(version) },
+    })
+    return await response.json() as RuntimeReply
+  }
+
+  async synthesizeAiSpeech(conversationId: string, version: number): Promise<{ audio: Blob; version: number }> {
+    const token = await this.bootstrapAuth()
+    const response = await this.authenticatedRequest(this.runtimePath(conversationId, '/speech'), {
+      method: 'POST', token, body: JSON.stringify({ expected_version: version }),
+    })
+    if (response.headers.get('X-Conversation-Version') !== String(version)) {
+      throw new ApiError('Speech version does not match the current reply', 409)
+    }
+    return { audio: await response.blob(), version }
   }
 
   private generateRequestId(): string {

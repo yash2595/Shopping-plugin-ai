@@ -1,13 +1,22 @@
 from functools import lru_cache
-from typing import Optional
+from typing import Literal, Optional
+from urllib.parse import urlsplit
+
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    ENV: str = "development"
-    DATABASE_URL: str = "postgresql+psycopg://postgres@127.0.0.1:5433/shopping"
-    DIRECT_DATABASE_URL: str = "postgresql+psycopg://postgres@127.0.0.1:5433/shopping"
-    TEST_DATABASE_URL: str = "postgresql+psycopg://postgres@127.0.0.1:5433/shopping_test"
+    ENV: Literal["development", "test", "production"] = "development"
+    DATABASE_URL: str = Field(
+        default="postgresql+psycopg://postgres@127.0.0.1:5433/shopping", repr=False
+    )
+    DIRECT_DATABASE_URL: str = Field(
+        default="postgresql+psycopg://postgres@127.0.0.1:5433/shopping", repr=False
+    )
+    TEST_DATABASE_URL: str = Field(
+        default="postgresql+psycopg://postgres@127.0.0.1:5433/shopping_test", repr=False
+    )
 
     # Database connection pool configuration
     DB_POOL_SIZE: int = 5  # PLACEHOLDER: small pool size for Neon pooled connection
@@ -15,7 +24,12 @@ class Settings(BaseSettings):
     DB_POOL_TIMEOUT: int = 30  # PLACEHOLDER: pool timeout in seconds
 
     # Authentication
-    AUTH_TOKEN_EXPIRE_DAYS: int = 30  # PLACEHOLDER: anonymous bearer token validity in days
+    AUTH_TOKEN_EXPIRE_DAYS: int = Field(default=30, ge=1, le=365)
+    AUTH_MODE: Literal["anonymous", "oidc"] = "anonymous"
+    AUTH_ISSUER: str = ""
+    AUTH_AUDIENCE: str = ""
+    AUTH_JWKS_JSON: str = Field(default="", repr=False)
+    ALLOW_ANONYMOUS_REGISTRATION: bool = False  # Explicit opt-in required in production.
 
     # Business thresholds
     PRICE_OBSERVATION_DEDUP_HOURS: int = 6  # PLACEHOLDER: skip identical price within 6 hours
@@ -23,7 +37,9 @@ class Settings(BaseSettings):
     MIN_HISTORY_SPAN_DAYS: int = 7  # PLACEHOLDER: minimum span between observations in days
 
     # Rate Limiting & Observation Trust
-    MAX_OBSERVATIONS_PER_LISTING_PER_HOUR: int = 10  # PLACEHOLDER: max observations per user per listing per hour
+    MAX_OBSERVATIONS_PER_LISTING_PER_HOUR: int = (
+        10  # PLACEHOLDER: max observations per user per listing per hour
+    )
     MAX_OBSERVATIONS_PER_USER_PER_DAY: int = 100  # PLACEHOLDER: max observations per user per day
     MAX_FUTURE_TIMESTAMP_MINUTES: int = 5  # PLACEHOLDER: max clock skew in the future
     MAX_AI_CALLS_PER_USER_PER_DAY: int = 50  # PLACEHOLDER: daily AI calls per user
@@ -42,11 +58,35 @@ class Settings(BaseSettings):
     MAX_PREFERENCE_INT_VALUE: int = 365  # PLACEHOLDER: max integer preference value
 
     # AI Configuration
-    AI_PROVIDER: str = "mock"  # 'mock' | 'gemini'
-    GEMINI_API_KEY: Optional[str] = None
+    AI_PROVIDER: Literal["mock", "gemini"] = "mock"
+    GEMINI_API_KEY: Optional[str] = Field(default=None, repr=False)
     GEMINI_MODEL: str = "gemini-2.5-flash"  # PLACEHOLDER
-    AI_TIMEOUT_SECONDS: float = 5.0  # PLACEHOLDER: timeout for AI provider calls
-    CHAT_RECENT_MESSAGES_COUNT: int = 10  # PLACEHOLDER: number of recent messages for AI context
+    AI_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, le=120)
+    AI_MAX_CONCURRENT_CALLS: int = Field(default=8, ge=1, le=64)
+    AI_RUNTIME_ENABLED: bool = False
+    AI_RUNTIME_PROVIDER: Literal["mock", "chat"] = "mock"
+    AI_RUNTIME_TIMEOUT_SECONDS: float = Field(default=90, ge=5, le=300)
+    AI_CORE_TIMEOUT_SECONDS: float = Field(default=30, ge=1, le=60)
+    AI_MAX_STEPS: int = Field(default=8, ge=1, le=30)
+    AI_MAX_SNAPSHOT_AGE_SECONDS: int = Field(default=120, ge=1, le=3600)
+    AI_SEARCH_TIMEOUT_SECONDS: int = Field(default=120, ge=1, le=600)
+    AI_BROWSER_ORIGINS: tuple[str, ...] = ()
+    AI_MUTATIONS_ENABLED: bool = False
+    AI_SEARCH_STORES: list[dict] = Field(default_factory=list)
+    AI_CHAT_ENDPOINT: str = ""
+    AI_CHAT_MODEL: str = ""
+    AI_CHAT_API_KEY: Optional[str] = Field(default=None, repr=False)
+    AI_STT_ENDPOINT: str = ""
+    AI_STT_MODEL: str = ""
+    AI_STT_API_KEY: Optional[str] = Field(default=None, repr=False)
+    AI_TTS_ENDPOINT: str = ""
+    AI_TTS_MODEL: str = ""
+    AI_TTS_API_KEY: Optional[str] = Field(default=None, repr=False)
+    AI_TTS_VOICE: str = ""
+    AI_TTS_FORMAT: Literal["mp3", "wav"] = "mp3"
+    CORS_ALLOWED_ORIGINS: tuple[str, ...] = ()
+    MAX_SPEECH_CALLS_PER_USER_PER_DAY: int = Field(default=100, ge=1, le=10000)
+    CHAT_RECENT_MESSAGES_COUNT: int = Field(default=10, ge=1, le=50)
 
     # Reviews Configuration
     MAX_REVIEWS_PER_SUMMARY: int = 30  # PLACEHOLDER: max reviews in single summary
@@ -59,7 +99,7 @@ class Settings(BaseSettings):
     MAX_HISTORY_DAILY_POINTS: int = 365  # PLACEHOLDER: maximum daily points returned
 
     # Maintenance & Jobs
-    JOB_SECRET: str = "dev-job-secret-token"
+    JOB_SECRET: str = Field(default="dev-job-secret-token", repr=False)
     SNAPSHOT_RETENTION_DAYS: int = 30  # PLACEHOLDER: snapshot retention period in days
     MESSAGE_RETENTION_DAYS: int = 30  # PLACEHOLDER: message retention period in days
     NOTIFICATION_RETENTION_DAYS: int = 90  # PLACEHOLDER: notification retention period in days
@@ -70,7 +110,47 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        hide_input_in_errors=True,
     )
+
+    @model_validator(mode="after")
+    def production_secrets(self):
+        if self.AUTH_MODE == "oidc":
+            issuer = urlsplit(self.AUTH_ISSUER)
+            if (
+                issuer.scheme != "https"
+                or not issuer.hostname
+                or len(self.AUTH_ISSUER) > 512
+                or not self.AUTH_ISSUER.isascii()
+                or issuer.username
+                or issuer.password
+                or issuer.query
+                or issuer.fragment
+                or not self.AUTH_AUDIENCE
+                or not self.AUTH_JWKS_JSON
+            ):
+                raise ValueError("OIDC requires an HTTPS issuer, API audience and public JWKS")
+        for origin in self.CORS_ALLOWED_ORIGINS:
+            parsed = urlsplit(origin)
+            if (
+                not parsed.hostname
+                or parsed.username
+                or parsed.password
+                or parsed.path
+                or parsed.query
+                or parsed.fragment
+                or parsed.scheme not in {"https", "http", "chrome-extension"}
+                or parsed.scheme == "http"
+                and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
+            ):
+                raise ValueError(
+                    "CORS origins must be explicit HTTPS, extension, or localhost origins"
+                )
+        if self.ENV == "production" and (
+            self.JOB_SECRET == "dev-job-secret-token" or len(self.JOB_SECRET) < 32
+        ):
+            raise ValueError("Production requires a separately configured strong JOB_SECRET")
+        return self
 
 
 @lru_cache

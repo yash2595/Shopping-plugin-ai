@@ -1,13 +1,13 @@
 import decimal
 import uuid
 from typing import List, Optional, Tuple
-from sqlalchemy.orm import Session
 
 from app.models.alert import PriceAlert
 from app.models.user import User
 from app.repositories.alert_repo import AlertRepository
 from app.repositories.snapshot_repo import SnapshotRepository
 from app.schemas.alert import AlertUpdate
+from sqlalchemy.orm import Session
 
 
 class AlertService:
@@ -25,6 +25,8 @@ class AlertService:
         user: User,
         listing_id: uuid.UUID,
         target_price: decimal.Decimal,
+        *,
+        commit: bool = True,
     ) -> Tuple[Optional[PriceAlert], Optional[str]]:
         # 1. Verify listing exists
         listing = self.snapshot_repo.get_listing_by_id(db, listing_id)
@@ -46,8 +48,9 @@ class AlertService:
             listing_id=listing_id,
             target_price=target_price,
         )
-        db.commit()
-        db.refresh(alert)
+        if commit:
+            db.commit()
+            db.refresh(alert)
         return alert, None
 
     def list_alerts(

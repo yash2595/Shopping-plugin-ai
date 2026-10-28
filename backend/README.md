@@ -1,4 +1,4 @@
-# AI Shopping Copilot - Backend (Phase 1 & Phase 2)
+# AI Shopping Copilot - Backend and integrated runtime
 
 Backend service for the **AI Shopping Copilot** Chrome extension. Ingests real-time product snapshots, tracks append-only price observations with deduplication and sudden jump protection, computes real price history statistics, fires atomic price drop alerts, and manages idempotent conversational chat sessions.
 
@@ -52,6 +52,13 @@ source .venv/bin/activate
 pip install -e .[dev]
 ```
 
+For core checkpoint integration and its PostgreSQL tests, install both local
+packages from the repository root (the core remains independent of FastAPI):
+
+```bash
+python -m pip install -e './ai[dev]' -e './backend[dev]'
+```
+
 ### 3. Configure Environment Variables
 Copy `.env.example` to `.env` and configure your database URLs and maintenance secret:
 ```env
@@ -93,6 +100,7 @@ pytest -v
 | `GET` | `/health` | Process liveness check | No |
 | `GET` | `/health/db` | Database connectivity verification (`SELECT 1`) | No |
 | `POST` | `/v1/auth/register` | Issues anonymous user opaque bearer token (stored as SHA-256) | No |
+| `POST` | `/v1/auth/logout` | Revokes the current bearer token; returns 204 | Bearer Token |
 | `POST` | `/v1/sessions` | Creates chat session scoped to current user | Bearer Token |
 | `GET` | `/v1/sessions/{id}` | Retrieves session details and message history (returns 404 for other users) | Bearer Token |
 | `POST` | `/v1/sessions/{id}/messages` | Post chat message; idempotent replay with `Idempotent-Replay: true` | Bearer Token |
@@ -379,5 +387,374 @@ Notify the user when price drops below a threshold.
 ## OpenAPI Specification
 The single canonical OpenAPI 3.1 specification for all endpoints and schemas is maintained at:
 - `backend/contracts/openapi.json`
+
+## AI continuation: security and durable state
+
+Reviewed base: `23bb0ad` on `main`. The October 19 handoff describes the earlier
+`d96401f` core-only tree; the backend and Electron frontend were added afterwards.
+This continuation extends the existing API rather than introducing another server.
+
+### Legacy chat admission and authentication
+
+- Chat validates the authenticated owner's session before looking up a replay.
+  Request IDs retain their existing per-user uniqueness. Reuse with another session,
+  changed text or changed snapshot returns `409 IDEMPOTENCY_CONFLICT`.
+- A unique database admission record is committed before the provider runs. Provider
+  waits hold no application DB transaction. Identical concurrent requests return
+  `409 REQUEST_IN_PROGRESS`; a completed retry returns its exact stored reply ID,
+  including after an application restart. Reply selection never relies on timestamps.
+- Tool effects and their final reply association commit together. A failed final
+  transaction leaves no budget/preference/alert effect. Its admitted request stays
+  unfinished and must not be executed again automatically. A process crash after
+  admission can leave `REQUEST_IN_PROGRESS` requiring operational reconciliation;
+  there is no processing-lease recovery worker yet. Never advise blind retries with
+  a new request ID for a potentially executed operation.
+- This ledger is stored in existing private user-message payloads. Pre-upgrade
+  messages without an exact request hash/reply binding return a conflict rather
+  than guessing a historical reply. Deduplication lasts only while those retained
+  messages exist (default 30 days); it is not a permanent mutation ledger.
+- Model proposals independently require a matching explicit current command and
+  exact amount/value. The conservative supported forms include `my budget is 3000`,
+  `set my budget to 3000`, `notify me below 3000`, `I prefer black`,
+  `prefer brand sony`, and `not this one, too expensive`. Negations, quoted commands,
+  explanations and unmatched values request clarification. This is not a general
+  Hinglish intent-quality claim. No cart or checkout tool is enabled in this API.
+- JSON bodies are bounded to 262,144 bytes before route parsing, including chunked
+  requests. Duplicate keys, depth above 32, non-finite numbers, invalid Unicode and
+  NUL characters are rejected. Audio uploads use the separate bounded media path
+  described below. Chat text is bounded to 2,000 characters.
+- Public validation errors, database-health failures and unhandled-error logs do not
+  echo private inputs/provider/database exception text. Unhandled errors have an
+  `X-Request-ID` for correlation. `/v1/` responses use `Cache-Control: no-store`.
+- Logout revokes the presented bearer token in the database. Invalid, expired and
+  revoked tokens cannot replay saved replies. Anonymous demo auth is the default;
+  verified API JWT authentication is available as described below. `ENV=production` disables registration
+  unless `ALLOW_ANONYMOUS_REGISTRATION=true` is deliberately configured. Anonymous
+  identities can bypass per-user budgets by re-registering; production still needs
+  gateway admission controls and a real account/session lifecycle.
+- Production refuses the sample maintenance secret or a secret shorter than 32
+  characters. All deployment secrets must stay outside source and client output.
+
+### Provider handling
+
+One configured provider client is created/closed by each app's lifespan. Chat and
+reviews share a bounded process-local executor (`AI_MAX_CONCURRENT_CALLS=8`,
+`AI_TIMEOUT_SECONDS=5` by default). A timed-out HTTP request returns its safe fallback
+without waiting for the provider thread. That thread retains its capacity slot until
+it exits; its late result cannot mutate state. Gemini also receives a transport timeout.
+The bounded executor and per-user quota are not a cross-worker/global cost limit.
+
+### Private core checkpoint repository
+
+Migration `b6e4d72f0a91` follows `234eb99aacb2`. It adds `ai_conversations` and an
+owned-session composite key. `app/repositories/ai_checkpoint_repo.py` depends on the
+locally installed `shopping_ai` package and exposes trusted create/load/CAS methods:
+
+- Ownership is constrained both in SQL queries and by a composite foreign key to
+  `sessions(user_id, id)`. A caller cannot bind one user's checkpoint to another's session.
+- Exact codec UTF-8 JSON is stored as `TEXT`; restoration checks row version,
+  conversation ID, owner/session and schema version. Money/IDs/deadlines are not rebuilt.
+- Conditional `UPDATE ... WHERE version = expected RETURNING ...` accepts one writer
+  at a time. Actual runtime version jumps are preserved. Equal-version writes only
+  accept identical checkpoint bytes; changed bytes cannot bypass concurrency checks.
+- Methods flush but never commit. The trusted application service must commit or
+  roll back the whole state/event/outbox transaction before returning any work.
+  The repository creates no HTTP endpoint and dispatches no browser actions.
+
+PostgreSQL tests cover two independent racing connections, tenant/session isolation,
+database rejection of a mismatched owned session, exact codec roundtrips, version
+metadata corruption, same-version changes and caller rollback. Core-checkpoint tests
+are explicitly skipped when the optional local core package is not installed; CI
+installs both packages and exercises them. CI also migrates a fresh PostgreSQL 17
+database, runs backend tests, and downgrades/upgrades this migration. Downgrade drops
+private checkpoints; export needed state before using it outside disposable tests.
+
+The implementation follows PostgreSQL's [conditional updates](https://www.postgresql.org/docs/current/sql-update.html)
+and SQLAlchemy's [transactional DML](https://docs.sqlalchemy.org/en/20/core/dml.html).
+Provider timeout handling accounts for Python's [executor shutdown behavior](https://docs.python.org/3/library/concurrent.futures.html).
+
+## Local AI runtime
+
+The runtime integration is now implemented in the existing FastAPI application.
+It preserves `shopping_ai` as the source of business policy and state transitions;
+there is no second agent loop/server and no model-generated browser code.
+The October 18 architecture PDFs describe the older proposed WXT frontend. The
+current repository already contains Electron, so this continuation adds its AI API
+client contract without replacing the browser team's interface or executor.
+
+### Start locally without model credentials
+
+Install both packages from the repository root:
+
+```sh
+python -m pip install -e './ai[dev,chat,speech]' -e './backend[dev]'
+```
+
+Configure `backend/.env` using the existing example, with a local PostgreSQL database
+in `DATABASE_URL` and a direct migration connection in `DIRECT_DATABASE_URL`.
+Use a distinct disposable `*_test` database for tests. No paid provider is needed:
+`AI_RUNTIME_ENABLED=true`, `AI_RUNTIME_PROVIDER=mock`, and blank speech endpoints
+select offline text decisions with no external model/audio calls. The optional
+feature defaults off when no `.env` is used, preserving standalone backend imports
+without the local core package. The checked-in example enables it explicitly.
+
+From `backend/`:
+
+```sh
+python -m alembic upgrade head
+python -m uvicorn app.main:app --host 127.0.0.1 --port 8019
+```
+
+The API reference is at `http://127.0.0.1:8019/docs`. For the included synthetic HTTP
+demonstration only, enable `AI_MUTATIONS_ENABLED=true` and keep
+`AI_BROWSER_ORIGINS=["https://demo.shop.test"]` in that server's local environment.
+In a second terminal, from `backend/`:
+
+```sh
+python scripts/demo_runtime.py --base-url http://127.0.0.1:8019
+```
+
+It registers a disposable anonymous demo identity, reads a synthetic product,
+explicitly confirms a quantity operation, submits a complete cart baseline,
+simulates a lost mutation result and recovers with `read_cart`. It prints each
+committed version and never prints a bearer token. It accepts loopback servers only
+and does not execute a retailer action. Its synthetic account/session is subject to
+the existing retention job. Disable mutations again before connecting a real page
+unless its packaged adapter and user confirmation UI have passed acceptance.
+
+### Public API for the browser team
+
+All routes below require the existing bearer token. Owner and session binding are
+derived from authenticated storage; checkpoints, principals, provider settings,
+capability grants and arbitrary scripts are never accepted in request bodies.
+
+| Method | Route under `/v1/ai` | Behavior |
+| --- | --- | --- |
+| POST | `/sessions/{session_id}/conversation` | Create or restore one owned core conversation per existing session. |
+| GET | `/conversations/{id}` | Safe current reply, version, observed products/facts and committed work IDs. |
+| POST | `/conversations/{id}/events` | Typed `text`, `cancel`, `resume` or one bounded `advance` step. |
+| POST | `/conversations/{id}/confirmations` | Explicit reviewed product/snapshot/variant/quantity/mode/ceiling/target confirmation. |
+| GET | `/conversations/{id}/work` | Read-only pending/claimed metadata; no browser instruction payload. |
+| POST | `/conversations/{id}/work/{dispatch_id}/claim` | Claim committed unexpired work in the owned session's execution lane. |
+| POST | `/conversations/{id}/work/{dispatch_id}/receipts` | Submit a claim-bound typed browser/search/navigation observation. |
+| POST | `/conversations/{id}/audio` | Bounded raw WAV/WebM/OGG/MP3 plus event/version headers; deferred TTS. |
+| POST | `/conversations/{id}/speech` | Synthesize only the current committed saved reply; private version-bound bytes. |
+| DELETE | `/conversations/{id}` | Delete owned checkpoint, events and work after in-flight/uncertain cart reconciliation. |
+
+The canonical OpenAPI includes these optional-feature routes. Legacy chat, history,
+review and alert routes remain backward compatible. The updated frontend
+`ShoppingApiClient` exposes `startAiConversation`, `sendAiEvent`, `confirmAiAction`,
+`getAiWork`, `claimAiWork`, `submitAiReceipt`, `sendAiAudio`, `synthesizeAiSpeech`
+and `deleteAiConversation`. These are transport methods, not a DOM executor.
+Its logout method now revokes the server token before clearing the local vault;
+an unsupported-site 403 does not discard an otherwise valid identity.
+
+Example initial text event after creating the conversation:
+
+```json
+{
+  "event_id": "unique-user-turn-1",
+  "expected_version": 1,
+  "kind": "text",
+  "message": "What is the price?",
+  "target": {"tab_id": 7, "document_id": "current-document", "active": true, "window_focused": true},
+  "origin": "https://demo.shop.test"
+}
+```
+
+### Persistence, leases and browser recovery
+
+Migration `c7f5a83e1b02` follows the owned checkpoint migration and adds
+`ai_events` and `ai_dispatches`. Composite foreign keys bind every dependent row to
+the same owned session/conversation. Each event has a canonical input hash, an
+expected conversation version, a bounded processing lease and a random fencing token.
+Identical completed retries return the exact saved public reply. Changed payloads
+conflict. A retry can reclaim an expired **processing** lease only while its input
+version is still current; the old producer cannot commit after its fence is replaced.
+Provider computation can occur twice after a lease loss, but only one candidate
+state and its work can commit. No external mutation occurs in provider processing.
+
+After provider processing outside the DB transaction, the service locks the owned
+execution lane and event, checks its live fence, compares/swaps the checkpoint and
+writes public reply, browser work, receipt acknowledgment and event result in one
+transaction. Failure rolls back candidate state and outbox together. Cancellation
+bypasses provider admission and can overtake an in-flight model call; stale results
+are discarded. This ledger is separate from the earlier legacy-message ledger.
+
+Work IDs are stable. Claim IDs must be saved in the browser's durable local action
+journal **before execution**. Retrying that exact claim returns the same fence/work;
+a different claim cannot take it over. Check current claim/target/deadline immediately
+before execution, and never execute a completed journal entry again. A claim timeout
+does not prove a click failed and never authorizes a fresh cart click. One active
+claim per owned session serializes visible work. The actual browser must enforce
+foreground execution, packaged adapter permissions, native tab/document lifetime
+and store origin. A correctly shaped receipt proves consistency, not DOM authenticity.
+
+Browser receipts omit run/session/source bindings: the server fills those from its
+owned dispatch. Product/cart observation times and target are validated by the core.
+For opened navigation, use the same capture timestamp for the receipt and its
+product snapshot; mismatched evidence returns a typed conflict without changing state.
+Cart observations require explicit complete coverage; partial/unknown absence is
+never interpreted as zero. Cancellation suppresses future claims but permits a late
+already-claimed receipt to be recorded without reviving the run. Cart outcomes are
+verified/failed/unknown; unknown operations resume through read-only reconciliation.
+Removing configured mutation capability blocks pending mutation claims as well.
+
+Run deadline settlement separately from the API, using the same database/config:
+
+```sh
+python -m app.ai.worker --once
+python -m app.ai.worker --interval 2 --limit 20
+```
+
+Due work is durable across restarts. Workers use short owned-session locks with
+`SKIP LOCKED`, recheck work identity, expire only the current matching operation and
+commit settlement atomically. Parallel workers settle each item once. Expired cart
+actions pause for uncertainty recovery; neither workers nor claim leases reissue
+them. A due navigation is cancelled only when that exact proposal remains current.
+
+### Voice, model configuration and quotas
+
+Audio requests use raw binary `Content-Type: audio/wav|audio/webm|audio/ogg|audio/mpeg`,
+`X-Event-ID` and `X-Expected-Version`. Optional `tab_id`, `document_id` and `origin`
+query parameters bind a current foreground context. Uploads are bounded to 5,000,000
+bytes before parsing, with a basic container-header check; full codec/duration
+decoding is delegated to the configured speech service. Raw audio is never stored
+in checkpoints, event payloads or logs. STT failure/low confidence leaves state
+unchanged. Text remains usable with no speech provider.
+
+Speech requests contain only `expected_version`. They call TTS on the saved text,
+never STT/intent/actions. TTS failure leaves committed text/work intact. The server
+checks version again after synthesis; stale bytes are discarded. Clients must also
+stop playback on cancel/new input/logout and compare `X-Conversation-Version` before
+playing. Daily speech admission is bounded separately; read-only uncertain-cart
+recovery and cancellation remain available after the ordinary AI budget is exhausted.
+
+The local default interpreter is deliberately conservative, not a real model or a
+general Hinglish classifier. The original offline intent/detail quality benchmark
+still scores 9/10: its `natural-details` case requires a richer detail interpreter;
+the benchmark and that failing case have not been removed or relabelled. The nine
+integration scenarios are a separate check. For a configured compatible provider, set
+`AI_RUNTIME_PROVIDER=chat` plus server-only `AI_CHAT_ENDPOINT`, `AI_CHAT_MODEL` and
+`AI_CHAT_API_KEY`. Decision, intent and detail adapters share one owned async client.
+Set both `AI_STT_*` and `AI_TTS_*`, `AI_TTS_VOICE` and optional `AI_TTS_FORMAT` for
+speech. Empty settings make no speech network calls; partial/invalid configuration
+fails startup safely. Existing `AI_PROVIDER=mock|gemini` controls the legacy chat
+route, not this new provider-neutral runtime. No vendor or paid plan is implied.
+
+Configure explicit `CORS_ALLOWED_ORIGINS` for the actual UI. JSON and auth controls
+still apply; no wildcard or `null` origin is required. CORS exposes the version/replay
+headers needed by the typed client and is not a substitute for authentication.
+Anonymous registration remains a local demo mechanism and is disabled in production
+without explicit opt-in; a selected verified account provider, HTTPS deployment,
+gateway abuse controls and real retailer acceptance are live release gates.
+
+### Verified account authentication
+
+`AUTH_MODE=anonymous` keeps the local demo token flow. For an identity provider
+that issues signed **API access tokens**, set `AUTH_MODE=oidc`, `AUTH_ISSUER` (exact
+HTTPS issuer), `AUTH_AUDIENCE` (this API's dedicated audience), and
+`AUTH_JWKS_JSON` (a JSON JWKS object containing public verification keys). Obtain
+these through the provider's trusted administration/configuration channel.
+Never configure a client secret or private signing key here. This backend validates
+bearer access tokens; it does not host a password database or an OAuth login UI.
+An ID token whose audience is the browser application's client ID is not an API
+access token and must not be used as one.
+
+Every configured key needs a unique `kid`, `alg=RS256` with RSA >=2048 bits or
+`alg=ES256` with P-256, and signing/verification usage. Startup rejects invalid,
+private, weak or duplicate keys. Verification requires valid signature, exact
+issuer, API audience, subject, expiry and issued-at; future not-before/issued-at
+claims fail. Tokens and claims are bounded. Token-controlled key URLs and critical
+extensions are rejected; verification makes no network request. This uses PyJWT's
+asymmetric verification API with algorithms fixed by the configured key, following
+its [algorithm-selection guidance](https://pyjwt.readthedocs.io/en/stable/api.html#jwt.decode).
+
+For rotation, configure current and next **public** keys, restart every API process,
+then retire the old key and restart again after the overlap. Changes take effect
+on restart; there is no automatic JWKS fetch/refresh. Choose short access-token
+lifetimes at the provider. Provider-side session revocation is bounded by token
+expiry or removal of the signing key; this backend's logout immediately revokes
+the specific presented token in PostgreSQL across API processes. It does not revoke
+the provider's refresh token/session. Frontend sign-out must also use the provider's
+own logout flow where required.
+
+Migration head `d8a6b94f2c13` follows `c7f5a83e1b02`, adding an issuer/subject to
+user mapping. Email/name claims never merge accounts. Concurrent first login
+creates one owner without orphan users. The OIDC mode disables anonymous
+registration in every environment, and opaque demo tokens are not accepted.
+All existing ownership, event, confirmation, quota and replay controls still apply.
+The typed frontend client accepts the selected login integration's secure
+`tokenProvider`; use `allowAnonymousRegistration: false` to require sign-in.
+Selecting/configuring the actual identity provider and its login/refresh flow is
+still required before a live release.
+
+### Readiness and capability discovery
+
+`GET /health` is process liveness. `GET /health/ready` returns 200 only when the
+database responds and its Alembic head matches the shipped migrations; otherwise it
+returns a generic 503. It performs no model/speech request. This endpoint does not
+certify upstream availability or worker health. Run the deadline worker alongside
+the API, as below. `GET /health/db` remains a connectivity-only check.
+
+Authenticated `GET /v1/ai/capabilities` reports configured provider/authentication
+mode, mutation enablement, browser origins, speech configuration and request/quota
+limits. It reveals no provider keys, internal grants or checkpoints. Configuration
+flags describe setup, not evidence of a successful live provider call.
+The client exposes `getAiCapabilities()` for integration.
+
+### Local container stack
+
+From the repository root with Docker Engine/Compose running, use a fresh random
+URL-safe database password. PowerShell example:
+
+```powershell
+$env:SHOPPING_DB_PASSWORD = python -c "import secrets; print(secrets.token_urlsafe(32))"
+docker compose up --build -d
+```
+
+Keep that password available for subsequent Compose commands. The stack runs
+PostgreSQL 17 on a private container network, a one-shot migration job, the API
+on `127.0.0.1:8000`, and a separate deadline worker. API/worker wait for successful
+migration; database storage uses the named `shopping_data` volume. The Python
+services run as a non-root user with a read-only filesystem, temporary `/tmp`,
+dropped Linux capabilities and no new privileges. The build context excludes
+environment files, Git data and frontend build/dependency trees.
+
+This Compose file is deliberately a **local mock demo**: development environment,
+anonymous auth, no speech/model network calls, no enabled store mutations. It does
+not load backend `.env` or activate a paid provider. Use the native configuration
+instructions above when preparing a separately reviewed live deployment.
+Stop with `docker compose down`; the database volume is retained. Never remove the
+volume to resolve a routine application error. `SHOPPING_DB_PASSWORD` is required
+for configuration and must match the existing volume after its first initialization.
+
+On this machine `docker compose config --quiet` passed, but Docker Engine was not
+running, so image build/container startup have not been locally verified. The CI
+container job builds and smoke-checks this stack when the workflow is run.
+
+### Verification and remaining ownership boundary
+
+On October 28, 2026, local Python 3.12 checks passed: 590 core tests, 150 backend
+tests against disposable PostgreSQL 17, all nine offline core scenarios and the real
+loopback HTTP synthetic cart/recovery demo. The frontend has 20 passing tests and
+passes TypeScript/Vite and Electron bundling. Core Ruff and changed-file static
+checks pass. The backend reports an upstream Starlette/httpx TestClient deprecation
+warning; frontend lint has three pre-existing warnings in untouched UI/native files.
+
+The new API tests include independent-connection CAS/lease races, cancellation
+during provider waits, no held provider DB transactions, duplicate claims/receipts,
+outbox rollback, parallel deadline workers, cross-store destination binding,
+speech-only retry, stale playback and cross-user/revoked-token access. CI now runs
+the backend/runtime and client gates alongside the original Python matrix.
+The workflow configuration was checked locally; a hosted GitHub CI run has not
+been started for these unpushed changes.
+
+The server and typed client are local implementations; live Neon/model/speech
+credentials, actual visible retailer adapters, native document identity, browser
+journal/playback/UI wiring and measured live quality remain the browser/deployment
+acceptance boundary. No live retailer, Neon or paid model was contacted in this run.
+Checkout/payment is outside the exposed tool set. This does not claim universal
+retailer coverage or production capacity. Changes remain uncommitted/unpushed.
 
 

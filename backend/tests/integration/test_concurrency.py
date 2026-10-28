@@ -1,9 +1,6 @@
 import concurrent.futures
 import decimal
 import uuid
-from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, delete, select
-from sqlalchemy.orm import Session
 
 from app.config import get_settings
 from app.db import get_db
@@ -12,6 +9,9 @@ from app.models.alert import AlertNotification, PriceAlert
 from app.models.product import Listing
 from app.models.user import User
 from app.services.auth_service import AuthService
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, delete, select
+from sqlalchemy.orm import Session
 
 settings = get_settings()
 
@@ -34,6 +34,7 @@ def test_concurrent_observations_produce_single_notification():
         # 1. Setup real committed records in test database
         with Session(engine) as db:
             from app.models.product import ProductSnapshot
+
             auth_service = AuthService()
             token, _ = auth_service.register_anonymous_user(db)
             user = auth_service.authenticate_token(db, token)
@@ -120,4 +121,86 @@ def test_concurrent_observations_produce_single_notification():
             if created_user_id:
                 cleanup_db.execute(delete(User).where(User.id == created_user_id))
             cleanup_db.commit()
+        engine.dispose()
+
+
+def test_concurrent_chat_retry_calls_provider_once_and_survives_app_restart():
+    """Separate connections and apps, not the shared savepoint test fixture."""
+    from threading import Event, Lock
+
+    from app.ai.contracts import ToolProposal
+    from app.deps import get_ai_provider
+    from app.models.context import ShoppingContext
+    from app.models.session import Message
+    from app.services.session_service import SessionService
+
+    engine = create_engine(settings.TEST_DATABASE_URL, connect_args={"prepare_threshold": None})
+    entered, release = Event(), Event()
+    counter_lock = Lock()
+    calls, owner_id = [], None
+
+    class BlockingProvider:
+        def decide(self, request):
+            with counter_lock:
+                calls.append(request)
+            # Every checked-out transaction must already have been released.
+            # The connection pool is shared by all HTTP apps in this test.
+            assert engine.pool.checkedout() == 0
+            entered.set()
+            assert release.wait(timeout=5)
+            return ToolProposal(tool="set_budget", args={"budget_max": "3000.00"})
+
+    def post():
+        app = create_app()
+
+        def database():
+            with Session(engine) as db:
+                yield db
+
+        app.dependency_overrides[get_db] = database
+        app.dependency_overrides[get_ai_provider] = lambda: BlockingProvider()
+        with TestClient(app) as client:
+            return client.post(
+                f"/v1/sessions/{session_id}/messages",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"request_id": "racing-budget", "text": "my budget is 3000"},
+            )
+
+    try:
+        with Session(engine) as db:
+            auth = AuthService()
+            token, _ = auth.register_anonymous_user(db)
+            user = auth.authenticate_token(db, token)
+            owner_id = user.id
+            session_id = SessionService().create_session(db, user).id
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            first = executor.submit(post)
+            try:
+                assert entered.wait(timeout=5)
+                retry = post()
+                assert retry.status_code == 409
+                assert retry.json()["error"]["code"] == "REQUEST_IN_PROGRESS"
+            finally:
+                release.set()
+            completed = first.result(timeout=5)
+        assert completed.status_code == 200
+        assert completed.json()["kind"] == "tool"
+        # post() constructs a fresh application instance each time.
+        replay = post()
+        assert replay.status_code == 200
+        assert replay.headers["Idempotent-Replay"] == "true"
+        assert replay.json()["id"] == completed.json()["id"]
+        assert len(calls) == 1
+        with Session(engine) as db:
+            ctx = db.scalar(select(ShoppingContext).where(ShoppingContext.session_id == session_id))
+            assert ctx.budget_max == decimal.Decimal("3000.00")
+            assert ctx.version == 2
+            messages = list(db.scalars(select(Message).where(Message.session_id == session_id)))
+            assert len(messages) == 2
+    finally:
+        release.set()
+        if owner_id:
+            with Session(engine) as db:
+                db.execute(delete(User).where(User.id == owner_id))
+                db.commit()
         engine.dispose()

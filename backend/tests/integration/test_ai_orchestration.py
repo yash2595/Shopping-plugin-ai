@@ -1,15 +1,20 @@
 import decimal
 import uuid
 from unittest.mock import MagicMock
-from fastapi.testclient import TestClient
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
-from app.ai.contracts import AIProvider, AIProviderError, AIRequest, Answer, ToolProposal
+from app.ai.contracts import (
+    AIProvider,
+    AIRequest,
+    Answer,
+    ToolProposal,
+)
 from app.deps import get_ai_provider
 from app.models.alert import PriceAlert
 from app.models.product import Listing
 from app.services.auth_service import AuthService
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 
 def test_mock_answer_path(client: TestClient, auth_headers: dict[str, str]):
@@ -274,6 +279,7 @@ def test_provider_timeout_returns_fallback_reply_http_200(
     monkeypatch,
 ):
     import time
+
     from app.config import get_settings
     settings = get_settings()
     # Set short timeout for test
@@ -284,7 +290,7 @@ def test_provider_timeout_returns_fallback_reply_http_200(
             time.sleep(0.3)
             return Answer(text="Finished too late")
 
-    target_app = client.app if hasattr(client, "app") else app
+    target_app = client.app
     target_app.dependency_overrides[get_ai_provider] = lambda: HangingProvider()
 
     try:
@@ -334,7 +340,7 @@ def test_hallucinated_amount_replaced_by_templated_answer(
         def decide(self, request: AIRequest):
             return Answer(text="This blender is on sale for only ₹1,999! Grab it now.")
 
-    from app.main import app
+    app = client.app
     app.dependency_overrides[get_ai_provider] = lambda: HallucinatingProvider()
 
     try:

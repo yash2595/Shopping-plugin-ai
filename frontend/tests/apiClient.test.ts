@@ -300,4 +300,84 @@ describe('ShoppingApiClient Integration Unit Tests', () => {
       (err) => err instanceof NetworkError && err.message.includes('Connection refused')
     )
   })
+
+  test('AI event IDs and concurrency preconditions are preserved without automatic retries', async () => {
+    const tokenProvider = createMockTokenProvider('valid-token')
+    const calls: { path: string; body: unknown }[] = []
+    const client = new ShoppingApiClient({ baseUrl: 'http://test-backend:8000', tokenProvider,
+      customFetch: async (input, init) => {
+        calls.push({ path: String(input), body: JSON.parse(String(init?.body)) })
+        return new Response(JSON.stringify({ error: { code: 'VERSION_CONFLICT' } }), { status: 409 })
+      },
+    })
+    const event = { event_id: 'stable-event', expected_version: 3, kind: 'cancel' as const }
+    await assert.rejects(client.sendAiEvent('conversation-1', event), ApiError)
+    assert.deepStrictEqual(calls, [{ path: 'http://test-backend:8000/v1/ai/conversations/conversation-1/events', body: event }])
+  })
+
+  test('unsupported site 403 preserves the valid identity token', async () => {
+    const tokenProvider = createMockTokenProvider('valid-token')
+    const client = new ShoppingApiClient({ tokenProvider, customFetch: async () =>
+      new Response(JSON.stringify({ error: { code: 'UNSUPPORTED_SITE' } }), { status: 403 }) })
+    await assert.rejects(client.getAiWork('owned-conversation'), ApiError)
+    assert.strictEqual(await tokenProvider.get(), 'valid-token')
+  })
+
+  test('logout revokes server token before clearing the local vault', async () => {
+    const tokenProvider = createMockTokenProvider('valid-token')
+    let revoked = false
+    const client = new ShoppingApiClient({ tokenProvider, customFetch: async (input, init) => {
+      assert.ok(String(input).endsWith('/v1/auth/logout'))
+      assert.strictEqual(init?.method, 'POST')
+      assert.strictEqual(await tokenProvider.get(), 'valid-token')
+      revoked = true
+      return new Response(null, { status: 204 })
+    } })
+    await client.logout()
+    assert.ok(revoked)
+    assert.strictEqual(await tokenProvider.get(), null)
+  })
+
+  test('audio sends bounded raw media with stable event/version metadata', async () => {
+    const tokenProvider = createMockTokenProvider('valid-token')
+    const clip = new Blob(['synthetic'], { type: 'audio/webm' })
+    const client = new ShoppingApiClient({ tokenProvider, customFetch: async (input, init) => {
+      assert.ok(String(input).endsWith('/audio'))
+      assert.strictEqual(init?.body, clip)
+      const headers = new Headers(init?.headers)
+      assert.strictEqual(headers.get('Content-Type'), 'audio/webm')
+      assert.strictEqual(headers.get('X-Event-ID'), 'voice-event')
+      assert.strictEqual(headers.get('X-Expected-Version'), '4')
+      return new Response(JSON.stringify({ version: 5 }), { status: 200 })
+    } })
+    await client.sendAiAudio('conversation-1', 'voice-event', 4, clip)
+    await assert.rejects(client.sendAiAudio('conversation-1', 'invalid', 4, new Blob()), ApiError)
+  })
+
+  test('account mode requires sign-in and does not bootstrap an anonymous identity', async () => {
+    const tokenProvider = createMockTokenProvider()
+    const client = new ShoppingApiClient({ tokenProvider, allowAnonymousRegistration: false,
+      customFetch: async () => { throw new Error('Registration must not be attempted') } })
+    await assert.rejects(client.bootstrapAuth(), AuthError)
+    await tokenProvider.set('verified-access-token')
+    assert.strictEqual(await client.bootstrapAuth(), 'verified-access-token')
+  })
+
+  test('capabilities are read with the current account token', async () => {
+    const tokenProvider = createMockTokenProvider('verified-access-token')
+    const client = new ShoppingApiClient({ tokenProvider, allowAnonymousRegistration: false,
+      customFetch: async (input, init) => {
+        assert.ok(String(input).endsWith('/v1/ai/capabilities'))
+        assert.strictEqual(new Headers(init?.headers).get('Authorization'), 'Bearer verified-access-token')
+        return Response.json({ authentication: 'oidc', provider: 'mock' })
+      } })
+    assert.strictEqual((await client.getAiCapabilities()).authentication, 'oidc')
+  })
+
+  test('speech result rejects obsolete playback versions', async () => {
+    const tokenProvider = createMockTokenProvider('valid-token')
+    const client = new ShoppingApiClient({ tokenProvider, customFetch: async () =>
+      new Response('audio', { status: 200, headers: { 'X-Conversation-Version': '8' } }) })
+    await assert.rejects(client.synthesizeAiSpeech('conversation-1', 7), ApiError)
+  })
 })

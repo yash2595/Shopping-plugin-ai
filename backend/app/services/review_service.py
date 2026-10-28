@@ -1,23 +1,19 @@
-import concurrent.futures
 import decimal
 import hashlib
 import json
 import re
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
-from fastapi import HTTPException, status
-from sqlalchemy.orm import Session
+from typing import List, Optional
 
 from app.ai.contracts import (
     AIProvider,
-    AIProviderError,
     ReviewItemContract,
     ReviewSummary,
     ReviewSummaryRequest,
 )
+from app.ai.execution import get_provider_executor
 from app.config import get_settings
-from app.models.review import ReviewSummary as ReviewSummaryModel
 from app.models.user import User
 from app.repositories.review_repo import ReviewRepository
 from app.repositories.snapshot_repo import SnapshotRepository
@@ -27,6 +23,8 @@ from app.schemas.review import (
     ReviewSummaryPostRequest,
     ReviewSummaryResponse,
 )
+from fastapi import HTTPException, status
+from sqlalchemy.orm import Session
 
 settings = get_settings()
 
@@ -195,10 +193,14 @@ class ReviewService:
         )
 
         ai_summary: Optional[ReviewSummary] = None
+        # Quota admission is durable and no DB connection is retained during AI.
+        db.commit()
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(ai_provider.summarize_reviews, contract_req)
-                ai_summary = future.result(timeout=settings.AI_TIMEOUT_SECONDS)
+            ai_summary = get_provider_executor().call(
+                lambda: ai_provider.summarize_reviews(contract_req),
+                timeout=settings.AI_TIMEOUT_SECONDS,
+            )
+            ai_summary = ReviewSummary.model_validate(ai_summary.model_dump())
         except Exception:
             # Fallback handling on provider error or timeout
             fallback_caveat = f"Based on {sample_size} reviews shown on the page, not all reviews."

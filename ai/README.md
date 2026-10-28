@@ -1,7 +1,7 @@
 # Standalone shopping AI
 
 This folder is a real installable Python AI decision package. It runs independently
-of the future FastAPI backend, Neon and Chrome extension. The first milestone is:
+of the FastAPI backend, Neon and browser frontend. Its core decision boundary is:
 
 **message + current product snapshot → bounded context → provider decision →
 application validation → grounded answer, question, or tool proposal**
@@ -20,9 +20,14 @@ application validation → grounded answer, question, or tool proposal**
 | Dialogue | Greeting, requirements, product references and speech-ready reply plus action via `Conversation`. |
 
 `ShoppingAI` performs one model decision; `Orchestrator` composes decisions with
-validated extension observations using explicit checkpoints. Persistence, auth,
-Neon, real browser execution and voice are not connected. Review synthesis and
-free-form conversational answers remain later AI milestones.
+validated extension observations using explicit checkpoints. The existing FastAPI
+service under `backend/` has its own chat/review contracts and demo authentication.
+Its private `AICheckpointRepository` now stores exact core checkpoints with owned
+session constraints and atomic version comparison. The optional integrated runtime
+now exposes owned events, explicit confirmations, committed work claims/receipts,
+deadline settlement, speech uploads/synthesis and safe public replies in that same
+backend. Real Neon/provider credentials and a verified visible shopping executor
+remain live integration gates. See `backend/README.md` for setup and tested boundaries.
 Answer values are grounded in supplied observations, not independently verified
 retailer claims. Source facts themselves can be incorrect or contain hostile text.
 They must be rendered as text, never HTML. Fact selection can still be irrelevant;

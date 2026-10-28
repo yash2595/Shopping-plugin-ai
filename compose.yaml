@@ -1,0 +1,68 @@
+name: shopping-ai-local
+services:
+  database:
+    image: postgres:17-bookworm
+    environment:
+      POSTGRES_USER: shopping
+      POSTGRES_DB: shopping
+      POSTGRES_PASSWORD: ${SHOPPING_DB_PASSWORD:?Set SHOPPING_DB_PASSWORD to a random URL-safe local password}
+    volumes:
+      - shopping_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shopping -d shopping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+  migrate:
+    build: .
+    image: shopping-ai-local:latest
+    environment: &backend-environment
+      ENV: development
+      DATABASE_URL: postgresql+psycopg://shopping:${SHOPPING_DB_PASSWORD}@database:5432/shopping
+      DIRECT_DATABASE_URL: postgresql+psycopg://shopping:${SHOPPING_DB_PASSWORD}@database:5432/shopping
+      AI_RUNTIME_ENABLED: "true"
+      AI_RUNTIME_PROVIDER: mock
+      AI_PROVIDER: mock
+      AI_MUTATIONS_ENABLED: "false"
+      AUTH_MODE: anonymous
+      CORS_ALLOWED_ORIGINS: '["http://localhost:5173","http://127.0.0.1:5173"]'
+      AI_BROWSER_ORIGINS: '["https://demo.shop.test"]'
+    command: ["python", "-m", "alembic", "upgrade", "head"]
+    depends_on:
+      database:
+        condition: service_healthy
+    healthcheck:
+      disable: true
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+  api:
+    image: shopping-ai-local:latest
+    environment: *backend-environment
+    ports: ["127.0.0.1:8000:8000"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+  worker:
+    image: shopping-ai-local:latest
+    environment: *backend-environment
+    command: ["python", "-m", "app.ai.worker", "--interval", "2", "--limit", "20"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      disable: true
+    read_only: true
+    tmpfs: [/tmp]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    restart: unless-stopped
+volumes:
+  shopping_data:

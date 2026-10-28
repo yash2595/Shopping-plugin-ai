@@ -17,6 +17,21 @@ def health_check():
     return {"status": "ok"}
 
 
+@router.get("/health/ready")
+def readiness(
+    db: Session = Depends(get_db),
+    health_service: HealthService = Depends(get_health_service),
+):
+    """Database/schema readiness only; does not spend model/speech quota."""
+    try:
+        ready = health_service.check_db(db) and health_service.health_repo.schema_ready(db)
+    except Exception:
+        ready = False
+    if not ready:
+        raise HTTPException(status_code=503, detail="Service is not ready")
+    return {"status": "ready"}
+
+
 @router.get("/health/db")
 def db_health_check(
     db: Session = Depends(get_db),
@@ -31,8 +46,8 @@ def db_health_check(
                 detail="Database ping failed",
             )
         return {"status": "ok", "db": "connected"}
-    except Exception as exc:
+    except Exception:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Database unreachable: {str(exc)}",
-        )
+            detail="Database unavailable",
+        ) from None

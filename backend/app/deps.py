@@ -1,5 +1,6 @@
 from typing import Optional
-from fastapi import Depends, HTTPException, status
+
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
@@ -7,16 +8,16 @@ from app.ai.contracts import AIProvider
 from app.ai.mock import MockProvider
 from app.db import get_db
 from app.models.user import User
+from app.repositories.context_repo import ContextRepository
+from app.repositories.review_repo import ReviewRepository
 from app.repositories.usage_repo import UsageRepository
 from app.services.alert_service import AlertService
 from app.services.auth_service import AuthService
 from app.services.chat_service import ChatService
+from app.services.context_service import ContextService
 from app.services.maintenance_service import MaintenanceService
 from app.services.notification_service import NotificationService
 from app.services.observation_service import ObservationService
-from app.repositories.context_repo import ContextRepository
-from app.repositories.review_repo import ReviewRepository
-from app.services.context_service import ContextService
 from app.services.review_service import ReviewService
 from app.services.session_service import SessionService
 from app.services.snapshot_service import SnapshotService
@@ -44,8 +45,8 @@ def get_usage_repo() -> UsageRepository:
     return UsageRepository()
 
 
-def get_auth_service() -> AuthService:
-    return AuthService()
+def get_auth_service(request: Request) -> AuthService:
+    return request.app.state.auth_service
 
 
 def get_session_service() -> SessionService:
@@ -76,13 +77,17 @@ def get_maintenance_service() -> MaintenanceService:
     return MaintenanceService()
 
 
-def get_ai_provider() -> AIProvider:
+def create_ai_provider() -> AIProvider:
     from app.config import get_settings
     settings = get_settings()
     if settings.AI_PROVIDER.lower() == "gemini":
         from app.ai.gemini import GeminiProvider
         return GeminiProvider()
     return MockProvider()
+
+
+def get_ai_provider(request: Request) -> AIProvider:
+    return request.app.state.ai_provider
 
 
 def get_current_user(

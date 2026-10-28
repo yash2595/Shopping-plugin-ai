@@ -2,12 +2,11 @@ import decimal
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from sqlalchemy import delete, select, update
-from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import Session, selectinload
 
 from app.models.context import RejectedProduct, ShoppingContext
 from app.models.product import Listing
+from sqlalchemy import delete, select, update
+from sqlalchemy.orm import Session, selectinload
 
 
 def utc_now() -> datetime:
@@ -41,6 +40,7 @@ class ContextRepository:
     ) -> Optional[ShoppingContext]:
         stmt = (
             select(ShoppingContext)
+            .execution_options(populate_existing=True)
             .options(
                 selectinload(ShoppingContext.rejections).selectinload(RejectedProduct.listing)
             )

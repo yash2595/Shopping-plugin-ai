@@ -1,15 +1,64 @@
 import decimal
+import re
 import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, Literal, Optional
+
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
-from app.ai.contracts import PREFERENCE_KEY_WHITELIST, CreatePriceAlertArgs, ToolProposal
+from app.ai.contracts import (
+    CreatePriceAlertArgs,
+    RejectCurrentProductArgs,
+    SetBudgetArgs,
+    SetPreferenceArgs,
+    ToolProposal,
+)
 from app.config import get_settings
 from app.models.user import User
 from app.repositories.alert_repo import AlertRepository
 
 settings = get_settings()
+
+
+def explicitly_requested(proposal: ToolProposal, user_text: str) -> bool:
+    """Conservative current-command guard, independent of page/model instructions.
+
+    Unrecognized phrasing requests clarification. It must never expand permission
+    from a quoted command, an explanation, a prior turn, or a different amount.
+    """
+    text = user_text.lower().strip().rstrip(".! ")
+    text = re.sub(r"^(?:(?:can|could|would) you (?:please )?|please )", "", text)
+    amount = r"(?:₹|rs\.?\s*|inr\s*)?([0-9][0-9,]*(?:\.[0-9]{1,2})?)"
+    if proposal.tool in {"set_budget", "create_price_alert"}:
+        prefix = (
+            r"(?:my budget is|set (?:my )?budget (?:to|at)|mera budget(?: hai)?)\s+"
+            if proposal.tool == "set_budget"
+            else r"(?:notify me|alert me|set (?:a )?(?:price )?alert)(?: when (?:the )?price drops)?\s+(?:below|under|at)\s+"
+        )
+        match = re.fullmatch(prefix + amount, text)
+        if not match:
+            return False
+        key = "budget_max" if proposal.tool == "set_budget" else "target_price"
+        return decimal.Decimal(match[1].replace(",", "")) == decimal.Decimal(
+            str(proposal.args[key])
+        )
+    if proposal.tool == "set_preference":
+        key, value = proposal.args["key"], str(proposal.args["value"]).lower()
+        key_pattern = "colou?r" if key == "color" else re.escape(key.replace("_", " "))
+        # Only color has a useful unambiguous shorthand in the offline demo.
+        key_prefix = rf"(?:{key_pattern}\s+)?" if key == "color" else rf"{key_pattern}\s+"
+        patterns = [
+            rf"(?:i prefer|prefer)\s+{key_prefix}{re.escape(value)}",
+            rf"set (?:my )?{key_pattern} to {re.escape(value)}",
+        ]
+        return any(re.fullmatch(pattern, text) for pattern in patterns)
+    return bool(
+        re.fullmatch(
+            r"(?:not this(?: one)?(?:,? too expensive)?|reject (?:this|the current) product|yeh nahi)",
+            text,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -41,11 +90,27 @@ class ProposalPolicyEngine:
         ):
             return PolicyResult(action="rejected", reason="Unknown tool")
 
+        argument_types = {
+            "create_price_alert": CreatePriceAlertArgs,
+            "set_budget": SetBudgetArgs,
+            "set_preference": SetPreferenceArgs,
+            "reject_current_product": RejectCurrentProductArgs,
+        }
+        try:
+            argument_types[proposal.tool].model_validate(proposal.args)
+        except ValidationError:
+            return PolicyResult(action="rejected", reason="Invalid tool arguments")
+        if not explicitly_requested(proposal, context.get("user_text", "")):
+            return PolicyResult(
+                action="clarification",
+                clarification_text="Please explicitly confirm the exact change and value you want to set.",
+            )
+
         if proposal.tool == "create_price_alert":
             try:
                 alert_args = CreatePriceAlertArgs.model_validate(proposal.args)
-            except Exception as e:
-                return PolicyResult(action="rejected", reason=f"Invalid alert arguments: {str(e)}")
+            except ValidationError:
+                return PolicyResult(action="rejected", reason="Invalid alert arguments")
 
             target = alert_args.target_price
             if target <= 0:
@@ -93,17 +158,13 @@ class ProposalPolicyEngine:
             return PolicyResult(action="allowed")
 
         if proposal.tool == "set_preference":
-            key = proposal.args.get("key")
-            if not key or key not in PREFERENCE_KEY_WHITELIST:
-                return PolicyResult(
-                    action="rejected",
-                    reason=f"Preference key '{key}' is not allowed. Whitelist: {sorted(PREFERENCE_KEY_WHITELIST)}",
-                )
             val = proposal.args.get("value")
             if isinstance(val, str) and len(val) > settings.MAX_PREFERENCE_STRING_LENGTH:
                 return PolicyResult(action="rejected", reason="Preference string value is too long")
             if isinstance(val, int) and (val < 0 or val > settings.MAX_PREFERENCE_INT_VALUE):
-                return PolicyResult(action="rejected", reason="Preference integer value is out of bounds")
+                return PolicyResult(
+                    action="rejected", reason="Preference integer value is out of bounds"
+                )
 
             if context.get("context_stale_version"):
                 return PolicyResult(
@@ -114,10 +175,9 @@ class ProposalPolicyEngine:
 
         if proposal.tool == "set_budget":
             try:
-                from app.ai.contracts import SetBudgetArgs
                 budget_args = SetBudgetArgs.model_validate(proposal.args)
-            except Exception as e:
-                return PolicyResult(action="rejected", reason=f"Invalid budget arguments: {str(e)}")
+            except ValidationError:
+                return PolicyResult(action="rejected", reason="Invalid budget arguments")
 
             if budget_args.budget_max <= 0:
                 return PolicyResult(action="rejected", reason="Budget must be greater than 0")

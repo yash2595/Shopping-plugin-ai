@@ -97,3 +97,36 @@ npm install
 - `nodeIntegration: false` and `contextIsolation: true` enforced on all renderer windows.
 - Native web browsing operates in sandboxed `WebContentsView` instances with isolated storage and navigation handlers.
 - Inter-Process Communication (IPC) is strictly gated through typed contextBridge handlers in [`electron/preload.ts`](electron/preload.ts).
+# AI runtime transport integration
+
+The existing `ShoppingApiClient` now exposes the versioned `/v1/ai` conversation,
+event, confirmation, work claim/receipt, audio, speech and deletion methods. See
+`../backend/README.md#local-ai-runtime` and `../backend/contracts/openapi.json` for
+the full local setup and public request/response contract. The SDK uses the existing
+token vault; logout revokes the server token, and policy/site 403 responses preserve
+valid identity. It never automatically retries or renumbers a browser mutation.
+
+This is the AI-to-browser integration seam. The browser team must connect the panel,
+packaged site adapters, native foreground tab/document identity, microphone/playback
+and a durable local action journal. Renderer tab labels/URLs are not authentication
+or document-lifetime IDs. Persist stable event IDs, claim IDs and outcomes before
+executing work; on reconnect load the saved conversation/work, and reuse the existing
+journal entry rather than clicking a claimed mutation again. Only the explicitly
+reviewed confirmation DTO can create server-side mutation permission.
+
+`sendAiAudio` uploads bounded raw media with event/version headers.
+`synthesizeAiSpeech` returns a Blob and validated conversation version; the caller
+must recheck its active turn/version and stop stale playback on new input/cancel/logout.
+Without configured server speech, browser STT can send its edited transcript through
+`sendAiEvent`; normal text remains usable. No production provider, real retailer cart
+acceptance or native executor wiring is implied by the local SDK tests/build.
+# Verified identity integration
+
+For an account-backed deployment, supply the selected login integration's secure
+`tokenProvider` and `allowAnonymousRegistration: false` to `ShoppingApiClient`.
+Without a token, requests fail with a sign-in error rather than creating an
+anonymous account. The backend verifies API access tokens against its configured
+issuer, audience and public signing keys. Login, refresh and provider sign-out
+belong to that selected identity integration. Never store private keys or backend
+secrets in the renderer. `getAiCapabilities()` reads authenticated runtime settings
+and limits; its flags are configuration information, not live provider health.

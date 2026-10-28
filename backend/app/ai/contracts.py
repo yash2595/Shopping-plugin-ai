@@ -1,6 +1,7 @@
 import decimal
-from typing import Any, Dict, List, Literal, Optional, Protocol, Union
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from typing import Annotated, Any, Dict, List, Literal, Optional, Protocol, Union
+
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr, field_validator
 
 PREFERENCE_KEY_WHITELIST = {
     "color",
@@ -17,24 +18,24 @@ class AIContractBase(BaseModel):
 
 
 class Answer(AIContractBase):
-    text: str
+    text: str = Field(min_length=1, max_length=2000)
 
 
 class Clarification(AIContractBase):
-    question: str
+    question: str = Field(min_length=1, max_length=2000)
 
 
 class CreatePriceAlertArgs(AIContractBase):
-    target_price: decimal.Decimal = Field(..., gt=0)
+    target_price: decimal.Decimal = Field(..., gt=0, max_digits=12, decimal_places=2, allow_inf_nan=False)
 
 
 class SetBudgetArgs(AIContractBase):
-    budget_max: decimal.Decimal = Field(..., gt=0)
+    budget_max: decimal.Decimal = Field(..., gt=0, max_digits=12, decimal_places=2, allow_inf_nan=False)
 
 
 class SetPreferenceArgs(AIContractBase):
     key: str
-    value: Union[str, int]
+    value: Union[StrictStr, StrictInt]
 
     @field_validator("key")
     @classmethod
@@ -74,7 +75,7 @@ class ShoppingContextContract(AIContractBase):
 
 
 class AIRequest(AIContractBase):
-    user_text: str
+    user_text: str = Field(min_length=1, max_length=2000)
     snapshot_facts: Optional[Dict[str, Any]] = None
     price_summary: Optional[Dict[str, Any]] = None
     recent_messages: List[Dict[str, Any]] = Field(default_factory=list)
@@ -96,9 +97,9 @@ class ReviewSummaryRequest(AIContractBase):
 
 class ReviewSummary(AIContractBase):
     overall: str = Field(..., max_length=500)
-    pros: List[str] = Field(..., max_length=10)
-    cons: List[str] = Field(..., max_length=10)
-    themes: List[str] = Field(..., max_length=10)
+    pros: List[Annotated[str, Field(min_length=1, max_length=300)]] = Field(..., max_length=10)
+    cons: List[Annotated[str, Field(min_length=1, max_length=300)]] = Field(..., max_length=10)
+    themes: List[Annotated[str, Field(min_length=1, max_length=300)]] = Field(..., max_length=10)
     caveat: str = Field(..., max_length=300)
 
 

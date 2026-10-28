@@ -1,7 +1,9 @@
 import uuid
 from datetime import datetime
 from typing import Optional
+
 from pydantic import Field
+
 from app.schemas.alert import PriceAlertRead
 from app.schemas.common import BaseSchema
 
@@ -9,7 +11,7 @@ from app.schemas.common import BaseSchema
 class MessageCreate(BaseSchema):
     request_id: str = Field(..., min_length=1, max_length=128)
     snapshot_id: Optional[uuid.UUID] = None
-    text: str = Field(..., min_length=1)
+    text: str = Field(..., min_length=1, max_length=2000)
 
 
 class MessageRead(BaseSchema):

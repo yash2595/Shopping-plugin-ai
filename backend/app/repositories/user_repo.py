@@ -1,13 +1,18 @@
 import uuid
 from datetime import datetime, timezone
 from typing import Optional
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 from app.models.user import AuthToken, User
+from sqlalchemy import select, update
+from sqlalchemy.orm import Session
 
 
 class UserRepository:
+    def revoke_token(self, db: Session, token_hash: str) -> None:
+        db.execute(update(AuthToken).where(
+            AuthToken.token_hash == token_hash, AuthToken.revoked_at.is_(None),
+        ).values(revoked_at=datetime.now(timezone.utc)))
+
     def create_user(self, db: Session, is_anonymous: bool = True) -> User:
         user = User(is_anonymous=is_anonymous)
         db.add(user)

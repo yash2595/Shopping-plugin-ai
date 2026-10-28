@@ -97,3 +97,13 @@ class AuthToken(Base):
         "User",
         back_populates="auth_tokens",
     )
+
+
+class ExternalIdentity(Base):
+    __tablename__ = "external_identities"
+
+    issuer: Mapped[str] = mapped_column(String(512), primary_key=True)
+    subject: Mapped[str] = mapped_column(String(255), primary_key=True)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )

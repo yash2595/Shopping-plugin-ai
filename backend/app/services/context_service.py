@@ -1,8 +1,5 @@
-import decimal
 import uuid
-from typing import Any, Dict, List, Optional
-from fastapi import HTTPException, status
-from sqlalchemy.orm import Session
+from typing import Optional
 
 from app.config import get_settings
 from app.models.context import RejectedProduct, ShoppingContext
@@ -10,6 +7,8 @@ from app.repositories.context_repo import ContextRepository
 from app.repositories.session_repo import SessionRepository
 from app.repositories.snapshot_repo import SnapshotRepository
 from app.schemas.context import RejectionCreate, ShoppingContextUpdate
+from fastapi import HTTPException, status
+from sqlalchemy.orm import Session
 
 settings = get_settings()
 
@@ -50,6 +49,8 @@ class ContextService:
         session_id: uuid.UUID,
         user_id: uuid.UUID,
         data: ShoppingContextUpdate,
+        *,
+        commit: bool = True,
     ) -> ShoppingContext:
         ctx = self.get_context(db, session_id=session_id, user_id=user_id)
 
@@ -129,8 +130,9 @@ class ContextService:
                     "message": "Shopping context version conflict. Please re-fetch and retry.",
                 },
             )
-        db.commit()
-        db.refresh(updated)
+        if commit:
+            db.commit()
+            db.refresh(updated)
         return updated
 
     def add_rejection(
@@ -139,6 +141,8 @@ class ContextService:
         session_id: uuid.UUID,
         user_id: uuid.UUID,
         data: RejectionCreate,
+        *,
+        commit: bool = True,
     ) -> RejectedProduct:
         ctx = self.get_context(db, session_id=session_id, user_id=user_id)
 
@@ -169,8 +173,9 @@ class ContextService:
             listing_id=data.listing_id,
             reason=data.reason,
         )
-        db.commit()
-        db.refresh(rejection)
+        if commit:
+            db.commit()
+            db.refresh(rejection)
         return rejection
 
     def remove_rejection(

@@ -1,20 +1,20 @@
-import concurrent.futures
 import datetime
 import decimal
+import hashlib
+import json
 import re
 import uuid
 from typing import Any, Dict, List, Optional, Set, Tuple
-from sqlalchemy.orm import Session
 
 from app.ai.contracts import (
     AIProvider,
-    AIProviderError,
     AIRequest,
     Answer,
     Clarification,
     ShoppingContextContract,
     ToolProposal,
 )
+from app.ai.execution import get_provider_executor
 from app.config import get_settings
 from app.models.session import Message
 from app.models.user import User
@@ -31,6 +31,7 @@ from app.schemas.message import MessageCreate
 from app.services.alert_service import AlertService
 from app.services.context_service import ContextService
 from app.services.snapshot_service import SnapshotService
+from sqlalchemy.orm import Session
 
 settings = get_settings()
 
@@ -68,13 +69,15 @@ def build_templated_answer(
     parts: List[str] = []
     if snapshot_price is not None:
         parts.append(f"The current price is ₹{snapshot_price}.")
-    if price_history and getattr(price_history, "count", 0) >= 3:
+    if price_history and all(
+        getattr(price_history, key, None) is not None for key in ("min", "max", "average")
+    ):
         parts.append(
             f"Over the last 30 days, the lowest recorded price was ₹{price_history.min}, "
             f"the highest was ₹{price_history.max}, and the average was ₹{price_history.average}."
         )
-    elif price_history and getattr(price_history, "count", 0) < 3:
-        parts.append("There is no price history yet for this item.")
+    elif price_history:
+        parts.append("There is not enough reliable price history yet for this item.")
     else:
         parts.append("Price history is currently unavailable.")
     return " ".join(parts)
@@ -128,21 +131,19 @@ class ChatService:
         - Runs grounding check on Answer text (including budget_max).
         - Validates ToolProposal through policies and executes server-side tool once.
         """
-        # 1. Idempotency check: if request_id already exists for this user, replay stored reply
-        existing_msg = self.session_repo.get_message_by_user_and_request_id(
-            db,
-            user_id=user.id,
-            request_id=data.request_id,
-        )
-        if existing_msg:
-            stored_reply = self.session_repo.get_assistant_reply_following(db, existing_msg)
-            if stored_reply:
-                return stored_reply, True, None
-
-        # 2. Verify session exists and belongs to this user
+        # Authenticate ownership before even looking up a request replay.
         session = self.session_repo.get_session_by_id(db, session_id=session_id, user_id=user.id)
         if not session:
             return None, False, "session_not_found"
+        payload_hash = hashlib.sha256(json.dumps(
+            {"session_id": str(session_id), **data.model_dump(mode="json")},
+            sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8")).hexdigest()
+        existing = self.session_repo.get_message_by_user_and_request_id(
+            db, user_id=user.id, request_id=data.request_id,
+        )
+        if existing:
+            return self._replay(db, existing, session_id, payload_hash)
 
         # 3. Retrieve shopping context
         ctx = self.context_service.get_context(db, session_id=session.id, user_id=user.id)
@@ -216,26 +217,6 @@ class ChatService:
         )
         recent_payload = [{"role": m.role, "content": m.content} for m in recent_msgs]
 
-        # 6. Persist user message
-        self.session_repo.create_message(
-            db,
-            session_id=session.id,
-            user_id=user.id,
-            role="user",
-            content=data.text,
-            request_id=data.request_id,
-            kind="user",
-            payload=None,
-        )
-
-        # 7. Check daily AI call limit (A2)
-        server_now = datetime.datetime.now(datetime.timezone.utc)
-        ai_count = self.usage_repo.increment_and_get_count(
-            db, user_id=user.id, day=server_now.date(), key="ai_daily"
-        )
-        if ai_count > settings.MAX_AI_CALLS_PER_USER_PER_DAY:
-            return None, False, "rate_limited"
-
         # 8. Build pure contract AIRequest
         ai_req = AIRequest(
             user_text=data.text,
@@ -247,43 +228,40 @@ class ChatService:
             review_summary=latest_review_summary,
         )
 
-        # 9. Call AIProvider with timeout
-        ai_resp = None
+        # Admit once in a short durable transaction. A retry of an unfinished
+        # request returns an explicit conflict, never reruns a possible effect.
+        request = self.session_repo.claim_request(
+            db, session_id=session.id, user_id=user.id, request_id=data.request_id,
+            content=data.text, payload_hash=payload_hash,
+        )
+        if request is None:
+            existing = self.session_repo.get_message_by_user_and_request_id(
+                db, user_id=user.id, request_id=data.request_id,
+            )
+            return self._replay(db, existing, session_id, payload_hash)
+        server_now = datetime.datetime.now(datetime.timezone.utc)
+        ai_count = self.usage_repo.increment_and_get_count(
+            db, user_id=user.id, day=server_now.date(), key="ai_daily"
+        )
+        if ai_count > settings.MAX_AI_CALLS_PER_USER_PER_DAY:
+            db.rollback()
+            return None, False, "rate_limited"
+        context_version = ctx.version
+        db.commit()
+        # Do not access expired ORM attributes until provider processing ends.
+        # This releases the connection and all locks during an external wait.
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(ai_provider.decide, ai_req)
-                ai_resp = future.result(timeout=settings.AI_TIMEOUT_SECONDS)  # PLACEHOLDER: 5.0
+            ai_resp = get_provider_executor().call(
+                lambda: ai_provider.decide(ai_req), timeout=settings.AI_TIMEOUT_SECONDS,
+            )
+            if not isinstance(ai_resp, (Answer, Clarification, ToolProposal)):
+                raise ValueError("INVALID_PROVIDER_RESULT")
+            ai_resp = type(ai_resp).model_validate(ai_resp.model_dump())
         except Exception:
-            # Fallback on AIProviderError, TimeoutError, or any execution failure
-            reply_text = "I'm having trouble analyzing this product right now. Please try again in a moment."
-            assistant_msg = self.session_repo.create_message(
-                db,
-                session_id=session.id,
-                user_id=user.id,
-                role="assistant",
-                content=reply_text,
-                kind="fallback",
-                payload=None,
+            return self._complete(
+                db, request, "I'm having trouble analyzing this product right now. Please try again in a moment.",
+                "fallback", None,
             )
-            db.commit()
-            db.refresh(assistant_msg)
-            return assistant_msg, False, None
-
-        # Check for malformed output
-        if not isinstance(ai_resp, (Answer, Clarification, ToolProposal)):
-            reply_text = "I'm having trouble analyzing this product right now. Please try again in a moment."
-            assistant_msg = self.session_repo.create_message(
-                db,
-                session_id=session.id,
-                user_id=user.id,
-                role="assistant",
-                content=reply_text,
-                kind="fallback",
-                payload=None,
-            )
-            db.commit()
-            db.refresh(assistant_msg)
-            return assistant_msg, False, None
 
         # 10. Orchestrate decision
         reply_content: str = ""
@@ -331,10 +309,11 @@ class ChatService:
         elif isinstance(ai_resp, ToolProposal):
             # Check if context was updated concurrently
             current_db_ctx = self.context_repo.get_context_by_id(db, context_id=ctx.id, user_id=user.id)
-            context_stale = (current_db_ctx.version != ctx.version) if current_db_ctx else False
+            context_stale = current_db_ctx is None or current_db_ctx.version != context_version
 
             context = {
                 "listing_id": listing_id,
+                "user_text": data.text,
                 "current_price": snapshot.captured_price if snapshot else None,
                 "context_stale_version": context_stale,
             }
@@ -366,6 +345,7 @@ class ChatService:
                             user=user,
                             listing_id=listing_id,
                             target_price=target,
+                            commit=False,
                         )
                         if created_alert:
                             alert_read = PriceAlertRead.model_validate(created_alert)
@@ -383,7 +363,8 @@ class ChatService:
                         db,
                         session_id=session.id,
                         user_id=user.id,
-                        data=ShoppingContextUpdate(budget_max=budget_val, version=ctx.version),
+                        data=ShoppingContextUpdate(budget_max=budget_val, version=context_version),
+                        commit=False,
                     )
                     reply_kind = "tool"
                     reply_content = f"I've updated your budget to ₹{budget_val}."
@@ -396,7 +377,8 @@ class ChatService:
                         db,
                         session_id=session.id,
                         user_id=user.id,
-                        data=ShoppingContextUpdate(preferences={key: value}, version=ctx.version),
+                        data=ShoppingContextUpdate(preferences={key: value}, version=context_version),
+                        commit=False,
                     )
                     reply_kind = "tool"
                     reply_content = f"Preference '{key}' has been set to '{value}'."
@@ -409,21 +391,32 @@ class ChatService:
                         session_id=session.id,
                         user_id=user.id,
                         data=RejectionCreate(listing_id=listing_id, reason=reason),
+                        commit=False,
                     )
                     reply_kind = "tool"
                     reply_content = "I've noted that you don't want this product and marked it as rejected."
                     reply_payload = {"rejection": {"listing_id": str(listing_id), "reason": reason}}
 
-        # 11. Store assistant message and return
+        return self._complete(db, request, reply_content, reply_kind, reply_payload)
+
+    def _complete(self, db, request, content, kind, payload):
+        # Side effect, exact reply association and response commit together.
         assistant_msg = self.session_repo.create_message(
-            db,
-            session_id=session.id,
-            user_id=user.id,
-            role="assistant",
-            content=reply_content,
-            kind=reply_kind,
-            payload=reply_payload,
+            db, session_id=request.session_id, user_id=request.user_id,
+            role="assistant", content=content, kind=kind, payload=payload,
         )
+        self.session_repo.finish_request(db, request=request, reply=assistant_msg)
         db.commit()
         db.refresh(assistant_msg)
         return assistant_msg, False, None
+
+    def _replay(self, db, request, session_id, payload_hash):
+        if request is None:
+            return None, False, "request_in_progress"
+        payload = request.payload or {}
+        if request.session_id != session_id or payload.get("request_hash") != payload_hash:
+            return None, False, "idempotency_conflict"
+        reply = self.session_repo.get_request_reply(db, request=request)
+        if payload.get("status") == "complete" and reply is not None:
+            return reply, True, None
+        return None, False, "request_in_progress"
