@@ -40,6 +40,7 @@ export interface OrbOverlayBounds {
 }
 
 const electronAPI = {
+  conversationNavigation: (data: { kind: 'navigate' | 'back' | 'forward' | 'reload' | 'stop' | 'switch' | 'scroll_down' | 'scroll_up' | 'open_result'; tabId: string; expectedUrl: string; url?: string; targetTabId?: string; index?: number }) => ipcRenderer.invoke('browser:conversation-navigation', data),
   navigate: (url: string, tabId?: string) => {
     ipcRenderer.send('browser:navigate', { url, tabId })
   },
@@ -145,6 +146,9 @@ const electronAPI = {
   setAuthToken: (token: string) => ipcRenderer.invoke('auth:set-token', token),
   clearAuthToken: () => ipcRenderer.invoke('auth:clear-token'),
   extractPageSnapshot: (tabId?: string) => ipcRenderer.invoke('browser:extract-snapshot', tabId),
+  requestBackend: (data: { url: string; method: string; headers: Record<string, string>; body?: string }) => ipcRenderer.invoke('backend:request', data),
+  showAnalysisEvidence: (data: { skill: string; document_id: string; source_url: string;
+    spec_key?: string | null; review_id?: string | null; expected_text: string }) => ipcRenderer.invoke('browser:analysis-skill', data),
 }
 
 contextBridge.exposeInMainWorld('electronAPI', electronAPI)

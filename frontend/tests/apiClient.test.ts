@@ -7,10 +7,27 @@ import {
   RateLimitError,
   NetworkError,
   ApiError,
+  desktopFetch,
   type TokenProvider,
 } from '../src/services/apiClient.ts'
 
 describe('ShoppingApiClient Integration Unit Tests', () => {
+  test('packaged desktop JSON uses the trusted HTTP bridge and preserves 204 responses', async () => {
+    const original = Object.getOwnPropertyDescriptor(globalThis, 'window')
+    const calls: unknown[] = []
+    Object.defineProperty(globalThis, 'window', { configurable: true, value: { electronAPI: {
+      requestBackend: async (data: unknown) => { calls.push(data); return { status: 204, headers: {}, body: '' } },
+    } } })
+    try {
+      const response = await desktopFetch('http://localhost:8000/v1/auth/logout', { method: 'POST', headers: { Authorization: 'Bearer token' } })
+      assert.strictEqual(response.status, 204)
+      assert.strictEqual(await response.text(), '')
+      assert.strictEqual(calls.length, 1)
+    } finally {
+      if (original) Object.defineProperty(globalThis, 'window', original)
+      else Reflect.deleteProperty(globalThis, 'window')
+    }
+  })
   function createMockTokenProvider(initialToken: string | null = null): TokenProvider & { tokens: string[] } {
     let currentToken = initialToken
     const tokens: string[] = []
@@ -297,7 +314,7 @@ describe('ShoppingApiClient Integration Unit Tests', () => {
       async () => {
         await client.createSession()
       },
-      (err) => err instanceof NetworkError && err.message.includes('Connection refused')
+      (err) => err instanceof NetworkError && !err.message.includes('Connection refused') && err.originalError instanceof TypeError
     )
   })
 
@@ -379,5 +396,22 @@ describe('ShoppingApiClient Integration Unit Tests', () => {
     const client = new ShoppingApiClient({ tokenProvider, customFetch: async () =>
       new Response('audio', { status: 200, headers: { 'X-Conversation-Version': '8' } }) })
     await assert.rejects(client.synthesizeAiSpeech('conversation-1', 7), ApiError)
+  })
+
+  test('shopping analysis submits typed observations without action retries', async () => {
+    const tokenProvider = createMockTokenProvider('valid-token')
+    let calls = 0
+    const client = new ShoppingApiClient({ tokenProvider, customFetch: async (input, init) => {
+      calls++
+      assert.ok(String(input).endsWith('/v1/ai/analysis'))
+      const body = JSON.parse(String(init?.body))
+      assert.strictEqual(body.question, 'battery?')
+      assert.strictEqual(body.budget, '2000')
+      return Response.json({ status: 'no_evidence', answer: 'Capture a product' })
+    } })
+    assert.strictEqual((await client.analyzeShopping('battery?', [], { budget: '2000' })).status, 'no_evidence')
+    assert.strictEqual(calls, 1)
+    await assert.rejects(client.analyzeShopping('', []), ApiError)
+    assert.strictEqual(calls, 1)
   })
 })

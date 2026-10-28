@@ -8,6 +8,17 @@ application validation → grounded answer, question, or tool proposal**
 
 ## What works now
 
+`shopping_ai.analysis` adds a pure local analytical API, independent of the
+database/model/browser: `AnalysisRequest -> analyze(..., now=...) -> AnalysisReply`.
+It answers observed specs, compares up to four fresh captures, shortlists by
+confirmed price/stock/currency and exact RAM/storage/colour requirements, and
+returns exact matched review excerpts with source/document references. Missing
+facts stay unknown; use-case suitability and "best" without criteria clarify.
+Review snippets are exact substrings of supplied text, not independently verified
+buyer claims or coverage of all reviews. Source-only highlight/scroll proposals
+contain no scripts/selectors; native execution must recheck the live document/text.
+The separate provider-backed runtime remains available for richer dialogue.
+
 | Capability | Current behavior |
 | --- | --- |
 | Product questions | Select known fact IDs; render exact observed price, stock, variant and specs. |
@@ -535,9 +546,14 @@ AI_CHAT_TOKEN_PARAMETER=max_completion_tokens
 requires that field. If it lacks JSON mode, explicitly set response mode `text`;
 application JSON/schema validation still applies, but output reliability depends
 on the model. There is no automatic downgrade, endpoint switch or retry. This
-adapter requires HTTPS, including for any self-hosted/local service; no direct
-plain-HTTP local endpoint support is provided. Endpoint configuration is trusted
-server configuration, never supplied by a model, extension client or retailer.
+adapter requires HTTPS by default. An explicit `ChatSettings(local_only=True, ...)`
+profile permits only loopback HTTP on port 11434 and the exact
+`/v1/chat/completions` path, without credentials, query strings or redirects.
+Use `token_parameter="max_tokens"` for that Ollama-compatible profile. Local model
+installation is separate; no model is downloaded. The backend composes explicit
+local-first/deterministic-or-cloud routing around this single-request transport;
+see its phase checklist. Endpoint configuration is trusted server configuration,
+never supplied by a model, extension client or retailer.
 
 ```python
 from shopping_ai import Conversation, Orchestrator, ShoppingAI
@@ -1678,3 +1694,9 @@ pause/resume transitions and do not authorize or dispatch work themselves. A rej
 partial capture leaves its read pending; callers may wait for complete evidence within
 the action window, or submit a bound failed read receipt with
 `CART_COVERAGE_INCOMPLETE` to enter the existing paused state.
+
+The analytical API can optionally ask an explicitly configured local/chat provider
+to select fact IDs when exact lookup has no answer. `selected_fact_reply` requires
+canonical field/value equality and fresh source facts after inference, then renders
+original observations. Model prose, foreign IDs and action proposals cannot become
+shopping answers or browser actions. Default extractive questions use no model.

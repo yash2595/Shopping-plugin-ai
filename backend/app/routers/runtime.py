@@ -1,19 +1,28 @@
 """AI-only public routes. Existing session authentication remains authoritative."""
 
+import re
 import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from pydantic import ValidationError
+from shopping_ai.analysis import (
+    AnalysisReply,
+    AnalysisRequest,
+    analyze,
+    selected_fact_reply,
+)
 from shopping_ai.browser import BrowserTarget
-from shopping_ai.models import Identifier
+from shopping_ai.models import AIRequest, Identifier
 from shopping_ai.voice import AudioClip
 from sqlalchemy.orm import Session
 
+from app.ai.runtime import inference_fallback
 from app.config import get_settings
 from app.db import get_db
 from app.deps import get_current_user
 from app.models.user import User
+from app.repositories.usage_repo import UsageRepository
 from app.schemas.common import ErrorResponse
 from app.schemas.runtime import (
     Capabilities,
@@ -42,14 +51,87 @@ def service(request: Request):
     return request.app.state.runtime_service
 
 
+@router.post("/analysis", response_model=AnalysisReply)
+async def shopping_analysis(
+    data: AnalysisRequest,
+    current: User = Depends(get_current_user),
+    svc=Depends(service),
+    db: Session = Depends(get_db),
+):
+    """Extract first; optional model may select fact IDs, never prose or actions."""
+    from urllib.parse import urlsplit
+
+    from app.repositories.runtime_repo import utcnow
+
+    for item in data.products:
+        url = urlsplit(item.source_url)
+        svc.origin(f"{url.scheme}://{url.netloc}", required=True)
+    result = analyze(data, now=utcnow(), max_age_seconds=svc.settings.AI_MAX_SNAPSHOT_AGE_SECONDS)
+    if result.status != "no_evidence" or svc.settings.AI_RUNTIME_PROVIDER == "mock":
+        return result
+    if re.search(
+        r"\b(reviews?|complaints?|heating|issues?|problems?|shikayat|compare|comparison|"
+        r"recommend|suggest|best|budget|under|below|kaunsa)\b", data.question, re.I
+    ):
+        return result
+    selected = next(
+        (item for item in data.products if item.product.product_id == data.selected_product_id),
+        None,
+    )
+    if selected is None and len(data.products) == 1:
+        selected = data.products[0]
+    if (
+        selected is None
+        or not 0
+        <= (utcnow() - selected.product.observed_at).total_seconds()
+        <= svc.settings.AI_MAX_SNAPSHOT_AGE_SECONDS
+    ):
+        return result
+    count = UsageRepository().increment_and_get_count(db, current.id, utcnow().date(), "ai_daily")
+    if count > svc.settings.MAX_AI_CALLS_PER_USER_PER_DAY:
+        db.rollback()
+        return result.model_copy(
+            update={
+                "follow_up": "AI limit reached; exact captured-spec questions remain available."
+            }
+        )
+    # Provider waits hold no database connection and write no page content/history.
+    db.commit()
+    trace = inference_fallback.set(None)
+    try:
+        response = await svc.runtime.conversation.orchestrator.ai.decide(
+            AIRequest(
+                request_id=uuid.uuid4().hex,
+                message=data.question,
+                language=data.language,
+                product=selected.product,
+                available_tools=[],
+            )
+        )
+        enriched = selected_fact_reply(
+            data, response, now=utcnow(), max_age_seconds=svc.settings.AI_MAX_SNAPSHOT_AGE_SECONDS
+        )
+        return (enriched or result).model_copy(
+            update={"inference_fallback": inference_fallback.get()}
+        )
+    except Exception:
+        return result.model_copy(update={"inference_fallback": inference_fallback.get()})
+    finally:
+        inference_fallback.reset(trace)
+
+
 @router.get("/capabilities", response_model=Capabilities)
 def capabilities(current: User = Depends(get_current_user)) -> dict:
     """Advertise configuration, not live upstream health or internal grants."""
     config = get_settings()
     return {
         "provider": config.AI_RUNTIME_PROVIDER,
+        "analysis_only": config.AI_ANALYSIS_ONLY,
+        "local_fallback": config.AI_LOCAL_FALLBACK
+        if config.AI_RUNTIME_PROVIDER == "local"
+        else None,
         "authentication": config.AUTH_MODE,
-        "mutations_enabled": config.AI_MUTATIONS_ENABLED,
+        "mutations_enabled": config.AI_MUTATIONS_ENABLED and not config.AI_ANALYSIS_ONLY,
         "browser_origins": list(config.AI_BROWSER_ORIGINS),
         "speech_to_text_configured": bool(config.AI_STT_ENDPOINT and config.AI_STT_MODEL),
         "text_to_speech_configured": bool(config.AI_TTS_ENDPOINT and config.AI_TTS_MODEL),

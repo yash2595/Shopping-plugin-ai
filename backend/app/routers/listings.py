@@ -1,6 +1,6 @@
 import datetime
 import uuid
-from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
@@ -34,7 +34,9 @@ router = APIRouter(prefix="/v1/listings", tags=["listings"])
 settings = get_settings()
 
 
-@router.post("/{listing_id}/observations", response_model=ObservationResponse, status_code=status.HTTP_200_OK)
+@router.post(
+    "/{listing_id}/observations", response_model=ObservationResponse, status_code=status.HTTP_200_OK
+)
 def record_observation(
     listing_id: uuid.UUID,
     data: ObservationCreate,
@@ -74,7 +76,9 @@ def record_observation(
 
     # 3. Usage counters & Rate limiting
     server_now = datetime.datetime.now(datetime.timezone.utc)
-    if data.captured_at and data.captured_at > server_now + datetime.timedelta(minutes=settings.MAX_FUTURE_TIMESTAMP_MINUTES):
+    if data.captured_at and data.captured_at > server_now + datetime.timedelta(
+        minutes=settings.MAX_FUTURE_TIMESTAMP_MINUTES
+    ):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail={
@@ -150,7 +154,9 @@ def get_price_history(
     return history
 
 
-@router.post("/{id}/review-summary", response_model=ReviewSummaryResponse, status_code=status.HTTP_200_OK)
+@router.post(
+    "/{id}/review-summary", response_model=ReviewSummaryResponse, status_code=status.HTTP_200_OK
+)
 def create_review_summary(
     id: uuid.UUID,
     data: ReviewSummaryPostRequest,
@@ -172,7 +178,9 @@ def create_review_summary(
     )
 
 
-@router.get("/{id}/review-summary", response_model=ReviewSummaryResponse, status_code=status.HTTP_200_OK)
+@router.get(
+    "/{id}/review-summary", response_model=ReviewSummaryResponse, status_code=status.HTTP_200_OK
+)
 def get_review_summary(
     id: uuid.UUID,
     current_user: User = Depends(get_current_user),
@@ -183,4 +191,4 @@ def get_review_summary(
     Retrieve latest stored review summary for a listing.
     Returns 404 NO_SUMMARY if none exists.
     """
-    return review_service.get_latest_review_summary(db=db, listing_id=id)
+    return review_service.get_latest_review_summary(db=db, listing_id=id, user=current_user)

@@ -1,16 +1,27 @@
-import { app, BrowserWindow, WebContentsView, ipcMain } from 'electron'
+import { app, BrowserWindow, WebContentsView, ipcMain, session } from 'electron'
 import * as path from 'path'
 import * as fs from 'fs'
 
 // Keep Electron's runtime profile in the writable project workspace. The host
 // profile can be access-denied in managed environments, which breaks Chromium
 // cache/GPU startup before the renderer can paint the overlay.
-app.setPath('userData', path.join(process.cwd(), '.electron-runtime'))
+if (!app.isPackaged) app.setPath('userData', path.join(process.cwd(), '.electron-runtime'))
 app.disableHardwareAcceleration()
 app.name = 'Copilot Browser'
 
 let mainWindow: BrowserWindow | null = null
 const views = new Map<string, WebContentsView>()
+const documentVersions = new Map<string, number>()
+
+function isTrustedUi(event: Electron.IpcMainInvokeEvent | Electron.IpcMainEvent) {
+  return !!mainWindow && event.sender === mainWindow.webContents && event.senderFrame === mainWindow.webContents.mainFrame
+}
+
+function assertTrustedUi(event: Electron.IpcMainInvokeEvent) {
+  if (!isTrustedUi(event)) {
+    throw new Error('Untrusted application frame')
+  }
+}
 let activeTabId: string = 'tab-1'
 let currentBounds = { x: 0, y: 0, width: 0, height: 0 }
 let orbOverlayWindow: BrowserWindow | null = null
@@ -52,21 +63,24 @@ function loadRendererPage(window: BrowserWindow, devPath: string, productionFile
 // Enable Chrome DevTools Protocol for later automation work. Keeping the
 // default stable also allows a separate local test instance to avoid a port
 // already used by another Electron session.
-app.commandLine.appendSwitch(
-  'remote-debugging-port',
-  process.env.SAARTHI_REMOTE_DEBUGGING_PORT || '9222',
-)
+if (!app.isPackaged && process.env.SAARTHI_REMOTE_DEBUGGING_PORT) {
+  const debugPort = Number(process.env.SAARTHI_REMOTE_DEBUGGING_PORT)
+  if (Number.isInteger(debugPort) && debugPort >= 1024 && debugPort <= 65535) {
+    app.commandLine.appendSwitch('remote-debugging-address', '127.0.0.1')
+    app.commandLine.appendSwitch('remote-debugging-port', String(debugPort))
+  }
+}
 
 // On Windows (Intel Iris Xe / certain AMD/NVIDIA configs) the Chromium GPU
 // process sandbox fails to initialise and exits immediately with
 // exit_code=-1073741515 (0xC0000135 – STATUS_DLL_NOT_FOUND).  Disabling the
 // GPU sandbox fixes the crash while keeping hardware-accelerated rendering.
 // This is NOT the same as `--disable-gpu`; full GPU acceleration is retained.
-app.commandLine.appendSwitch('disable-gpu-sandbox')
-// This managed host cannot launch Chromium renderer sandboxes (exit code 49).
-// Keep the existing WebContentsView/overlay architecture but allow renderers
-// to start reliably in this environment.
-app.commandLine.appendSwitch('no-sandbox')
+if (!app.isPackaged && process.env.SHOPPING_UNSAFE_DEV_SANDBOX === '1') {
+  app.commandLine.appendSwitch('disable-gpu-sandbox')
+  app.commandLine.appendSwitch('no-sandbox')
+}
+// The workaround above is opt-in for development only; packaged releases retain sandboxing.
 
 const KNOWN_DOMAINS: Record<string, string> = {
   youtube: 'https://www.youtube.com',
@@ -156,7 +170,7 @@ function createTabView(tabId: string, rawUrl: string): WebContentsView {
 
   // Handle window.open & target="_blank" -> route into SAARTHI native browser tab
   view.webContents.setWindowOpenHandler(({ url }) => {
-    console.log(`[WebContentsView:${tabId}] Intercepted target="_blank" window.open: ${url}`)
+    console.log(`[WebContentsView:${tabId}] Intercepted new-tab request`)
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('browser:new-tab-requested', { url })
     }
@@ -189,13 +203,15 @@ function createTabView(tabId: string, rawUrl: string): WebContentsView {
     }
   })
 
-  view.webContents.on('did-navigate', (_e, navUrl) => {
-    console.log(`[WebContentsView:${tabId}] Loaded: ${navUrl}`)
+  view.webContents.on('did-navigate', (_e, _navUrl) => {
+    documentVersions.set(tabId, (documentVersions.get(tabId) || 0) + 1)
+    console.log(`[WebContentsView:${tabId}] Page navigation completed`)
     sendNavState()
   })
 
-  view.webContents.on('did-navigate-in-page', (_e, navUrl) => {
-    console.log(`[WebContentsView:${tabId}] In-page navigation: ${navUrl}`)
+  view.webContents.on('did-navigate-in-page', (_e, _navUrl) => {
+    documentVersions.set(tabId, (documentVersions.get(tabId) || 0) + 1)
+    console.log(`[WebContentsView:${tabId}] In-page navigation completed`)
     sendNavState()
   })
 
@@ -209,13 +225,14 @@ function createTabView(tabId: string, rawUrl: string): WebContentsView {
   views.set(tabId, view)
 
   const finalUrl = normalizeUrl(rawUrl)
-  console.log(`[WebContentsView:${tabId}] Loading initial URL: ${finalUrl}`)
+  console.log(`[WebContentsView:${tabId}] Loading initial page`)
   view.webContents.loadURL(finalUrl)
 
   return view
 }
 
 function switchActiveTab(tabId: string) {
+  if (tabId !== activeTabId) conversationNavigationCancels.get(activeTabId)?.()
   if (!mainWindow || !views.has(tabId)) return
 
   // Detach previous active view if mounted
@@ -253,6 +270,7 @@ function switchActiveTab(tabId: string) {
 }
 
 function closeTabView(tabId: string) {
+  conversationNavigationCancels.get(tabId)?.()
   if (!views.has(tabId)) return
   const viewToClose = views.get(tabId)!
 
@@ -605,10 +623,11 @@ function ensureOrbOverlay(): BrowserWindow {
   // pointer handshake that can strand the avatar in ignore mode.
   overlay.setIgnoreMouseEvents(false)
   overlay.webContents.setWindowOpenHandler(() => ({ action: 'deny' }))
+  overlay.webContents.on('will-navigate', (event) => event.preventDefault())
   const markReady = (source: string) => {
     if (overlay.isDestroyed() || orbOverlayWindow !== overlay) return
     orbOverlayReady = true
-    console.log(`[OrbOverlay] Ready via ${source}: ${overlay.getURL()}`)
+    console.log(`[OrbOverlay] Ready via ${source}`)
     syncOrbOverlayState()
     syncOrbOverlayMode()
     syncOrbOverlayBounds()
@@ -664,7 +683,16 @@ function createWindow() {
       preload: path.join(__dirname, 'preload.cjs'),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
     },
+  })
+
+  mainWindow.webContents.on('will-navigate', (event) => event.preventDefault())
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    try {
+      if (new URL(url).protocol === 'https:') mainWindow?.webContents.send('browser:new-tab-requested', { url })
+    } catch { /* Invalid URLs are never opened. */ }
+    return { action: 'deny' }
   })
 
   // Start the WebContentsView with zero bounds (hidden).  Once the React
@@ -708,6 +736,7 @@ function createWindow() {
 
 // IPC Handlers for React Frontend Multi-Tab & Browser Controls
 ipcMain.on('browser:create-tab', (_event, payload: { tabId: string; url: string; activate?: boolean }) => {
+  if (!isTrustedUi(_event)) return
   const { tabId, url, activate = true } = payload
   if (!views.has(tabId)) {
     createTabView(tabId, url || 'https://www.google.com')
@@ -718,14 +747,17 @@ ipcMain.on('browser:create-tab', (_event, payload: { tabId: string; url: string;
 })
 
 ipcMain.on('browser:switch-tab', (_event, payload: { tabId: string }) => {
+  if (!isTrustedUi(_event)) return
   switchActiveTab(payload.tabId)
 })
 
 ipcMain.on('browser:close-tab', (_event, payload: { tabId: string }) => {
+  if (!isTrustedUi(_event)) return
   closeTabView(payload.tabId)
 })
 
 ipcMain.on('browser:update-bounds', (_event, bounds) => {
+  if (!isTrustedUi(_event)) return
   if (!bounds) return
   currentBounds = {
     x: Math.round(bounds.x),
@@ -829,49 +861,165 @@ ipcMain.on('orb:update-state', (event, payload: { state: string; isPanelOpen: bo
   }
 })
 
+const conversationNavigationCancels = new Map<string, () => void>()
+// Conversation navigation accepts bounded commands from the trusted UI only.
+ipcMain.handle('browser:conversation-navigation', async (event, data: {
+  kind: string; tabId: string; expectedUrl: string; url?: string; targetTabId?: string; index?: number;
+}) => {
+  assertTrustedUi(event)
+  const view = views.get(data?.tabId)
+  if (!view || data.tabId !== activeTabId || !mainWindow?.isFocused() ||
+      (data.kind !== 'stop' && view.webContents.getURL() !== data.expectedUrl)) return { success: false, message: 'The active page changed. Please repeat your request.' }
+  const wc = view.webContents
+  if (data.kind === 'stop') {
+    documentVersions.set(data.tabId, (documentVersions.get(data.tabId) || 0) + 1)
+    conversationNavigationCancels.get(data.tabId)?.()
+    wc.stop()
+    return { success: true, message: 'Navigation stopped.' }
+  }
+  if (data.kind === 'open_result') {
+    if (!Number.isInteger(data.index) || data.index! < 1 || data.index! > 5) return { success: false, message: 'Choose a result number from 1 to 5.' }
+    const source = new URL(wc.getURL())
+    if (!['amazon.in', 'www.amazon.in', 'flipkart.com', 'www.flipkart.com'].includes(source.hostname) ||
+        !['/s', '/search'].includes(source.pathname)) return { success: false, message: 'Open a supported Amazon or Flipkart search page first.' }
+    const version = documentVersions.get(data.tabId) || 0
+    try {
+      const links = await wc.executeJavaScript(`(() => {
+        const selector = location.hostname.endsWith('amazon.in') ? '[data-component-type="s-search-result"] h2 a[href], [data-component-type="s-search-result"] a[href] h2' : 'a[href*="/p/itm"]';
+        const results = [];
+        for (const node of [...document.querySelectorAll(selector)].slice(0, 100)) {
+          const a = node.closest('a'); if (!a) continue;
+          const rect = a.getBoundingClientRect(); const style = getComputedStyle(a);
+          if (!rect.width || !rect.height || style.display === 'none' || style.visibility === 'hidden') continue;
+          try {
+            const u = new URL(a.href, location.href);
+            if (u.protocol !== 'https:' || u.username || u.password || u.port || u.hostname !== location.hostname) continue;
+            const asin = /\\/dp\\/([A-Z0-9]{10})(?:[/?]|$)/i.exec(u.pathname);
+            const path = asin ? '/dp/' + asin[1] : /\\/p\\/itm[a-z0-9]+/i.test(u.pathname) ? u.pathname : null;
+            if (!path) continue;
+            const href = u.origin + path;
+            if (!results.includes(href)) results.push(href);
+            if (results.length === 5) break;
+          } catch {}
+        }
+        return results;
+      })()`)
+      if (wc.getURL() !== source.href || activeTabId !== data.tabId || (documentVersions.get(data.tabId) || 0) !== version) return { success: false, message: 'Search results changed. Please repeat your request.' }
+      if (!Array.isArray(links) || typeof links[data.index! - 1] !== 'string') return { success: false, message: 'That product result is unavailable. Check the search page or scroll to load results.' }
+      // Reuse URL validation and actual-load receipt; never click page-provided controls.
+      const chosen = new URL(links[data.index! - 1])
+      if (chosen.origin !== source.origin || !/\/dp\/[A-Z0-9]{10}$|\/p\/itm[a-z0-9]+/i.test(chosen.pathname)) throw new Error()
+      data = { ...data, kind: 'navigate', url: chosen.href }
+    } catch { return { success: false, message: 'Product result navigation is unavailable.' } }
+  }
+  if (data.kind === 'scroll_down' || data.kind === 'scroll_up') {
+    if (!/^https:\/\//i.test(wc.getURL())) return { success: false, message: 'Scrolling requires a web page.' }
+    const originalUrl = wc.getURL()
+    try {
+      // Fixed packaged code: no selectors, page text or model-authored JavaScript.
+      const delta = data.kind === 'scroll_down' ? 600 : -600
+      const moved = await wc.executeJavaScript(`(() => { const before = window.scrollY; window.scrollBy({ top: ${delta}, behavior: 'instant' }); return window.scrollY !== before })()`)
+      if (activeTabId !== data.tabId || wc.getURL() !== originalUrl) return { success: false, message: 'The active page changed.' }
+      return { success: moved === true, message: moved === true ? 'Page scrolled.' : 'The page did not scroll; it may already be at its edge.' }
+    } catch { return { success: false, message: 'Scrolling is unavailable on this page.' } }
+  }
+  if (data.kind === 'switch') {
+    if (!data.targetTabId || !views.has(data.targetTabId)) return { success: false, message: 'That tab is no longer open.' }
+    switchActiveTab(data.targetTabId)
+    return { success: activeTabId === data.targetTabId, message: 'Switched to the requested tab.' }
+  }
+  if (!['navigate', 'back', 'forward', 'reload'].includes(data.kind)) return { success: false, message: 'Unsupported browser command.' }
+  let destination: URL | undefined
+  if (data.kind === 'navigate') {
+    try {
+      if (!data.url || data.url.length > 2000 || (/[\s\\]/u.test(data.url) || Array.from(data.url).some((char) => char.charCodeAt(0) < 32))) throw new Error()
+      destination = new URL(data.url)
+      if (destination.protocol !== 'https:' || destination.username || destination.password || destination.port ||
+          !destination.hostname.includes('.') || /^(localhost|127\.|0\.|10\.|192\.168\.|169\.254\.|172\.(1[6-9]|2\d|3[01])\.)/i.test(destination.hostname) ||
+          /\.(localhost|local|internal)$/i.test(destination.hostname) ||
+          /\/(?:cart|checkout|payment|buy|order|logout|delete)(?:[/?-]|$)/i.test(destination.pathname)) throw new Error()
+    } catch { return { success: false, message: 'This destination is not allowed for assistant navigation.' } }
+  }
+  const history = wc.navigationHistory
+  if (data.kind === 'back' && !history.canGoBack() || data.kind === 'forward' && !history.canGoForward()) return { success: false, message: 'No page is available in that direction.' }
+  conversationNavigationCancels.get(data.tabId)?.()
+  return await new Promise<{ success: boolean; message: string }>((resolve) => {
+    let settled = false
+    const finish = (success: boolean, message: string) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      conversationNavigationCancels.delete(data.tabId)
+      wc.removeListener('did-finish-load', loaded)
+      wc.removeListener('did-fail-load', failed)
+      resolve({ success, message })
+    }
+    const loaded = () => finish(true, 'Page loaded. What would you like to do here?')
+    const failed = (_event: unknown, _code: number, _description: string, _url: string, isMainFrame: boolean) => { if (isMainFrame) finish(false, 'The page did not load. Please retry or choose another website.') }
+    const timer = setTimeout(() => { finish(false, 'Navigation timed out. Please check the page before retrying.'); wc.stop() }, 30000)
+    conversationNavigationCancels.set(data.tabId, () => finish(false, 'Navigation stopped.'))
+    wc.on('did-finish-load', loaded)
+    wc.on('did-fail-load', failed)
+    if (destination) void wc.loadURL(destination.href).catch(() => finish(false, 'The page did not load.'))
+    else if (data.kind === 'back') history.goBack()
+    else if (data.kind === 'forward') history.goForward()
+    else wc.reload()
+  })
+})
+
 ipcMain.on('browser:navigate', (_event, payload: { url: string; tabId?: string } | string) => {
+  if (!isTrustedUi(_event)) return
   const rawUrl = typeof payload === 'string' ? payload : payload.url
   const targetId = (typeof payload === 'object' && payload.tabId) || activeTabId
   const targetView = views.get(targetId)
   if (!targetView) return
 
+  conversationNavigationCancels.get(targetId)?.()
   const finalUrl = normalizeUrl(rawUrl)
-  console.log(`[WebContentsView:${targetId}] Navigating to: ${finalUrl}`)
+  console.log(`[WebContentsView:${targetId}] Navigating to requested page`)
+  conversationNavigationCancels.get(targetId)?.()
   targetView.webContents.loadURL(finalUrl)
 })
 
 ipcMain.on('browser:go-back', (_event, payload?: { tabId?: string }) => {
+  if (!isTrustedUi(_event)) return
   const targetId = payload?.tabId || activeTabId
   const targetView = views.get(targetId)
   if (!targetView) return
 
   const nav = targetView.webContents.navigationHistory
   if (nav && nav.canGoBack()) {
+    conversationNavigationCancels.get(targetId)?.()
     nav.goBack()
   }
 })
 
 ipcMain.on('browser:go-forward', (_event, payload?: { tabId?: string }) => {
+  if (!isTrustedUi(_event)) return
   const targetId = payload?.tabId || activeTabId
   const targetView = views.get(targetId)
   if (!targetView) return
 
   const nav = targetView.webContents.navigationHistory
   if (nav && nav.canGoForward()) {
+    conversationNavigationCancels.get(targetId)?.()
     nav.goForward()
   }
 })
 
 ipcMain.on('browser:reload', (_event, payload?: { tabId?: string }) => {
+  if (!isTrustedUi(_event)) return
   const targetId = payload?.tabId || activeTabId
   const targetView = views.get(targetId)
   if (targetView) {
+    conversationNavigationCancels.get(targetId)?.()
     targetView.webContents.reload()
   }
 })
 
-ipcMain.handle('browser:demo-focus-search', (_event, tabId?: string) => focusBrowserSearch(tabId))
+ipcMain.handle('browser:demo-focus-search', (_event, tabId?: string) => { assertTrustedUi(_event); return focusBrowserSearch(tabId) })
 ipcMain.handle('browser:demo-type', async (_event, text: string, tabId?: string) => {
+  assertTrustedUi(_event)
   try {
     return await typeBrowserText(text, tabId)
   } catch (error) {
@@ -879,35 +1027,107 @@ ipcMain.handle('browser:demo-type', async (_event, text: string, tabId?: string)
     throw error
   }
 })
-ipcMain.handle('browser:demo-submit-search', (_event, tabId?: string) => submitBrowserSearch(tabId))
-ipcMain.handle('browser:demo-collect-results', (_event, tabId?: string) => collectBrowserResults(tabId))
-ipcMain.handle('browser:demo-open-result', (_event, index: number, tabId?: string) => openBrowserResult(index, tabId))
+ipcMain.handle('browser:demo-submit-search', (_event, tabId?: string) => { assertTrustedUi(_event); return submitBrowserSearch(tabId) })
+ipcMain.handle('browser:demo-collect-results', (_event, tabId?: string) => { assertTrustedUi(_event); return collectBrowserResults(tabId) })
+ipcMain.handle('browser:demo-open-result', (_event, index: number, tabId?: string) => { assertTrustedUi(_event); return openBrowserResult(index, tabId) })
 
 // Secure In-Memory Auth Vault (Keeps tokens safe in main process without leaking to disk/localStorage)
 let secureAuthToken: string | null = null
 
-ipcMain.handle('auth:get-token', () => secureAuthToken)
+ipcMain.handle('auth:get-token', (event) => { assertTrustedUi(event); return secureAuthToken })
 ipcMain.handle('auth:set-token', (_event, token: string) => {
-  secureAuthToken = typeof token === 'string' && token.trim().length > 0 ? token.trim() : null
+  assertTrustedUi(_event)
+  secureAuthToken = typeof token === 'string' && token.trim().length > 0 && token.length <= 8192 && !/[\r\n]/.test(token) ? token.trim() : null
   return true
 })
-ipcMain.handle('auth:clear-token', () => {
+ipcMain.handle('auth:clear-token', (event) => {
+  assertTrustedUi(event)
   secureAuthToken = null
   return true
 })
 
+// Packaged file:// renderers use a trusted native HTTP bridge instead of widening
+// CORS to null origins. Retailer cookies and arbitrary destinations are excluded.
+ipcMain.handle('backend:request', async (event, data: {
+  url: string; method: string; headers: Record<string, string>; body?: string;
+}) => {
+  assertTrustedUi(event)
+  try {
+    const base = new URL(process.env.SHOPPING_BACKEND_URL || 'http://localhost:8000')
+    const requested = new URL(data.url)
+    const target = new URL(requested.pathname + requested.search, base.origin)
+    const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(base.hostname)
+    if (base.protocol !== 'https:' && !(base.protocol === 'http:' && loopback)
+        || base.username || base.password || base.search || base.hash || requested.username || requested.password
+        || ![base.origin, 'http://localhost:8000'].includes(requested.origin) || !target.pathname.startsWith('/v1/')
+        || !['GET', 'POST', 'PATCH', 'DELETE'].includes(data.method)
+        || data.body !== undefined && (typeof data.body !== 'string' || Buffer.byteLength(data.body) > 262144)) {
+      throw new Error('Invalid backend request')
+    }
+    const headers: Record<string, string> = { Accept: 'application/json' }
+    for (const [key, value] of Object.entries(data.headers || {})) {
+      const name = key.toLowerCase()
+      if (['content-type', 'x-event-id', 'x-expected-version'].includes(name) && typeof value === 'string') headers[name] = value
+      if (name === 'authorization' && secureAuthToken) headers.Authorization = `Bearer ${secureAuthToken}`
+    }
+    const response = await fetch(target, { method: data.method, headers, body: data.body,
+      redirect: 'error', credentials: 'omit', signal: AbortSignal.timeout(120000) })
+    const reader = response.body?.getReader()
+    const chunks: Uint8Array[] = []
+    let size = 0
+    if (reader) {
+      try {
+        while (true) {
+          const part = await reader.read()
+          if (part.done) break
+          size += part.value.byteLength
+          if (size > 1048576) throw new Error('Response too large')
+          chunks.push(part.value)
+        }
+      } finally { await reader.cancel().catch(() => undefined) }
+    }
+    const allowedHeaders: Record<string, string> = {}
+    for (const name of ['content-type', 'idempotent-replay', 'x-conversation-version', 'x-request-id']) {
+      const value = response.headers.get(name)
+      if (value) allowedHeaders[name] = value
+    }
+    return { status: response.status, headers: allowedHeaders, body: Buffer.concat(chunks).toString('utf8') }
+  } catch {
+    return { status: 503, headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ error: { code: 'BACKEND_UNAVAILABLE', message: 'The shopping service is unavailable. Check its local setup and retry.' } }) }
+  }
+})
+
 // Safe Snapshot Extraction from Active Chromium WebContentsView
 ipcMain.handle('browser:extract-snapshot', async (_event, tabId?: string) => {
+  assertTrustedUi(_event)
   const targetId = tabId || activeTabId
   const targetView = views.get(targetId)
   if (!targetView || targetView.webContents.isDestroyed()) {
     return { success: false, error: 'No active web view available' }
   }
 
+  const sourceUrl = targetView.webContents.getURL()
+  const parsedSource = new URL(sourceUrl)
+  if (parsedSource.protocol !== 'https:' || !['www.amazon.in', 'amazon.in', 'www.flipkart.com', 'flipkart.com'].includes(parsedSource.hostname)) {
+    return { success: false, error: 'Open a supported Amazon.in or Flipkart product page' }
+  }
+  if (!/\/(?:dp|gp\/product|ASIN)\/[a-z0-9]{10}(?:\/|$)/i.test(parsedSource.pathname)
+      && !/\/p\/itm[a-z0-9]+(?:\/|$)/i.test(parsedSource.pathname)) {
+    return { success: false, error: 'Open an identified product page, not a cart, account or checkout page' }
+  }
+  const version = documentVersions.get(targetId) || 0
+  const documentId = `document-${targetView.webContents.id}-${version}`
   try {
     const rawData = await targetView.webContents.executeJavaScript(`
       (() => {
         try {
+          const clip = (text, limit) => Array.from(text).slice(0, limit).join('');
+          const parsePrice = (value) => {
+            const text = String(value).trim();
+            const match = text.match(/^(?:₹|INR|Rs\\.?)?\\s*((?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,2}(?:,[0-9]{2})*,[0-9]{3})(?:\\.[0-9]{1,2})?)$/i);
+            return match ? match[1].replace(/,/g, '') : null;
+          };
           const url = window.location.href;
           const hostname = window.location.hostname || '';
           const title = (document.title || '').trim();
@@ -934,22 +1154,25 @@ ipcMain.handle('browser:extract-snapshot', async (_event, tabId?: string) => {
 
           let price = null;
           let currency = 'INR';
-          let inStock = true;
+          let inStock = null;
 
           // 1. Try structured JSON-LD (<script type="application/ld+json">)
           const scripts = document.querySelectorAll('script[type="application/ld+json"]');
-          for (const s of scripts) {
+          for (const s of Array.from(scripts).slice(0, 20)) {
             try {
-              const parsed = JSON.parse(s.textContent || '');
+              const source = s.textContent || '';
+              if (source.length > 100000) continue;
+              const parsed = JSON.parse(source);
               const items = Array.isArray(parsed) ? parsed : [parsed];
               for (const item of items) {
                 if (item && (item['@type'] === 'Product' || item['@type'] === 'http://schema.org/Product')) {
-                  const offer = Array.isArray(item.offers) ? item.offers[0] : item.offers;
+                  const offer = Array.isArray(item.offers) ? (item.offers.length === 1 ? item.offers[0] : null) : item.offers;
                   if (offer) {
-                    if (offer.price !== undefined) price = String(offer.price).replace(/[^0-9.]/g, '');
+                    if (offer.price !== undefined) price = parsePrice(offer.price);
                     if (offer.priceCurrency) currency = String(offer.priceCurrency).toUpperCase();
                     if (offer.availability) {
-                      inStock = String(offer.availability).toLowerCase().includes('instock');
+                      const availability = String(offer.availability).toLowerCase();
+                      inStock = (availability === 'instock' || availability.endsWith('/instock')) ? true : (availability === 'outofstock' || availability.endsWith('/outofstock')) ? false : null;
                     }
                   }
                   break;
@@ -962,29 +1185,60 @@ ipcMain.handle('browser:extract-snapshot', async (_event, tabId?: string) => {
           // 2. Fallback to OpenGraph / Product Meta Tags
           if (!price) {
             const priceMeta = document.querySelector('meta[property="product:price:amount"], meta[property="og:price:amount"]');
-            if (priceMeta) price = priceMeta.getAttribute('content')?.replace(/[^0-9.]/g, '') || null;
+            if (priceMeta) price = parsePrice(priceMeta.getAttribute('content') || '');
             const currMeta = document.querySelector('meta[property="product:price:currency"], meta[property="og:price:currency"]');
             if (currMeta) currency = currMeta.getAttribute('content')?.toUpperCase() || 'INR';
           }
 
           // 3. Fallback to DOM elements for known shopping sites
           if (!price && retailer === 'amazon_in') {
-            const amazonPriceElem = document.querySelector('.a-price .a-offscreen, #priceblock_ourprice, #priceblock_dealprice');
+            const amazonPriceElem = document.querySelector('#corePriceDisplay_desktop_feature_div .a-offscreen, #corePrice_feature_div .a-offscreen, #priceblock_ourprice, #priceblock_dealprice');
             if (amazonPriceElem && amazonPriceElem.textContent) {
-              price = amazonPriceElem.textContent.replace(/[^0-9.]/g, '') || null;
+              price = parsePrice(amazonPriceElem.textContent);
             }
           }
 
+          const visiblePriceNode = document.querySelector('#corePriceDisplay_desktop_feature_div .a-offscreen, #corePrice_feature_div .a-offscreen, #priceblock_ourprice, #priceblock_dealprice');
+          const visibleText = visiblePriceNode?.textContent || '';
+          const visiblePrice = parsePrice(visibleText);
+          if (visiblePrice && price && (Number(visiblePrice) !== Number(price) || (visibleText.includes('₹') && currency !== 'INR'))) {
+            price = null; currency = null;
+          }
+          if (!asinMatch && !url.match(/\\/p\\/(itm[a-zA-Z0-9]+)/i)) {
+            return { success: false, error: 'This is not an identified product page' };
+          }
+          const specs = {};
+          for (const row of Array.from(document.querySelectorAll('#productDetails_techSpec_section_1 tr, #productDetails_detailBullets_sections1 tr, #technicalSpecifications_section_1 tr, ._14cfVK tr, ._3k-BhJ tr, table.specification tr')).slice(0, 100)) {
+            const cells = row.querySelectorAll('th, td');
+            if (cells.length < 2) continue;
+            const key = clip((cells[0].innerText || cells[0].textContent || '').trim(), 80);
+            const value = clip((cells[1].innerText || cells[1].textContent || '').trim(), 500);
+            if (key && value && Object.keys(specs).length < 30 && !['__proto__','constructor','prototype'].includes(key)) specs[key] = value;
+          }
+          const reviews = [];
+          let reviewChars = 0;
+          for (const node of Array.from(document.querySelectorAll('[data-hook="review"], ._27M-vq')).slice(0, 30)) {
+            const body = node.querySelector('[data-hook="review-body"], .ZmyHeo');
+            const stars = node.querySelector('[data-hook="review-star-rating"], [data-hook="cmps-review-star-rating"], .XQDdHH');
+            const text = clip((body?.innerText || body?.textContent || '').trim(), 1000);
+            const rating = Number((stars?.textContent || '').trim().match(/^[1-5](?:\\.0)?(?![0-9.])/)?.[0]);
+            if (!text || !Number.isInteger(rating) || rating < 1 || rating > 5) continue;
+            if (reviewChars + text.length > 15000) break;
+            reviewChars += text.length;
+            reviews.push({ review_id: 'review-' + reviews.length, rating, text,
+              verified_purchase_observed: /verified purchase/i.test(node.querySelector('[data-hook="avp-badge"]')?.textContent || '') ? true : null });
+          }
           return {
             success: true,
             snapshot: {
               retailer,
               retailer_product_id: retailerProductId,
-              title: title.slice(0, 500),
+              title: clip(title, 500),
               url,
               price: price || '0.00',
               currency,
-              availability: inStock ? 'in_stock' : 'out_of_stock',
+              availability: inStock === true ? 'in_stock' : inStock === false ? 'out_of_stock' : 'unknown',
+              specs, reviews,
               captured_at: new Date().toISOString()
             }
           };
@@ -994,13 +1248,78 @@ ipcMain.handle('browser:extract-snapshot', async (_event, tabId?: string) => {
       })()
     `, true)
 
+    if (targetView.webContents.isDestroyed() || targetView.webContents.getURL() !== sourceUrl || (documentVersions.get(targetId) || 0) !== version) {
+      return { success: false, error: 'The page changed while reading; capture it again' }
+    }
+    if (rawData?.snapshot) rawData.snapshot.document_id = documentId
     return rawData
   } catch (error) {
     return { success: false, error: String(error) }
   }
 })
 
+ipcMain.handle('browser:analysis-skill', async (event, data: {
+  skill: string; document_id: string; source_url: string; spec_key?: string | null;
+  review_id?: string | null; expected_text: string;
+}) => {
+  assertTrustedUi(event)
+  if (!data || !['highlight_spec', 'scroll_to_reviews'].includes(data.skill)
+      || typeof data.expected_text !== 'string' || !data.expected_text || Array.from(data.expected_text).length > 500
+      || typeof data.spec_key === 'string' && Array.from(data.spec_key).length > 80
+      || typeof data.review_id === 'string' && !/^review-\d{1,2}$/.test(data.review_id)) {
+    return { success: false, error: 'Unsupported page action' }
+  }
+  const view = views.get(activeTabId)
+  if (!view || view.webContents.isDestroyed() || !mainWindow?.isFocused()) return { success: false, error: 'Bring the product tab to the foreground' }
+  const expectedDocument = `document-${view.webContents.id}-${documentVersions.get(activeTabId) || 0}`
+  const currentUrl = view.webContents.getURL()
+  let source: URL
+  try { source = new URL(currentUrl) } catch { return { success: false, error: 'No product page' } }
+  if (expectedDocument !== data.document_id || currentUrl !== data.source_url || source.protocol !== 'https:'
+      || !['amazon.in', 'www.amazon.in', 'flipkart.com', 'www.flipkart.com'].includes(source.hostname)) {
+    return { success: false, error: 'Page changed. Capture fresh evidence before continuing.' }
+  }
+  const args = { skill: data.skill, spec_key: data.spec_key, review_id: data.review_id, expected_text: data.expected_text }
+  try {
+    return await view.webContents.executeJavaScript(`(() => {
+      const args = ${JSON.stringify(args)};
+      const clip = (text, limit) => Array.from(text).slice(0, limit).join('');
+      let target = null;
+      if (args.skill === 'highlight_spec') {
+        for (const row of Array.from(document.querySelectorAll('#productDetails_techSpec_section_1 tr, #productDetails_detailBullets_sections1 tr, #technicalSpecifications_section_1 tr, ._14cfVK tr, ._3k-BhJ tr, table.specification tr')).slice(0, 100)) {
+          const cells = row.querySelectorAll('th, td');
+          if (cells.length < 2) continue;
+          const key = clip((cells[0].innerText || cells[0].textContent || '').trim(), 80);
+          const value = clip((cells[1].innerText || cells[1].textContent || '').trim(), 500);
+          if (key === args.spec_key && value === args.expected_text) { target = row; break; }
+        }
+      } else {
+        let index = 0;
+        for (const node of Array.from(document.querySelectorAll('[data-hook="review"], ._27M-vq')).slice(0, 30)) {
+          const body = node.querySelector('[data-hook="review-body"], .ZmyHeo');
+          const stars = node.querySelector('[data-hook="review-star-rating"], [data-hook="cmps-review-star-rating"], .XQDdHH');
+          const text = clip((body?.innerText || body?.textContent || '').trim(), 1000);
+          const rating = Number((stars?.textContent || '').trim().match(/^[1-5](?:\\.0)?(?![0-9.])/)?.[0]);
+          if (!text || !Number.isInteger(rating) || rating < 1 || rating > 5) continue;
+          if ('review-' + index === args.review_id && text.includes(args.expected_text)) { target = node; break; }
+          index++;
+        }
+      }
+      if (!target || !target.getClientRects().length) return { success: false, error: 'Evidence no longer matches the visible page' };
+      target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      const previous = target.style.outline;
+      target.style.outline = '3px solid #22d3ee';
+      setTimeout(() => { target.style.outline = previous; }, 2500);
+      return { success: true };
+    })()`, true)
+  } catch { return { success: false, error: 'Page highlighting is unavailable; the text evidence is still shown' } }
+})
+
 app.whenReady().then(() => {
+  const permittedMedia = (contents: Electron.WebContents | null, permission: string) =>
+    permission === 'media' && !!mainWindow && mainWindow.isFocused() && contents === mainWindow.webContents
+  session.defaultSession.setPermissionCheckHandler((contents, permission) => permittedMedia(contents, permission))
+  session.defaultSession.setPermissionRequestHandler((contents, permission, callback) => callback(permittedMedia(contents, permission)))
   createWindow()
 
   app.on('activate', () => {

@@ -1,16 +1,52 @@
 """Optional core runtime composition. All providers are owned by app lifespan."""
 
+import asyncio
 from contextlib import AsyncExitStack, asynccontextmanager
+from contextvars import ContextVar
 from urllib.parse import urlsplit
 
 from shopping_ai.config import AIConfig
 from shopping_ai.intents import BasicInterpreter
 from shopping_ai.market import Store
 from shopping_ai.market_dialogue import OfflineDetailInterpreter
+from shopping_ai.providers.base import ProviderError
 from shopping_ai.providers.chat import ChatProvider, ChatSettings
 from shopping_ai.providers.mock import MockProvider
 from shopping_ai.providers.speech import AudioService, SpeechProvider, SpeechSettings
 from shopping_ai.runtime import create_runtime
+
+inference_fallback = ContextVar("inference_fallback", default=None)
+
+
+class LocalFirstProvider:
+    """Inference-only degradation; fallback never dispatches or executes an action."""
+
+    name = "local_first"
+
+    def __init__(
+        self, local, decisions, interpreter, details, *, timeout, fallback_kind="deterministic"
+    ):
+        self.local = local
+        self.decisions, self.interpreter, self.details = decisions, interpreter, details
+        self.timeout = timeout
+        self.fallback_kind = fallback_kind
+
+    async def _call(self, operation, fallback, *args):
+        try:
+            async with asyncio.timeout(self.timeout):
+                return await getattr(self.local, operation)(*args)
+        except (ProviderError, TimeoutError):
+            inference_fallback.set(self.fallback_kind)
+            return await getattr(fallback, operation)(*args)
+
+    async def decide(self, context):
+        return await self._call("decide", self.decisions, context)
+
+    async def interpret(self, message, awaiting):
+        return await self._call("interpret", self.interpreter, message, awaiting)
+
+    async def extract(self, message, draft):
+        return await self._call("extract", self.details, message, draft)
 
 
 @asynccontextmanager
@@ -42,7 +78,9 @@ async def configured_runtime(settings):
             BasicInterpreter(),
             OfflineDetailInterpreter(),
         )
-        if settings.AI_RUNTIME_PROVIDER == "chat":
+        if settings.AI_RUNTIME_PROVIDER == "chat" or (
+            settings.AI_RUNTIME_PROVIDER == "local" and settings.AI_LOCAL_FALLBACK == "cloud"
+        ):
             decisions = await stack.enter_async_context(
                 ChatProvider(
                     ChatSettings(
@@ -52,6 +90,29 @@ async def configured_runtime(settings):
                     ),
                     config,
                 )
+            )
+            interpreter = details = decisions
+        if settings.AI_RUNTIME_PROVIDER == "local":
+            local = await stack.enter_async_context(
+                ChatProvider(
+                    ChatSettings(
+                        local_only=True,
+                        endpoint=settings.AI_LOCAL_ENDPOINT,
+                        model=settings.AI_LOCAL_MODEL,
+                        token_parameter="max_tokens",
+                    ),
+                    config.model_copy(
+                        update={"timeout_seconds": float(settings.AI_LOCAL_TIMEOUT_SECONDS)}
+                    ),
+                )
+            )
+            decisions = LocalFirstProvider(
+                local,
+                decisions,
+                interpreter,
+                details,
+                timeout=settings.AI_LOCAL_TIMEOUT_SECONDS,
+                fallback_kind=settings.AI_LOCAL_FALLBACK,
             )
             interpreter = details = decisions
         speech = None

@@ -7,6 +7,7 @@
  */
 
 import type {
+  AnalysisProduct, ShoppingAnalysis,
   ClaimedRuntimeWork, RuntimeCapabilities, RuntimeConfirmation, RuntimeEvent, RuntimeReceipt, RuntimeReply,
   RuntimeTarget, RuntimeWork,
 } from '../types/assistant'
@@ -184,6 +185,17 @@ export const defaultTokenProvider: TokenProvider = {
   },
 }
 
+export const desktopFetch: typeof fetch = async (input, init) => {
+  if (typeof window !== 'undefined' && window.electronAPI?.requestBackend &&
+      (init?.body === undefined || typeof init.body === 'string')) {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+    const result = await window.electronAPI.requestBackend({ url, method: init?.method || 'GET',
+      headers: Object.fromEntries(new Headers(init?.headers)), body: init?.body as string | undefined })
+    return new Response(result.status === 204 ? null : result.body, { status: result.status, headers: result.headers })
+  }
+  return fetch(input, init)
+}
+
 export class ShoppingApiClient {
   public readonly baseUrl: string
   private readonly fetchFn: typeof fetch
@@ -192,7 +204,7 @@ export class ShoppingApiClient {
 
   constructor(config: ApiClientConfig = {}) {
     this.baseUrl = (config.baseUrl || 'http://localhost:8000').replace(/\/+$/, '')
-    this.fetchFn = config.customFetch || (typeof fetch !== 'undefined' ? fetch.bind(globalThis) : (undefined as unknown as typeof fetch))
+    this.fetchFn = config.customFetch || desktopFetch
     this.tokenProvider = config.tokenProvider || defaultTokenProvider
     this.allowAnonymousRegistration = config.allowAnonymousRegistration ?? true
   }
@@ -226,7 +238,8 @@ export class ShoppingApiClient {
         } catch {
           detail = await response.text()
         }
-        throw new AuthError(`Registration failed with status ${response.status}`, detail)
+        if (response.status >= 500) throw new NetworkError('The shopping service is unavailable. Start it and retry.')
+        throw new AuthError('Sign in or account setup is required.', detail)
       }
 
       const data = (await response.json()) as RegisterResponse
@@ -237,8 +250,8 @@ export class ShoppingApiClient {
       await this.tokenProvider.set(data.access_token)
       return data.access_token
     } catch (err) {
-      if (err instanceof ApiError) throw err
-      throw new NetworkError(`Failed to connect to authentication endpoint: ${String(err)}`, err)
+      if (err instanceof ApiError || err instanceof NetworkError) throw err
+      throw new NetworkError('The shopping service could not be reached. Check its setup and retry.', err)
     }
   }
 
@@ -355,7 +368,7 @@ export class ShoppingApiClient {
         body: options.body,
       })
     } catch (err) {
-      throw new NetworkError(`Network connection error calling ${path}: ${String(err)}`, err)
+      throw new NetworkError('The shopping service could not be reached. Please retry.', err)
     }
 
     if (!response.ok) {
@@ -373,15 +386,20 @@ export class ShoppingApiClient {
       if (response.status === 401) {
         // Clear cached token if server rejects it
         await this.tokenProvider.clear()
-        throw new AuthError(`Authentication failed: HTTP ${response.status}`, detail)
+        throw new AuthError('Please sign in again.', detail)
       }
       if (response.status === 404) {
-        throw new NotFoundError(`Endpoint or resource not found: ${path}`, detail)
+        throw new NotFoundError('The requested shopping feature or item is unavailable.', detail)
       }
       if (response.status === 429) {
         throw new RateLimitError('Rate limit exceeded', detail)
       }
-      throw new ApiError(`Request to ${path} failed with HTTP ${response.status}`, response.status, detail)
+      const envelope = detail as { error?: { message?: unknown; code?: unknown } } | null
+      const message = typeof envelope?.error?.message === 'string' && envelope.error.message.length <= 300
+        ? envelope.error.message : 'The shopping request could not be completed. Please retry.'
+      const code = typeof envelope?.error?.code === 'string' ? envelope.error.code : undefined
+      if (code === 'BACKEND_UNAVAILABLE') throw new NetworkError(message)
+      throw new ApiError(message, response.status, detail, code)
     }
 
     return response
@@ -403,6 +421,19 @@ export class ShoppingApiClient {
 
   async getAiCapabilities(): Promise<RuntimeCapabilities> {
     return this.runtimeJson('/v1/ai/capabilities', 'GET')
+  }
+
+  async analyzeShopping(question: string, products: AnalysisProduct[], options: {
+    budget?: string; selected_product_id?: string; currency?: string; required_specs?: Record<string, string>; language?: 'en' | 'hi-Latn'
+  } = {}): Promise<ShoppingAnalysis> {
+    if (!question.trim() || question.length > 2000 || products.length > 4) {
+      throw new ApiError('Enter a question and at most four captured products', 422)
+    }
+    const payload = { question, products, ...options }
+    if (new Blob([JSON.stringify(payload)]).size > 262144) {
+      throw new ApiError('The captures are too large. Clear previous products and capture fewer details.', 413)
+    }
+    return this.runtimeJson('/v1/ai/analysis', 'POST', payload)
   }
 
   async startAiConversation(sessionId: string, language: 'en' | 'hi-Latn' = 'hi-Latn'): Promise<RuntimeReply> {

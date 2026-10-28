@@ -8,7 +8,7 @@ from app.schemas.common import BaseSchema
 
 
 class ReviewItemInput(BaseSchema):
-    rating: int = Field(..., ge=1, le=5)
+    rating: int = Field(..., strict=True, ge=1, le=5)
     title: Optional[str] = Field(None, max_length=500)
     text: str
     reviewed_at: Optional[datetime] = None

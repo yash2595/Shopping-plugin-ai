@@ -7,10 +7,6 @@ import uuid
 from datetime import timedelta
 from urllib.parse import urlsplit
 
-from app.repositories.ai_checkpoint_repo import AICheckpointRepository
-from app.repositories.runtime_repo import RuntimeRepository, utcnow
-from app.repositories.usage_repo import UsageRepository
-from app.schemas.runtime import PublicReply
 from fastapi import HTTPException
 from shopping_ai.browser import BrowserResult
 from shopping_ai.checkpoint import SCHEMA_VERSION, CheckpointError, load_checkpoint
@@ -31,6 +27,12 @@ from shopping_ai.runtime import (
     TextEvent,
 )
 from shopping_ai.voice import AudioClip, VoiceTurn
+
+from app.ai.runtime import inference_fallback
+from app.repositories.ai_checkpoint_repo import AICheckpointRepository
+from app.repositories.runtime_repo import RuntimeRepository, utcnow
+from app.repositories.usage_repo import UsageRepository
+from app.schemas.runtime import PublicReply
 
 
 def reject(code, status=409):
@@ -119,7 +121,7 @@ class RuntimeService:
         return origin
 
     def tools(self):
-        if self.settings.AI_MUTATIONS_ENABLED:
+        if self.settings.AI_MUTATIONS_ENABLED and not self.settings.AI_ANALYSIS_ONLY:
             return ("read_product", "read_cart", "select_variant", "add_to_cart")
         return ("read_product", "read_cart")
 
@@ -146,6 +148,7 @@ class RuntimeService:
             work_ids=tuple(work),
             origin=origin,
             speech_available=self.runtime.voice is not None,
+            inference_fallback=inference_fallback.get(),
         ).model_dump(mode="json")
 
     def proposals(self, reply):
@@ -307,6 +310,7 @@ class RuntimeService:
                 db.rollback()
                 reject("RATE_LIMITED", 429)
         db.commit()
+        trace_token = inference_fallback.set(None)
         try:
             async with asyncio.timeout(self.settings.AI_RUNTIME_TIMEOUT_SECONDS):
                 output = await self.runtime.handle(
@@ -376,9 +380,11 @@ class RuntimeService:
             )
             db.commit()
             reject("RUNTIME_UNAVAILABLE", 503)
+        finally:
+            inference_fallback.reset(trace_token)
 
     def confirm(self, state, data, origin):
-        if not self.settings.AI_MUTATIONS_ENABLED:
+        if self.settings.AI_ANALYSIS_ONLY or not self.settings.AI_MUTATIONS_ENABLED:
             reject("MUTATIONS_DISABLED", 403)
         product = next(
             (
@@ -551,7 +557,7 @@ class RuntimeService:
         if (
             item.kind == "browser"
             and item.payload["work"]["tool"]["name"] in {"select_variant", "add_to_cart"}
-            and not self.settings.AI_MUTATIONS_ENABLED
+            and (self.settings.AI_ANALYSIS_ONLY or not self.settings.AI_MUTATIONS_ENABLED)
         ):
             reject("MUTATIONS_DISABLED", 403)
         if item.deadline_at <= utcnow() or item.status not in {"pending", "claimed"}:

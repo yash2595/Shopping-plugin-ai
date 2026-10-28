@@ -85,3 +85,5 @@ jobs:
         working-directory: frontend
       - run: npm run build:electron
         working-directory: frontend
+      - run: npm exec tsc -- -p electron/tsconfig.json --noEmit
+        working-directory: frontend

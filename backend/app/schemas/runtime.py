@@ -21,7 +21,9 @@ class RuntimeLimits(Contract):
 
 
 class Capabilities(Contract):
-    provider: Literal["mock", "chat"]
+    provider: Literal["mock", "chat", "local"]
+    analysis_only: bool
+    local_fallback: Literal["deterministic", "cloud"] | None
     authentication: Literal["anonymous", "oidc"]
     mutations_enabled: bool
     browser_origins: list[str]
@@ -115,6 +117,7 @@ class SpeechRequest(Contract):
 
 
 class PublicReply(Contract):
+    inference_fallback: Literal["deterministic", "cloud"] | None = None
     conversation_id: Identifier
     session_id: uuid.UUID
     version: Version

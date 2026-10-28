@@ -4,6 +4,35 @@
  * from the active browser page without exposing privileged Electron APIs.
  */
 
+import type { AnalysisProduct, ShoppingAnalysis } from '../types/assistant'
+
+export function rawCaptureFallback(capture: AnalysisProduct, now = Date.now()): ShoppingAnalysis {
+  const p = capture.product
+  const result: ShoppingAnalysis = {
+    status: 'needs_input', processing: 'local_capture_fallback',
+    answer: 'The shopping service is unavailable. These are captured page details; your question has not been analyzed.',
+    evidence: [], comparison: [], shortlist: [], lowest_observed_price_product_id: null,
+    review_sample_size: 0, review_match_count: 0,
+    coverage: 'Current page capture only. No recommendation, review consensus or checkout action.',
+    warnings: ['LOCAL_CAPTURE_FALLBACK'], follow_up: 'Retry your question when the service is available.', skills: [],
+  }
+  let source: URL
+  try { source = new URL(capture.source_url) } catch { return result }
+  const age = now - Date.parse(p.observed_at)
+  if (source.protocol !== 'https:' || source.username || source.password ||
+      !['www.amazon.in', 'amazon.in', 'www.flipkart.com', 'flipkart.com'].includes(source.hostname) ||
+      !Number.isFinite(age) || age < 0 || age > 120000) return result
+  const facts: [string, string, string][] = [['title', 'title', p.title]]
+  if (p.price !== null && p.currency) facts.push(['price', 'price', `${p.currency} ${p.price}`])
+  if (p.in_stock !== null) facts.push(['stock', 'stock', p.in_stock ? 'in stock' : 'out of stock'])
+  for (const [key, value] of Object.entries(p.specs).slice(0, 30)) facts.push(['spec', key, value])
+  result.evidence = facts.map(([kind, label, value], index) => ({ evidence_id: `raw-${index}`,
+    product_id: p.product_id, product_title: p.title, snapshot_id: p.snapshot_id, document_id: p.document_id,
+    source_url: capture.source_url, observed_at: p.observed_at, kind, label, value,
+    review_id: null, rating: null, verified_purchase_observed: null }))
+  return result
+}
+
 export interface ExtractedSnapshot {
   retailer: string
   retailer_product_id: string

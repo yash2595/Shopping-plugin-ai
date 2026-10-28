@@ -2,6 +2,10 @@ import decimal
 import uuid
 from unittest.mock import MagicMock
 
+from fastapi.testclient import TestClient
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
 from app.ai.contracts import (
     AIProvider,
     AIRequest,
@@ -12,9 +16,6 @@ from app.deps import get_ai_provider
 from app.models.alert import PriceAlert
 from app.models.product import Listing
 from app.services.auth_service import AuthService
-from fastapi.testclient import TestClient
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 
 
 def test_mock_answer_path(client: TestClient, auth_headers: dict[str, str]):
@@ -55,6 +56,27 @@ def test_mock_answer_path(client: TestClient, auth_headers: dict[str, str]):
     assert "2500.00" in reply["content"]
 
 
+def test_legacy_provider_cannot_claim_stock_warranty_or_unobserved_cart_success(
+    client, auth_headers
+):
+    class MaliciousProvider:
+        def decide(self, request):
+            return Answer(
+                text="Added to cart successfully. It is in stock, costs $99999 and has lifetime warranty."
+            )
+
+    client.app.dependency_overrides[get_ai_provider] = lambda: MaliciousProvider()
+    session_id = client.post("/v1/sessions", json={}, headers=auth_headers).json()["id"]
+    result = client.post(
+        f"/v1/sessions/{session_id}/messages",
+        headers=auth_headers,
+        json={"text": "tell me about this", "request_id": uuid.uuid4().hex},
+    )
+    assert result.status_code == 200
+    content = result.json()["content"].lower()
+    assert not any(claim in content for claim in ("added", "in stock", "$99999", "warranty"))
+
+
 def test_clarification_path(client: TestClient, auth_headers: dict[str, str]):
     sess_resp = client.post("/v1/sessions", json={"title": "Alert Setup"}, headers=auth_headers)
     session_id = sess_resp.json()["id"]
@@ -80,7 +102,9 @@ def test_tool_proposal_creates_exactly_one_alert_and_replays_idempotently(
     auth_headers: dict[str, str],
     db_session: Session,
 ):
-    sess_resp = client.post("/v1/sessions", json={"title": "Alert Automation"}, headers=auth_headers)
+    sess_resp = client.post(
+        "/v1/sessions", json={"title": "Alert Automation"}, headers=auth_headers
+    )
     session_id = sess_resp.json()["id"]
 
     # Snapshot at 3500.00
@@ -118,7 +142,9 @@ def test_tool_proposal_creates_exactly_one_alert_and_replays_idempotently(
 
     # Verify DB has exactly 1 alert
     alerts_in_db = list(
-        db_session.scalars(select(PriceAlert).where(PriceAlert.listing_id == uuid.UUID(listing_id))).all()
+        db_session.scalars(
+            select(PriceAlert).where(PriceAlert.listing_id == uuid.UUID(listing_id))
+        ).all()
     )
     assert len(alerts_in_db) == 1
     assert str(alerts_in_db[0].id) == created_alert_id
@@ -133,7 +159,9 @@ def test_tool_proposal_creates_exactly_one_alert_and_replays_idempotently(
 
     # Verify tool did NOT run again: still exactly 1 alert
     alerts_after_replay = list(
-        db_session.scalars(select(PriceAlert).where(PriceAlert.listing_id == uuid.UUID(listing_id))).all()
+        db_session.scalars(
+            select(PriceAlert).where(PriceAlert.listing_id == uuid.UUID(listing_id))
+        ).all()
     )
     assert len(alerts_after_replay) == 1
 
@@ -178,7 +206,11 @@ def test_policy_rejects_target_greater_than_or_equal_to_current_price(
     assert "must be below the current price" in data["content"].lower()
 
     # Verify no alert was created
-    alerts = list(db_session.scalars(select(PriceAlert).where(PriceAlert.listing_id == uuid.UUID(listing_id))).all())
+    alerts = list(
+        db_session.scalars(
+            select(PriceAlert).where(PriceAlert.listing_id == uuid.UUID(listing_id))
+        ).all()
+    )
     assert len(alerts) == 0
 
 
@@ -195,6 +227,7 @@ def test_policy_rejects_21st_alert(
     assert user_resp.status_code == 200
 
     from app.services.auth_service import AuthService
+
     auth_s = AuthService()
     token = auth_headers["Authorization"].split(" ")[1]
     user = auth_s.authenticate_token(db_session, token)
@@ -255,7 +288,9 @@ def test_provider_error_returns_fallback_reply(
     client: TestClient,
     auth_headers: dict[str, str],
 ):
-    sess_resp = client.post("/v1/sessions", json={"title": "Error Resilience"}, headers=auth_headers)
+    sess_resp = client.post(
+        "/v1/sessions", json={"title": "Error Resilience"}, headers=auth_headers
+    )
     session_id = sess_resp.json()["id"]
 
     # "crash" triggers MockProvider to raise AIProviderError
@@ -281,6 +316,7 @@ def test_provider_timeout_returns_fallback_reply_http_200(
     import time
 
     from app.config import get_settings
+
     settings = get_settings()
     # Set short timeout for test
     monkeypatch.setattr(settings, "AI_TIMEOUT_SECONDS", 0.05)
@@ -294,7 +330,9 @@ def test_provider_timeout_returns_fallback_reply_http_200(
     target_app.dependency_overrides[get_ai_provider] = lambda: HangingProvider()
 
     try:
-        sess_resp = client.post("/v1/sessions", json={"title": "Timeout Resilience"}, headers=auth_headers)
+        sess_resp = client.post(
+            "/v1/sessions", json={"title": "Timeout Resilience"}, headers=auth_headers
+        )
         session_id = sess_resp.json()["id"]
 
         resp = client.post(
@@ -391,7 +429,9 @@ def test_another_user_snapshot_id_returns_404(
     user2_token, _ = auth_s.register_anonymous_user(db_session)
     user2_headers = {"Authorization": f"Bearer {user2_token}"}
 
-    sess2_resp = client.post("/v1/sessions", json={"title": "User 2 Session"}, headers=user2_headers)
+    sess2_resp = client.post(
+        "/v1/sessions", json={"title": "User 2 Session"}, headers=user2_headers
+    )
     session2_id = sess2_resp.json()["id"]
 
     # User 2 attempts to use User 1's snapshot_id
@@ -411,6 +451,7 @@ def test_another_user_snapshot_id_returns_404(
 
 def test_gemini_provider_structured_json_with_mocked_client():
     from app.ai.gemini import GeminiProvider
+
     mock_genai_client = MagicMock()
     mock_models = MagicMock()
     mock_genai_client.models = mock_models

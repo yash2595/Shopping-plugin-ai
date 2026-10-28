@@ -18,6 +18,52 @@ from shopping_ai.providers.chat import ChatProvider, ChatSettings
 httpx = pytest.importorskip("httpx")
 
 
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "http://example.test:11434/v1/chat/completions",
+        "http://127.0.0.1:8080/v1/chat/completions",
+        "https://127.0.0.1:11434/v1/chat/completions",
+        "http://127.0.0.1:11434/api/chat",
+        "http://127.0.0.1:11434/v1/chat/completions?redirect=1",
+        "http://user:pass@127.0.0.1:11434/v1/chat/completions",
+        "http://127.0.0.1.attacker.test:11434/v1/chat/completions",
+    ],
+)
+def test_local_transport_rejects_non_ollama_targets(endpoint):
+    with pytest.raises(ValueError, match="loopback Ollama"):
+        ChatSettings(local_only=True, endpoint=endpoint, model="local-model")
+
+
+def test_local_ollama_transport_never_sends_cloud_key_and_uses_max_tokens():
+    endpoint = "http://127.0.0.1:11434/v1/chat/completions"
+    with pytest.raises(ValueError, match="cloud credentials"):
+        ChatSettings(local_only=True, endpoint=endpoint, model="local", api_key="secret")
+    with pytest.raises(ValueError, match="HTTPS"):
+        ChatSettings(endpoint=endpoint, model="local")
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        assert "authorization" not in request.headers
+        assert str(request.url) == endpoint
+        body = json.loads(request.content)
+        assert body["max_tokens"] == 1000
+        assert "max_completion_tokens" not in body
+        return httpx.Response(200, json=completion({"intent": "greeting"}))
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            settings = ChatSettings(
+                local_only=True, endpoint=endpoint, model="local", token_parameter="max_tokens"
+            )
+            async with ChatProvider(settings, client=client) as model:
+                assert (await model.interpret("hello", None)).intent == "greeting"
+
+    asyncio.run(scenario())
+    assert len(calls) == 1
+
+
 def settings(**updates):
     return ChatSettings.model_validate(
         dict(

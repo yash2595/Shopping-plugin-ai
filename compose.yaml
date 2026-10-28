@@ -25,9 +25,10 @@ services:
       AI_RUNTIME_PROVIDER: mock
       AI_PROVIDER: mock
       AI_MUTATIONS_ENABLED: "false"
+      AI_ANALYSIS_ONLY: "true"
       AUTH_MODE: anonymous
       CORS_ALLOWED_ORIGINS: '["http://localhost:5173","http://127.0.0.1:5173"]'
-      AI_BROWSER_ORIGINS: '["https://demo.shop.test"]'
+      AI_BROWSER_ORIGINS: '["https://demo.shop.test","https://www.amazon.in","https://amazon.in","https://www.flipkart.com","https://flipkart.com"]'
     command: ["python", "-m", "alembic", "upgrade", "head"]
     depends_on:
       database:
@@ -53,12 +54,16 @@ services:
   worker:
     image: shopping-ai-local:latest
     environment: *backend-environment
-    command: ["python", "-m", "app.ai.worker", "--interval", "2", "--limit", "20"]
+    command: ["python", "-m", "app.ai.worker", "--interval", "2", "--limit", "20", "--heartbeat-file", "/tmp/shopping-ai-worker-heartbeat"]
     depends_on:
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      disable: true
+      test: ["CMD", "python", "-c", "import time; from pathlib import Path; p=Path('/tmp/shopping-ai-worker-heartbeat'); assert p.exists() and 0 <= time.time()-p.stat().st_mtime < 30"]
+      interval: 5s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
     read_only: true
     tmpfs: [/tmp]
     cap_drop: [ALL]

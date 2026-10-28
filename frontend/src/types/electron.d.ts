@@ -38,6 +38,7 @@ export interface OrbOverlayBounds {
 }
 
 export interface ElectronAPI {
+  conversationNavigation: (data: { kind: 'navigate' | 'back' | 'forward' | 'reload' | 'stop' | 'switch' | 'scroll_down' | 'scroll_up' | 'open_result'; tabId: string; expectedUrl: string; url?: string; targetTabId?: string; index?: number }) => Promise<{ success: boolean; message: string }>
   navigate: (url: string, tabId?: string) => void
   goBack: (tabId?: string) => void
   goForward: (tabId?: string) => void
@@ -79,9 +80,15 @@ export interface ElectronAPI {
       currency: string
       availability: string
       captured_at: string
+        document_id: string
+        specs: Record<string, string>
+        reviews: { review_id: string; rating: number; text: string; verified_purchase_observed: boolean | null }[]
     }
     error?: string
   }>
+    requestBackend: (data: { url: string; method: string; headers: Record<string, string>; body?: string }) => Promise<{ status: number; headers: Record<string, string>; body: string }>
+    showAnalysisEvidence: (data: { skill: string; document_id: string; source_url: string;
+      spec_key?: string | null; review_id?: string | null; expected_text: string }) => Promise<{ success: boolean; error?: string }>
 }
 
 declare global {

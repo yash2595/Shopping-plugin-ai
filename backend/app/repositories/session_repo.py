@@ -1,14 +1,26 @@
 import uuid
 from typing import Optional
 
-from app.models.session import Message
-from app.models.session import Session as ChatSession
 from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session, selectinload
 
+from app.models.session import Message
+from app.models.session import Session as ChatSession
+
 
 class SessionRepository:
+    def lock_request(self, db: Session, request: Message) -> Optional[Message]:
+        return db.scalar(
+            select(Message)
+            .where(
+                Message.id == request.id,
+                Message.user_id == request.user_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+
     def claim_request(
         self,
         db: Session,

@@ -1154,6 +1154,133 @@
         }
       }
     },
+    "/v1/ai/analysis": {
+      "post": {
+        "tags": [
+          "AI runtime"
+        ],
+        "summary": "Shopping Analysis",
+        "description": "Extract first; optional model may select fact IDs, never prose or actions.",
+        "operationId": "shopping_analysis_v1_ai_analysis_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AnalysisRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalysisReply"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request Entity Too Large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported Media Type",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Entity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too Many Requests",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
     "/v1/ai/capabilities": {
       "get": {
         "tags": [
@@ -2924,6 +3051,470 @@
         ],
         "title": "AlertUpdate"
       },
+      "AnalysisEvidence": {
+        "properties": {
+          "evidence_id": {
+            "type": "string",
+            "title": "Evidence Id"
+          },
+          "product_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_.:-]+$",
+            "title": "Product Id"
+          },
+          "product_title": {
+            "type": "string",
+            "maxLength": 500,
+            "minLength": 1,
+            "title": "Product Title"
+          },
+          "snapshot_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_.:-]+$",
+            "title": "Snapshot Id"
+          },
+          "document_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_.:-]+$",
+            "title": "Document Id"
+          },
+          "source_url": {
+            "type": "string",
+            "title": "Source Url"
+          },
+          "observed_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Observed At"
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "spec",
+              "price",
+              "stock",
+              "review",
+              "title"
+            ],
+            "title": "Kind"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "value": {
+            "type": "string",
+            "title": "Value"
+          },
+          "review_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1,
+                "pattern": "^[a-zA-Z0-9_.:-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Review Id"
+          },
+          "rating": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Rating"
+          },
+          "verified_purchase_observed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verified Purchase Observed"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "evidence_id",
+          "product_id",
+          "product_title",
+          "snapshot_id",
+          "document_id",
+          "source_url",
+          "observed_at",
+          "kind",
+          "label",
+          "value"
+        ],
+        "title": "AnalysisEvidence"
+      },
+      "AnalysisProduct": {
+        "properties": {
+          "product": {
+            "$ref": "#/components/schemas/ProductSnapshot-Input"
+          },
+          "source_url": {
+            "type": "string",
+            "maxLength": 2000,
+            "title": "Source Url"
+          },
+          "reviews": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewObservation"
+            },
+            "type": "array",
+            "maxItems": 30,
+            "title": "Reviews",
+            "default": []
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "product",
+          "source_url"
+        ],
+        "title": "AnalysisProduct"
+      },
+      "AnalysisReply": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "answered",
+              "needs_input",
+              "no_evidence"
+            ],
+            "title": "Status"
+          },
+          "answer": {
+            "type": "string",
+            "title": "Answer"
+          },
+          "evidence": {
+            "items": {
+              "$ref": "#/components/schemas/AnalysisEvidence"
+            },
+            "type": "array",
+            "title": "Evidence",
+            "default": []
+          },
+          "comparison": {
+            "items": {
+              "$ref": "#/components/schemas/AnalysisRow"
+            },
+            "type": "array",
+            "title": "Comparison",
+            "default": []
+          },
+          "shortlist": {
+            "items": {
+              "type": "string",
+              "maxLength": 100,
+              "minLength": 1,
+              "pattern": "^[a-zA-Z0-9_.:-]+$"
+            },
+            "type": "array",
+            "title": "Shortlist",
+            "default": []
+          },
+          "lowest_observed_price_product_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1,
+                "pattern": "^[a-zA-Z0-9_.:-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lowest Observed Price Product Id"
+          },
+          "review_sample_size": {
+            "type": "integer",
+            "title": "Review Sample Size",
+            "default": 0
+          },
+          "review_match_count": {
+            "type": "integer",
+            "title": "Review Match Count",
+            "default": 0
+          },
+          "coverage": {
+            "type": "string",
+            "title": "Coverage",
+            "default": "Only supplied observations; not all products or all customer reviews."
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Warnings",
+            "default": []
+          },
+          "follow_up": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Follow Up"
+          },
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/AnalysisSkill"
+            },
+            "type": "array",
+            "title": "Skills",
+            "default": []
+          },
+          "processing": {
+            "type": "string",
+            "enum": [
+              "local_extractive",
+              "grounded_model_selection"
+            ],
+            "title": "Processing",
+            "default": "local_extractive"
+          },
+          "inference_fallback": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "deterministic",
+                  "cloud"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inference Fallback"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "status",
+          "answer"
+        ],
+        "title": "AnalysisReply"
+      },
+      "AnalysisRequest": {
+        "properties": {
+          "question": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Question"
+          },
+          "products": {
+            "items": {
+              "$ref": "#/components/schemas/AnalysisProduct"
+            },
+            "type": "array",
+            "maxItems": 4,
+            "title": "Products",
+            "default": []
+          },
+          "budget": {
+            "anyOf": [
+              {
+                "type": "number",
+                "minimum": 0.0
+              },
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Budget"
+          },
+          "selected_product_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1,
+                "pattern": "^[a-zA-Z0-9_.:-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Selected Product Id"
+          },
+          "currency": {
+            "type": "string",
+            "pattern": "^[A-Z]{3}$",
+            "title": "Currency",
+            "default": "INR"
+          },
+          "required_specs": {
+            "additionalProperties": {
+              "type": "string",
+              "maxLength": 500,
+              "minLength": 1
+            },
+            "propertyNames": {
+              "maxLength": 80,
+              "minLength": 1
+            },
+            "type": "object",
+            "maxProperties": 8,
+            "title": "Required Specs"
+          },
+          "language": {
+            "type": "string",
+            "enum": [
+              "en",
+              "hi-Latn"
+            ],
+            "title": "Language",
+            "default": "hi-Latn"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "question"
+        ],
+        "title": "AnalysisRequest"
+      },
+      "AnalysisRow": {
+        "properties": {
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "values": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object",
+            "title": "Values"
+          },
+          "evidence_ids": {
+            "additionalProperties": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "type": "object",
+            "title": "Evidence Ids"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "label",
+          "values",
+          "evidence_ids"
+        ],
+        "title": "AnalysisRow"
+      },
+      "AnalysisSkill": {
+        "properties": {
+          "skill": {
+            "type": "string",
+            "enum": [
+              "highlight_spec",
+              "scroll_to_reviews"
+            ],
+            "title": "Skill"
+          },
+          "product_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_.:-]+$",
+            "title": "Product Id"
+          },
+          "document_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_.:-]+$",
+            "title": "Document Id"
+          },
+          "source_url": {
+            "type": "string",
+            "title": "Source Url"
+          },
+          "spec_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Spec Key"
+          },
+          "review_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1,
+                "pattern": "^[a-zA-Z0-9_.:-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Review Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "skill",
+          "product_id",
+          "document_id",
+          "source_url"
+        ],
+        "title": "AnalysisSkill"
+      },
       "BrowserAction": {
         "properties": {
           "action_id": {
@@ -3104,9 +3695,29 @@
             "type": "string",
             "enum": [
               "mock",
-              "chat"
+              "chat",
+              "local"
             ],
             "title": "Provider"
+          },
+          "analysis_only": {
+            "type": "boolean",
+            "title": "Analysis Only"
+          },
+          "local_fallback": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "deterministic",
+                  "cloud"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Local Fallback"
           },
           "authentication": {
             "type": "string",
@@ -3143,6 +3754,8 @@
         "type": "object",
         "required": [
           "provider",
+          "analysis_only",
+          "local_fallback",
           "authentication",
           "mutations_enabled",
           "browser_origins",
@@ -4972,6 +5585,21 @@
       },
       "PublicReply": {
         "properties": {
+          "inference_fallback": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "deterministic",
+                  "cloud"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inference Fallback"
+          },
           "conversation_id": {
             "type": "string",
             "maxLength": 100,
@@ -5393,6 +6021,48 @@
           "text"
         ],
         "title": "ReviewItemInput"
+      },
+      "ReviewObservation": {
+        "properties": {
+          "review_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_.:-]+$",
+            "title": "Review Id"
+          },
+          "rating": {
+            "type": "integer",
+            "maximum": 5.0,
+            "minimum": 1.0,
+            "title": "Rating"
+          },
+          "text": {
+            "type": "string",
+            "maxLength": 1000,
+            "minLength": 1,
+            "title": "Text"
+          },
+          "verified_purchase_observed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Verified Purchase Observed"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "review_id",
+          "rating",
+          "text"
+        ],
+        "title": "ReviewObservation"
       },
       "ReviewSummaryPostRequest": {
         "properties": {

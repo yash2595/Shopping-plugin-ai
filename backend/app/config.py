@@ -64,13 +64,20 @@ class Settings(BaseSettings):
     AI_TIMEOUT_SECONDS: float = Field(default=5.0, gt=0, le=120)
     AI_MAX_CONCURRENT_CALLS: int = Field(default=8, ge=1, le=64)
     AI_RUNTIME_ENABLED: bool = False
-    AI_RUNTIME_PROVIDER: Literal["mock", "chat"] = "mock"
+    AI_RUNTIME_PROVIDER: Literal["mock", "chat", "local"] = "mock"
+    AI_ANALYSIS_ONLY: bool = True
+    AI_LOCAL_ENDPOINT: str = "http://127.0.0.1:11434/v1/chat/completions"
+    AI_LOCAL_MODEL: str = "llama3.2"
+    AI_LOCAL_TIMEOUT_SECONDS: float = Field(default=5, ge=0.1, le=60)
+    AI_LOCAL_FALLBACK: Literal["deterministic", "cloud"] = "deterministic"
     AI_RUNTIME_TIMEOUT_SECONDS: float = Field(default=90, ge=5, le=300)
     AI_CORE_TIMEOUT_SECONDS: float = Field(default=30, ge=1, le=60)
     AI_MAX_STEPS: int = Field(default=8, ge=1, le=30)
     AI_MAX_SNAPSHOT_AGE_SECONDS: int = Field(default=120, ge=1, le=3600)
     AI_SEARCH_TIMEOUT_SECONDS: int = Field(default=120, ge=1, le=600)
-    AI_BROWSER_ORIGINS: tuple[str, ...] = ()
+    AI_BROWSER_ORIGINS: tuple[str, ...] = (
+        "https://www.amazon.in", "https://amazon.in", "https://www.flipkart.com", "https://flipkart.com",
+    )
     AI_MUTATIONS_ENABLED: bool = False
     AI_SEARCH_STORES: list[dict] = Field(default_factory=list)
     AI_CHAT_ENDPOINT: str = ""

@@ -1,5 +1,8 @@
 import uuid
 
+from fastapi import APIRouter, Depends, HTTPException, Response, status
+from sqlalchemy.orm import Session
+
 from app.ai.contracts import AIProvider
 from app.db import get_db
 from app.deps import (
@@ -21,8 +24,6 @@ from app.schemas.session import SessionCreate, SessionDetailRead, SessionRead
 from app.services.chat_service import ChatService
 from app.services.context_service import ContextService
 from app.services.session_service import SessionService
-from fastapi import APIRouter, Depends, HTTPException, Response, status
-from sqlalchemy.orm import Session
 
 router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 
@@ -105,12 +106,23 @@ def send_message(
                 "message": "Daily AI limit exceeded",
             },
         )
+    if err == "request_interrupted":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "REQUEST_INTERRUPTED",
+                "message": "The previous analysis was interrupted. Submit a new request to retry.",
+            },
+        )
     if err in {"idempotency_conflict", "request_in_progress"}:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail={
-                "code": "IDEMPOTENCY_CONFLICT" if err == "idempotency_conflict" else "REQUEST_IN_PROGRESS",
-                "message": "Request ID was already used with different input." if err == "idempotency_conflict"
+                "code": "IDEMPOTENCY_CONFLICT"
+                if err == "idempotency_conflict"
+                else "REQUEST_IN_PROGRESS",
+                "message": "Request ID was already used with different input."
+                if err == "idempotency_conflict"
                 else "This request has no completed reply yet. Retry the same request later.",
             },
         )
@@ -157,7 +169,9 @@ def update_shopping_context(
     )
 
 
-@router.post("/{id}/context/rejections", response_model=RejectedProductRead, status_code=status.HTTP_200_OK)
+@router.post(
+    "/{id}/context/rejections", response_model=RejectedProductRead, status_code=status.HTTP_200_OK
+)
 def add_product_rejection(
     id: uuid.UUID,
     data: RejectionCreate,

@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity,
   CheckCircle2,
@@ -11,10 +11,10 @@ import {
 import { ExecutionTimeline } from './ExecutionTimeline'
 import { SaarthiHeader } from './SaarthiHeader'
 import type { AgentEvent, AgentRunState } from '../../types/agentEvents'
-import type { BackendConnectionStatus } from '../../types/assistant'
+import type { BackendConnectionStatus, ShoppingPanelIntegration } from '../../types/assistant'
 import { getCurrentAction, getExecutionSteps } from '../../utils/agentExecution'
 
-interface SaarthiPanelProps {
+interface SaarthiPanelProps extends ShoppingPanelIntegration {
   events: AgentEvent[]
   runState: AgentRunState
   backendStatus?: BackendConnectionStatus
@@ -38,7 +38,17 @@ export const SaarthiPanel: React.FC<SaarthiPanelProps> = ({
   activeTabTitle,
   userRequest,
   parsedIntent,
+  conversation = [], onVoiceListening, analysis, analysisError, onAskShopping, onStopShopping,
 }) => {
+  const [draft, setDraft] = useState('')
+  const [voiceStatus, setVoiceStatus] = useState('')
+  const recognition = useRef<{ abort: () => void } | null>(null)
+  const stopRecognition = useCallback(() => {
+    const current = recognition.current
+    recognition.current = null
+    current?.abort()
+    if (current) onVoiceListening?.(false)
+  }, [onVoiceListening])
   const timelineEndRef = useRef<HTMLDivElement>(null)
   const steps = useMemo(() => getExecutionSteps(events), [events])
   const currentAction = useMemo(() => getCurrentAction(events), [events])
@@ -46,6 +56,50 @@ export const SaarthiPanel: React.FC<SaarthiPanelProps> = ({
   const isExecuting = runState === 'executing'
   const isCompleted = runState === 'completed'
   const isFailed = runState === 'failed'
+  const busy = runState === 'processing' || isExecuting
+
+  useEffect(() => () => {
+    stopRecognition()
+    window.speechSynthesis?.cancel()
+    window.electronAPI?.setOrbSpeaking(false)
+  }, [stopRecognition])
+
+  const startVoice = () => {
+    type Recognition = { start: () => void; abort: () => void; lang: string; interimResults: boolean;
+      onresult: ((event: { results: { [key: number]: { [key: number]: { transcript: string } } } }) => void) | null;
+      onerror: (() => void) | null; onend: (() => void) | null }
+    const host = window as unknown as { SpeechRecognition?: new () => Recognition; webkitSpeechRecognition?: new () => Recognition }
+    const Engine = host.SpeechRecognition || host.webkitSpeechRecognition
+    if (!Engine) { setVoiceStatus('Voice is unavailable here. You can type your question.'); return }
+    window.speechSynthesis?.cancel()
+    stopRecognition()
+    const recorder = new Engine()
+    recognition.current = recorder
+    recorder.lang = 'hi-IN'
+    recorder.interimResults = false
+    recorder.onresult = (event) => { if (recognition.current !== recorder) return; setDraft(event.results[0][0].transcript.slice(0, 2000)); setVoiceStatus('Check or edit the transcript, then ask.') }
+    recorder.onerror = () => { if (recognition.current === recorder) { onVoiceListening?.(false); setVoiceStatus('Microphone access or recognition failed. Type your question instead.') } }
+    recorder.onend = () => { if (recognition.current === recorder) { recognition.current = null; onVoiceListening?.(false); setVoiceStatus((current) => current.startsWith('Listening') ? 'No transcript received. You can type your question.' : current) } }
+    try { recorder.start(); onVoiceListening?.(true); setVoiceStatus('Listening. Browser speech may use online processing.') }
+    catch { recognition.current = null; onVoiceListening?.(false); setVoiceStatus('Voice could not start. Type your question instead.') }
+  }
+
+  const speakAnswer = () => {
+    if ((!analysis && !conversation.length) || !window.speechSynthesis) return
+    const voice = window.speechSynthesis.getVoices().find((item) => item.localService && item.lang.startsWith('hi'))
+      || window.speechSynthesis.getVoices().find((item) => item.localService)
+    if (!voice) { setVoiceStatus('A local voice is unavailable. The text answer remains here.'); return }
+    const spoken = (analysis?.answer || [...conversation].reverse().find((turn) => turn.role === 'assistant')?.text || '') + '\n' + (analysis?.evidence || []).slice(0, 5).map((item) =>
+      item.kind === 'review' ? `Captured review excerpt: ${item.value}` : `${item.label}: ${item.value}`).join('\n')
+    const speech = new SpeechSynthesisUtterance(Array.from(spoken).slice(0, 2000).join(''))
+    speech.voice = voice
+    speech.onstart = () => window.electronAPI?.setOrbSpeaking(true)
+    speech.onend = () => window.electronAPI?.setOrbSpeaking(false)
+    speech.onerror = (event) => { window.electronAPI?.setOrbSpeaking(false); reportSpeechError(event) }
+    const reportSpeechError = (event: SpeechSynthesisErrorEvent) => { if (!['canceled', 'interrupted'].includes(event.error)) setVoiceStatus('Read aloud failed. The text answer remains available.') }
+    window.speechSynthesis.cancel()
+    window.speechSynthesis.speak(speech)
+  }
 
   const handleClose = onClosePanel || onTogglePanel
 
@@ -58,22 +112,67 @@ export const SaarthiPanel: React.FC<SaarthiPanelProps> = ({
       {/* 1. Header with dynamic status & close controls */}
       <SaarthiHeader
         runState={runState}
-        onClearChat={onClearExecution}
+        onClearChat={() => { setDraft(''); setVoiceStatus(''); stopRecognition(); onClearExecution() }}
         onTogglePanel={handleClose}
         activeTabTitle={activeTabTitle}
       />
 
       {/* 2. Scrollable Observable Execution Workspace */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        <form className="space-y-2" onSubmit={(event) => {
+          event.preventDefault()
+          stopRecognition()
+          if (draft.trim() && !busy) void onAskShopping?.(draft.trim())
+        }}>
+          <label htmlFor="shopping-question" className="text-xs text-neutral-300">Talk to Saarthi</label>
+          <textarea id="shopping-question" value={draft} onChange={(event) => setDraft(event.target.value)}
+            maxLength={2000} rows={3} placeholder="Amazon kholo · Search headphones on Flipkart · Battery kitni hai?"
+            className="w-full rounded-lg bg-neutral-900 border border-neutral-700 p-3 text-sm text-white select-text" />
+          <div className="flex gap-2">
+            <button type="submit" disabled={busy || !draft.trim() || !onAskShopping} className="rounded bg-cyan-700 px-3 py-2 text-xs disabled:opacity-40">{busy ? 'Checking…' : 'Ask'}</button>
+            <button type="button" onClick={startVoice} disabled={busy} className="rounded bg-neutral-800 px-3 py-2 text-xs">Mic</button>
+            <button type="button" onClick={() => { stopRecognition(); window.speechSynthesis?.cancel(); onStopShopping?.(); setVoiceStatus('Stopped.') }} className="rounded bg-neutral-800 px-3 py-2 text-xs">Stop</button>
+            {(analysis || conversation.some((turn) => turn.role === 'assistant')) && <button type="button" onClick={speakAnswer} className="rounded bg-neutral-800 px-3 py-2 text-xs">Read aloud</button>}
+          </div>
+          <p className="text-[10px] text-neutral-500">Capture products by asking on each page, then ask to compare. Clear removes this session’s captures.</p>
+          {voiceStatus && <p role="status" className="text-xs text-neutral-400">{voiceStatus}</p>}
+        </form>
+        <section aria-label="Conversation" aria-live="polite" className="space-y-2 select-text">
+          {conversation.map((turn) => <article key={turn.id} className={`rounded-lg p-3 text-sm whitespace-pre-wrap ${turn.role === 'user' ? 'bg-cyan-950 ml-5' : 'bg-neutral-900 mr-2'}`}><span className="block text-[10px] text-neutral-400">{turn.role === 'user' ? 'You' : 'Saarthi'}</span>{turn.text}</article>)}
+        </section>
+        {analysisError && <p role="alert" className="text-xs text-amber-300">{analysisError}</p>}
+        {analysis && <section aria-label="Shopping answer" className="space-y-3 select-text">
+          <p className="text-sm text-neutral-100">{analysis.answer}</p>
+          {analysis.inference_fallback && <p className="text-xs text-amber-300">{analysis.inference_fallback === 'cloud' ? 'The configured cloud fallback was used for this question.' : 'Local inference was unavailable; captured-fact rules were used.'}</p>}
+          {analysis.follow_up && <p className="text-xs text-cyan-300">{analysis.follow_up}</p>}
+          {analysis.evidence.map((item) => <article key={item.evidence_id} className="rounded border border-neutral-800 bg-neutral-900 p-3">
+            <p className="text-[10px] text-cyan-300">{item.product_title} · {item.kind === 'review' ? `${item.rating} stars · captured excerpt` : item.label}</p>
+            <p className="mt-1 text-sm whitespace-pre-wrap">{item.kind === 'review' ? `“${item.value}”` : item.value}</p>
+            {item.verified_purchase_observed === true && <p className="text-[10px] text-neutral-400">Page showed a verified-purchase badge</p>}
+            <a href={item.source_url} target="_blank" rel="noreferrer" className="text-[10px] text-neutral-500 underline">Source · {new Date(item.observed_at).toLocaleTimeString()}</a>
+            {(item.kind === 'spec' || item.kind === 'review') && <button type="button" className="ml-2 text-[10px] text-cyan-300 underline" onClick={async () => {
+              const result = await window.electronAPI?.showAnalysisEvidence({
+                skill: item.kind === 'spec' ? 'highlight_spec' : 'scroll_to_reviews',
+                document_id: item.document_id, source_url: item.source_url,
+                spec_key: item.kind === 'spec' ? item.label : null, review_id: item.review_id, expected_text: item.value,
+              })
+              setVoiceStatus(result?.success ? 'Evidence highlighted on the page.' : result?.error || 'Page highlighting is unavailable.')
+            }}>Show on page</button>}
+          </article>)}
+          {analysis.comparison.length > 0 && <div className="overflow-x-auto"><table className="text-xs w-full"><thead><tr><th className="text-left p-1">Detail</th>{Object.keys(analysis.comparison[0].values).map((id, index) => <th key={id} className="p-1">{analysis.evidence.find((item) => item.product_id === id)?.product_title || `Product ${index + 1}`}</th>)}</tr></thead><tbody>{analysis.comparison.map((row) => <tr key={row.label}><td className="p-1">{row.label}</td>{Object.entries(row.values).map(([id, value]) => <td key={id} className="p-1">{value ?? 'Unknown'}</td>)}</tr>)}</tbody></table></div>}
+          {analysis.shortlist.length > 0 && <p className="text-xs text-emerald-300">Observed-price shortlist: {analysis.shortlist.map((id, index) => analysis.evidence.find((item) => item.product_id === id)?.product_title || `Product ${index + 1}`).join(' → ')}</p>}
+          {analysis.warnings.map((warning) => <p key={warning} className="text-xs text-amber-300">{warning === 'LOCAL_CAPTURE_FALLBACK' ? 'Captured details only. Reconnect for question-specific analysis.' : warning.startsWith('STALE_') ? 'A saved capture is old. Ask again on that product page to refresh it.' : warning === 'ITEM_PRICE_ONLY_FINAL_TOTAL_UNKNOWN' ? 'The shortlist uses item prices. Delivery charges and the final checkout total may differ.' : warning === 'MIXED_CURRENCIES_NO_CONVERSION' ? 'Prices have different currencies. No currency conversion was applied.' : 'Some price, stock or currency details are missing. Check the source page.'}</p>)}
+          <p className="text-[10px] text-neutral-500">{analysis.coverage}</p>
+        </section>}
         {/* Request & Understood Intent Section */}
         <section className="rounded-xl border border-neutral-800/90 bg-neutral-900/70 p-3.5 space-y-3">
           <div>
             <div className="flex items-center gap-1.5 text-[9px] font-mono uppercase tracking-[0.14em] text-neutral-400">
               <Mic className="h-3 w-3 text-cyan-400" />
-              Voice Request
+              Shopping Question
             </div>
             <p className={`mt-1 text-xs leading-relaxed ${userRequest ? 'font-semibold text-white' : 'font-normal text-neutral-400 italic'}`}>
-              {userRequest ? `"${userRequest}"` : 'No active voice request — microphone/STT pending integration'}
+              {userRequest ? `"${userRequest}"` : 'Type a shopping question or use the microphone.'}
             </p>
           </div>
 
@@ -135,7 +234,7 @@ export const SaarthiPanel: React.FC<SaarthiPanelProps> = ({
                 {currentAction
                   ? currentAction.message
                   : isCompleted
-                    ? 'Execution completed'
+                    ? 'Analysis finished'
                     : isFailed
                       ? 'Action could not be completed'
                       : isExecuting
@@ -167,7 +266,7 @@ export const SaarthiPanel: React.FC<SaarthiPanelProps> = ({
           <section className="rounded-lg border border-emerald-500/30 bg-emerald-950/20 px-3 py-2.5 animate-in fade-in duration-300">
             <div className="flex items-center gap-2 text-xs font-medium text-emerald-200">
               <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
-              Execution completed; the browser remains the result surface.
+              Analysis finished. Check the captured facts and sources above.
             </div>
           </section>
         )}
@@ -205,7 +304,7 @@ export const SaarthiPanel: React.FC<SaarthiPanelProps> = ({
 
           <div className="flex items-center gap-2">
             <span className="text-[10px] text-neutral-500 font-mono">
-              Backend: {backendStatus === 'connected' ? 'Connected' : 'Pending'}
+              Backend: {backendStatus === 'connected' ? 'Connected' : backendStatus === 'disconnected' ? 'Unavailable' : 'Pending'}
             </span>
             {onSimulateFailure && !isExecuting && (
               <>

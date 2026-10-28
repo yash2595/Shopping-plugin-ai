@@ -1,5 +1,48 @@
 # Copilot Browser
 
+## Shopping assistant flow
+
+The side panel now has a typed shopping question, editable browser-mic transcript,
+source-backed answer cards, a comparison table, observed-price shortlist and local
+voice read-aloud. Ask on each supported product page to retain up to four captures,
+then compare them. Explicit budget/RAM/storage/colour requirements stay in memory;
+Clear removes them and the captures. Stale/unknown values do not become invented
+facts or recommendations. This is a captured-evidence assistant, not global web
+search or an automatic purchasing agent.
+
+Start the backend on port 8000 with `AI_RUNTIME_ENABLED=true` and the Amazon.in /
+Flipkart origins in `AI_BROWSER_ORIGINS` (see the backend `.env.example`). From
+this folder, install normal desktop dependencies and run `npm run start:electron`.
+The Electron binary must be installed; `npm ci --ignore-scripts` is sufficient for
+CI tests/bundling but does not install that binary. HTTPS public product pages are
+supported; cart, account, sign-in and checkout pages are not capture sources.
+
+The packaged app's JSON calls use a trusted main-frame HTTP bridge, so backend CORS
+does not need to permit `null` origins. `SHOPPING_BACKEND_URL` chooses a trusted
+backend origin in the main-process environment, defaulting to localhost:8000.
+Remote origins must use HTTPS. The bridge forwards its in-memory bearer token,
+never retailer cookies, refuses redirects and bounds request/response sizes.
+
+Show on page highlights a spec row or scrolls to an exact captured review excerpt
+only after native active-document/source/text checks. No model selectors, generated
+scripts, cart click or purchase instruction is accepted. Missing selectors/text
+produce a visible failure rather than a success claim. Product/review extraction
+uses packaged bounded selectors; live retailer layouts still require acceptance.
+
+Mic is feature-detected and never auto-submits: edit the transcript before Ask.
+Browser recognition may use online services; failure keeps typed input usable.
+Read aloud uses an available `localService` voice; failure keeps the answer visible.
+Stop, a new question and tab/panel changes discard late answers/playback. Actual
+microphone/voice quality and device permissions have not been certified by builds.
+
+Release renderers retain sandboxing and privileged IPC checks the main frame.
+Remote debugging is off unless a development port is explicitly configured.
+`SHOPPING_UNSAFE_DEV_SANDBOX=1` is an opt-in managed-host development workaround;
+it is ignored by packaged builds and is not a release configuration. The overlay's
+incorrect `BrowserWindow.getURL()` call was removed and native TypeScript now checks.
+WXT/MV3 packaging, offscreen VAD, rating-filter clicking and real-device/retailer
+acceptance remain separate work; they are not claimed as completed here.
+
 A modern, high-performance desktop browser with an adaptive AI assistant overlay and White-Box Execution timeline, built with Electron, React, and TypeScript.
 
 ---
@@ -106,9 +149,9 @@ the full local setup and public request/response contract. The SDK uses the exis
 token vault; logout revokes the server token, and policy/site 403 responses preserve
 valid identity. It never automatically retries or renumbers a browser mutation.
 
-This is the AI-to-browser integration seam. The browser team must connect the panel,
-packaged site adapters, native foreground tab/document identity, microphone/playback
-and a durable local action journal. Renderer tab labels/URLs are not authentication
+The analytical panel, packaged product adapters, native foreground/document checks
+and browser voice controls are connected. A durable local mutation journal remains
+required before enabling any future cart executor. Renderer tab labels/URLs are not authentication
 or document-lifetime IDs. Persist stable event IDs, claim IDs and outcomes before
 executing work; on reconnect load the saved conversation/work, and reuse the existing
 journal entry rather than clicking a claimed mutation again. Only the explicitly
@@ -130,3 +173,49 @@ issuer, audience and public signing keys. Login, refresh and provider sign-out
 belong to that selected identity integration. Never store private keys or backend
 secrets in the renderer. `getAiCapabilities()` reads authenticated runtime settings
 and limits; its flags are configuration information, not live provider health.
+
+The latest analysis/local-first backend profile adds `analysis_only`,
+`local_fallback` and `provider: 'local'` to capabilities. Each reply includes
+`inference_fallback: 'deterministic' | 'cloud' | null`; show a degradation badge
+from that committed reply rather than guessing provider health. These are typed
+integration fields for the durable runtime. The separate stateless analysis UI is
+now connected as described above. Analysis
+mode does not permit variant/cart dispatch, even when the historical mutation
+flag is enabled.
+
+## Saarthi conversation and browser navigation
+
+The avatar opens one conversation panel for typed questions and edited speech
+transcripts. Up to 40 turns and explicit budget/RAM/storage/colour preferences stay
+in app memory across page/tab changes. Clear resets that local memory. Non-product
+shopping dialogue uses the existing authenticated, versioned backend conversation;
+page content and model replies never enter the browser-command planner. Backend
+conversation records follow backend retention, independently of local Clear.
+
+Direct user commands support public HTTPS websites, Amazon/Flipkart/Google search,
+back/forward, refresh, bounded scrolling and existing-tab switching. Examples:
+`Amazon kholo`, `search headphones` → `Amazon par`, `अमेज़न पर हेडफोन खोजो`,
+`open first result`, `scroll down`, `next tab`, then `battery kitni hai?`. Result
+opening supports the first five parsed Amazon/Flipkart product links on search
+pages; it canonicalizes product URLs and drops tracking rather than clicking a
+page control. Other websites can be opened, but arbitrary page understanding,
+forms, login, booking and universal website automation are not implemented.
+
+The trusted native executor checks the foreground tab/source and validates commands
+again. Page-load events acknowledge navigation; failures/timeouts/Stop do not claim
+completion. Stop/tab/manual navigation cancels pending load listeners; pending
+result reads recheck document identity. No generated scripts/selectors, checkout,
+cart action or silent page-triggered navigation are accepted by this executor.
+Listening state follows recognition events and local read-aloud drives the avatar's
+speaking animation. Voice remains push-to-talk with editable transcripts; always-on
+VAD and general Hindi language understanding are not claimed.
+
+Verification: 43 client tests, TypeScript/Vite build, native TypeScript check and
+Electron bundle passed. A real Electron hidden-window smoke used intercepted HTTPS
+fixture pages and local PostgreSQL/API: avatar activation, greeting, search follow-up,
+foreground rejection, exact battery answer, Clear, two-turn backend conversation and
+conversation-budget-to-product-shortlist all passed. Native executable fixture tests
+cover successful navigation, result extraction, failure, stale targets and Stop.
+Focused visible-window navigation, live retailer selectors, microphone/local voice
+and installed local-model quality still need device acceptance. No live retailer
+or paid model request was used.

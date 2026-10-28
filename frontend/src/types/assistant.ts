@@ -1,5 +1,41 @@
 import type { AgentEvent, AgentRunState } from './agentEvents'
 
+export interface AnalysisProduct {
+  product: RuntimeProduct
+  source_url: string
+  reviews: { review_id: string; rating: number; text: string; verified_purchase_observed?: boolean | null }[]
+}
+
+export interface ShoppingAnalysis {
+  status: 'answered' | 'needs_input' | 'no_evidence'
+  answer: string
+  evidence: { evidence_id: string; product_id: string; product_title: string; snapshot_id: string; document_id: string;
+    source_url: string; observed_at: string; kind: string; label: string; value: string;
+    review_id: string | null; rating: number | null; verified_purchase_observed: boolean | null }[]
+  comparison: { label: string; values: Record<string, string | null>; evidence_ids: Record<string, string | null> }[]
+  shortlist: string[]
+  lowest_observed_price_product_id: string | null
+  review_sample_size: number
+  review_match_count: number
+  coverage: string
+  warnings: string[]
+  follow_up: string | null
+  skills: { skill: 'highlight_spec' | 'scroll_to_reviews'; product_id: string;
+    document_id: string; source_url: string; spec_key: string | null; review_id: string | null }[]
+  processing: 'local_extractive' | 'grounded_model_selection' | 'local_capture_fallback'
+  inference_fallback?: 'deterministic' | 'cloud' | null
+}
+
+export interface ConversationTurn { id: string; role: 'user' | 'assistant'; text: string }
+export interface ShoppingPanelIntegration {
+  conversation?: ConversationTurn[]
+  onVoiceListening?: (listening: boolean) => void
+  analysis?: ShoppingAnalysis | null
+  analysisError?: string
+  onAskShopping?: (question: string) => Promise<void>
+  onStopShopping?: () => void
+}
+
 export type BackendConnectionStatus = 'connected' | 'disconnected' | 'pending'
 
 export interface SpeechRecognitionService {
@@ -59,6 +95,7 @@ export interface RuntimeProduct {
 }
 
 export interface RuntimeReply {
+  inference_fallback: 'deterministic' | 'cloud' | null
   conversation_id: string
   session_id: string
   version: number
@@ -103,7 +140,9 @@ export interface RuntimeConfirmation {
 }
 
 export interface RuntimeCapabilities {
-  provider: 'mock' | 'chat'
+  provider: 'mock' | 'chat' | 'local'
+  analysis_only: boolean
+  local_fallback: 'deterministic' | 'cloud' | null
   authentication: 'anonymous' | 'oidc'
   mutations_enabled: boolean
   browser_origins: string[]

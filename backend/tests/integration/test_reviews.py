@@ -1,7 +1,7 @@
-import decimal
 import logging
 import uuid
 from unittest.mock import MagicMock
+
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import text
@@ -10,11 +10,96 @@ from sqlalchemy.orm import Session
 from app.ai.contracts import ReviewItemContract, ReviewSummaryRequest
 from app.ai.gemini import GeminiProvider
 from app.config import get_settings
-from app.models.product import ProductSnapshot
-from app.models.review import ReviewSummary
 from app.services.auth_service import AuthService
 
 settings = get_settings()
+
+
+def test_review_stats_ignore_hallucinated_model_prose_and_require_seen_listing(
+    client, auth_headers
+):
+    from app.deps import get_ai_provider
+
+    class NoModelCalls:
+        def summarize_reviews(self, request):
+            raise AssertionError("Sample statistics must not call a language model")
+
+    client.app.dependency_overrides[get_ai_provider] = lambda: NoModelCalls()
+    listing = client.post(
+        "/v1/snapshots",
+        headers=auth_headers,
+        json={
+            "retailer": "amazon",
+            "retailer_product_id": uuid.uuid4().hex,
+            "title": "Sample product",
+            "price": "100",
+            "availability": "unknown",
+        },
+    ).json()["listing_id"]
+    result = client.post(
+        f"/v1/listings/{listing}/review-summary",
+        headers=auth_headers,
+        json={
+            "reviews": [
+                {"rating": 2, "text": "Battery lasts a day"},
+                {"rating": 3, "text": "Sound is clear"},
+                {"rating": 4, "text": "Build is solid"},
+            ]
+        },
+    )
+    assert result.status_code == 200
+    data = result.json()
+    assert data["pros"] == [] and data["cons"] == [] and data["themes"] == []
+    assert "3 reviews" in data["overall"] and "not all reviews" in data["caveat"]
+    other_token = client.post("/v1/auth/register").json()["access_token"]
+    assert (
+        client.get(
+            f"/v1/listings/{listing}/review-summary",
+            headers={"Authorization": "Bearer " + other_token},
+        ).status_code
+        == 404
+    )
+
+
+def test_review_cache_is_owner_scoped_and_expired_entry_refreshes_without_duplicate(
+    client, auth_headers, db_session
+):
+    source = {
+        "retailer": "amazon",
+        "retailer_product_id": uuid.uuid4().hex,
+        "title": "Cache isolation",
+        "price": "100",
+        "availability": "unknown",
+    }
+    listing = client.post("/v1/snapshots", headers=auth_headers, json=source).json()["listing_id"]
+    body = {
+        "reviews": [
+            {"rating": 2, "text": "Battery lasts a day"},
+            {"rating": 3, "text": "Sound is clear"},
+            {"rating": 4, "text": "Build is solid"},
+        ]
+    }
+    path = f"/v1/listings/{listing}/review-summary"
+    assert client.post(path, headers=auth_headers, json=body).status_code == 200
+    other = {"Authorization": "Bearer " + client.post("/v1/auth/register").json()["access_token"]}
+    client.post("/v1/snapshots", headers=other, json=source)
+    assert client.get(path, headers=other).status_code == 404
+    own = client.post(path, headers=other, json=body)
+    assert own.status_code == 200 and own.json()["cached"] is False
+    db_session.execute(
+        text(
+            "UPDATE review_summaries SET created_at = now() - interval '10 days' WHERE listing_id = :listing"
+        ),
+        {"listing": uuid.UUID(listing)},
+    )
+    db_session.commit()
+    refreshed = client.post(path, headers=auth_headers, json=body)
+    assert refreshed.status_code == 200 and refreshed.json()["cached"] is False
+    count = db_session.execute(
+        text("SELECT count(*) FROM review_summaries WHERE listing_id = :listing"),
+        {"listing": uuid.UUID(listing)},
+    ).scalar()
+    assert count == 2
 
 
 def test_review_summary_created_and_stored_without_raw_text(
@@ -44,9 +129,21 @@ def test_review_summary_created_and_stored_without_raw_text(
 
     secret_raw_text = "UNTRUSTED_RAW_REVIEW_TEXT_12345_NEVER_PERSIST_ME"
     raw_reviews = [
-        {"rating": 5, "title": "Great chair", "text": f"{secret_raw_text} Lumbar support is wonderful."},
-        {"rating": 4, "title": "Good quality", "text": "Assembly was easy and wheels glide smoothly."},
-        {"rating": 2, "title": "Armrests wobble", "text": "Armrests are somewhat loose after a week."},
+        {
+            "rating": 5,
+            "title": "Great chair",
+            "text": f"{secret_raw_text} Lumbar support is wonderful.",
+        },
+        {
+            "rating": 4,
+            "title": "Good quality",
+            "text": "Assembly was easy and wheels glide smoothly.",
+        },
+        {
+            "rating": 2,
+            "title": "Armrests wobble",
+            "text": "Armrests are somewhat loose after a week.",
+        },
     ]
 
     resp = client.post(
@@ -62,7 +159,9 @@ def test_review_summary_created_and_stored_without_raw_text(
     assert "Based on 3 reviews" in data["caveat"]
 
     # 1. Assert raw text is NOT in any database row
-    stored_summaries = db_session.execute(text("SELECT summary FROM review_summaries")).scalars().all()
+    stored_summaries = (
+        db_session.execute(text("SELECT summary FROM review_summaries")).scalars().all()
+    )
     for summary_json in stored_summaries:
         summary_str = str(summary_json)
         assert secret_raw_text not in summary_str
@@ -92,15 +191,23 @@ def test_same_reviews_twice_second_is_cached_and_provider_called_once(
 
     reviews = [
         {"rating": 5, "title": "Fast transfer", "text": "HDMI and USB ports work flawlessly."},
-        {"rating": 4, "title": "Slightly warm", "text": "Gets a bit warm under heavy 4K video usage."},
+        {
+            "rating": 4,
+            "title": "Slightly warm",
+            "text": "Gets a bit warm under heavy 4K video usage.",
+        },
         {"rating": 5, "title": "Durable metal", "text": "Compact aluminum body feels very solid."},
     ]
 
-    r1 = client.post(f"/v1/listings/{listing_id}/review-summary", json={"reviews": reviews}, headers=auth_headers)
+    r1 = client.post(
+        f"/v1/listings/{listing_id}/review-summary", json={"reviews": reviews}, headers=auth_headers
+    )
     assert r1.status_code == 200
     assert r1.json()["cached"] is False
 
-    r2 = client.post(f"/v1/listings/{listing_id}/review-summary", json={"reviews": reviews}, headers=auth_headers)
+    r2 = client.post(
+        f"/v1/listings/{listing_id}/review-summary", json={"reviews": reviews}, headers=auth_headers
+    )
     assert r2.status_code == 200
     assert r2.json()["cached"] is True
     assert r2.json()["sample_size"] == 3
@@ -129,7 +236,11 @@ def test_changed_reviews_generates_new_summary(
         {"rating": 4, "text": "Battery lasts all day long."},
         {"rating": 3, "text": "Case is a bit bulky."},
     ]
-    r1 = client.post(f"/v1/listings/{listing_id}/review-summary", json={"reviews": reviews_set_1}, headers=auth_headers)
+    r1 = client.post(
+        f"/v1/listings/{listing_id}/review-summary",
+        json={"reviews": reviews_set_1},
+        headers=auth_headers,
+    )
     assert r1.status_code == 200
     assert r1.json()["cached"] is False
 
@@ -138,7 +249,11 @@ def test_changed_reviews_generates_new_summary(
         {"rating": 2, "text": "Left earbud stopped charging."},
         {"rating": 2, "text": "Constant Bluetooth disconnections."},
     ]
-    r2 = client.post(f"/v1/listings/{listing_id}/review-summary", json={"reviews": reviews_set_2}, headers=auth_headers)
+    r2 = client.post(
+        f"/v1/listings/{listing_id}/review-summary",
+        json={"reviews": reviews_set_2},
+        headers=auth_headers,
+    )
     assert r2.status_code == 200
     assert r2.json()["cached"] is False
     assert r2.json()["average_rating_in_sample"] != r1.json()["average_rating_in_sample"]
@@ -165,7 +280,9 @@ def test_fewer_than_three_usable_reviews_422(
     # Only 2 reviews
     res2 = client.post(
         f"/v1/listings/{listing_id}/review-summary",
-        json={"reviews": [{"rating": 5, "text": "Good keys"}, {"rating": 4, "text": "RGB is bright"}]},
+        json={
+            "reviews": [{"rating": 5, "text": "Good keys"}, {"rating": 4, "text": "RGB is bright"}]
+        },
         headers=auth_headers,
     )
     assert res2.status_code == 422
@@ -311,11 +428,11 @@ def test_prompt_injection_inside_review_does_not_break_contract_or_execute_tools
     assert isinstance(data["cons"], list)
 
 
-def test_review_provider_error_and_timeout_returns_documented_fallback(
+def test_review_stats_remain_available_without_invoking_provider(
     client: TestClient,
     auth_headers: dict[str, str],
 ):
-    """Proves provider error or timeout returns HTTP 200 with kind='fallback', never 500 or stack trace."""
+    """Extracted sample statistics remain usable without a language model."""
     snap = client.post(
         "/v1/snapshots",
         json={
@@ -342,8 +459,8 @@ def test_review_provider_error_and_timeout_returns_documented_fallback(
     )
     assert res.status_code == 200
     data = res.json()
-    assert data["kind"] == "fallback"
-    assert "unavailable" in data["overall"].lower()
+    assert data["kind"] == "summary"
+    assert "Captured review sample" in data["overall"]
     assert data["sample_size"] == 3
 
 
@@ -381,7 +498,9 @@ def test_ai_daily_limit_429_on_chat_and_reviews_cached_does_not_count(
         {"rating": 4, "text": "Good durability"},
         {"rating": 5, "text": "Highly recommend"},
     ]
-    r_init = client.post(f"/v1/listings/{listing_id}/review-summary", json={"reviews": reviews}, headers=auth_headers)
+    r_init = client.post(
+        f"/v1/listings/{listing_id}/review-summary", json={"reviews": reviews}, headers=auth_headers
+    )
     assert r_init.status_code == 200
     assert r_init.json()["cached"] is False
 
@@ -389,11 +508,15 @@ def test_ai_daily_limit_429_on_chat_and_reviews_cached_does_not_count(
     auth_service = AuthService()
     user = auth_service.authenticate_token(db_session, auth_headers["Authorization"].split()[1])
 
-    from app.repositories.usage_repo import UsageRepository
     import datetime
+
+    from app.repositories.usage_repo import UsageRepository
+
     repo = UsageRepository()
     now_date = datetime.datetime.now(datetime.timezone.utc).date()
 
+    # Statistics no longer consume an AI call, so explicitly create the counter.
+    repo.increment_and_get_count(db_session, user_id=user.id, day=now_date, key="ai_daily")
     # Artificially set usage count to MAX (50)
     db_session.execute(
         text("UPDATE usage_counters SET count = 50 WHERE user_id = :uid AND key = 'ai_daily'"),
@@ -411,7 +534,7 @@ def test_ai_daily_limit_429_on_chat_and_reviews_cached_does_not_count(
     assert chat_fail.status_code == 429
     assert chat_fail.json()["error"]["code"] == "RATE_LIMITED"
 
-    # 2. Review summary with new reviews should now hit 429 RATE_LIMITED
+    # 2. New deterministic review statistics do not spend the exhausted AI quota.
     new_reviews = [
         {"rating": 1, "text": "Different review 1"},
         {"rating": 2, "text": "Different review 2"},
@@ -422,8 +545,8 @@ def test_ai_daily_limit_429_on_chat_and_reviews_cached_does_not_count(
         json={"reviews": new_reviews},
         headers=auth_headers,
     )
-    assert rev_fail.status_code == 429
-    assert rev_fail.json()["error"]["code"] == "RATE_LIMITED"
+    assert rev_fail.status_code == 200
+    assert rev_fail.json()["sample_size"] == 3
 
     # 3. BUT cached review summary still succeeds with 200 and cached: true!
     rev_cached = client.post(
@@ -488,7 +611,11 @@ def test_chat_ai_answers_review_questions_from_latest_summary(
     # 1. Ask before any summary exists
     m1 = client.post(
         f"/v1/sessions/{session_id}/messages",
-        json={"text": "are the reviews good?", "snapshot_id": snapshot_id, "request_id": str(uuid.uuid4())},
+        json={
+            "text": "are the reviews good?",
+            "snapshot_id": snapshot_id,
+            "request_id": str(uuid.uuid4()),
+        },
         headers=auth_headers,
     ).json()
     assert "no review summary is available" in m1["content"].lower()
@@ -509,7 +636,11 @@ def test_chat_ai_answers_review_questions_from_latest_summary(
     # 3. Ask after summary exists -> AI answers from it
     m2 = client.post(
         f"/v1/sessions/{session_id}/messages",
-        json={"text": "are the reviews good?", "snapshot_id": snapshot_id, "request_id": str(uuid.uuid4())},
+        json={
+            "text": "are the reviews good?",
+            "snapshot_id": snapshot_id,
+            "request_id": str(uuid.uuid4()),
+        },
         headers=auth_headers,
     ).json()
     assert "review summary" in m2["content"].lower()

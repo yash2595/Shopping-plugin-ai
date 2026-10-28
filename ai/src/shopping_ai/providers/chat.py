@@ -10,7 +10,7 @@ import os
 from typing import Annotated, Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator
 
 from shopping_ai.config import AIConfig
 from shopping_ai.context import SYSTEM_PROMPT, BuiltContext
@@ -21,6 +21,7 @@ from shopping_ai.providers.base import ProviderError
 
 
 class ChatSettings(Contract):
+    local_only: bool = Field(default=False, strict=True)
     endpoint: Annotated[str, Field(min_length=1, max_length=2000)]
     model: Annotated[str, Field(min_length=1, max_length=100)]
     api_key: SecretStr | None = Field(default=None, exclude=True)
@@ -29,8 +30,21 @@ class ChatSettings(Contract):
 
     @field_validator("endpoint")
     @classmethod
-    def trusted_https_endpoint(cls, value):
+    def trusted_https_endpoint(cls, value, info: ValidationInfo):
         url = urlsplit(value)
+        if info.data.get("local_only"):
+            if (
+                url.scheme != "http"
+                or url.hostname not in {"127.0.0.1", "localhost", "::1"}
+                or url.port != 11434
+                or url.username
+                or url.password
+                or url.query
+                or url.fragment
+                or url.path != "/v1/chat/completions"
+            ):
+                raise ValueError("Local inference requires the loopback Ollama chat endpoint")
+            return value
         if (
             url.scheme != "https"
             or not url.hostname
@@ -45,7 +59,9 @@ class ChatSettings(Contract):
 
     @field_validator("api_key")
     @classmethod
-    def valid_key(cls, value):
+    def valid_key(cls, value, info: ValidationInfo):
+        if info.data.get("local_only") and value is not None:
+            raise ValueError("Local inference does not accept cloud credentials")
         if value is not None and (
             not value.get_secret_value().strip()
             or any(c in value.get_secret_value() for c in "\r\n")

@@ -6,10 +6,10 @@ import { SaarthiPanel } from '../saarthi/SaarthiPanel'
 import { SaarthiAvatar } from '../saarthi/SaarthiAvatar'
 import type { BrowserTab } from '../../types/browser'
 import type { AgentEvent, AgentRunState } from '../../types/agentEvents'
-import type { BackendConnectionStatus } from '../../types/assistant'
+import type { BackendConnectionStatus, ShoppingPanelIntegration } from '../../types/assistant'
 import type { OrbOverlayBounds } from '../../types/electron'
 
-interface BrowserShellProps {
+interface BrowserShellProps extends ShoppingPanelIntegration {
   tabs: BrowserTab[]
   activeTabId: string
   onSelectTab: (tabId: string) => void
@@ -67,6 +67,7 @@ export const BrowserShell: React.FC<BrowserShellProps> = ({
   userRequest,
   parsedIntent,
   onIdleOrbBoundsChange,
+  conversation, onVoiceListening, analysis, analysisError, onAskShopping, onStopShopping,
 }) => {
   const activeTab = tabs.find((t) => t.id === activeTabId) || tabs[0]
 
@@ -118,6 +119,12 @@ export const BrowserShell: React.FC<BrowserShellProps> = ({
         {/* Right SAARTHI Execution Panel (slides in dynamically when executing, shrinks WebContentsView) */}
         {isSaarthiPanelOpen && (
           <SaarthiPanel
+            analysis={analysis}
+            conversation={conversation}
+            onVoiceListening={onVoiceListening}
+            analysisError={analysisError}
+            onAskShopping={onAskShopping}
+            onStopShopping={onStopShopping}
             events={agentEvents}
             runState={agentRunState}
             backendStatus={backendStatus}
