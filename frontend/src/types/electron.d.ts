@@ -38,7 +38,8 @@ export interface OrbOverlayBounds {
 }
 
 export interface ElectronAPI {
-  conversationNavigation: (data: { kind: 'navigate' | 'back' | 'forward' | 'reload' | 'stop' | 'switch' | 'scroll_down' | 'scroll_up' | 'open_result'; tabId: string; expectedUrl: string; url?: string; targetTabId?: string; index?: number }) => Promise<{ success: boolean; message: string }>
+  getNavigationContext: () => Promise<{ tabId: string; url: string; target: { tab_id: number; document_id: string; active: boolean; window_focused: boolean } }>
+  conversationNavigation: (data: { kind: 'navigate' | 'back' | 'forward' | 'reload' | 'stop' | 'switch' | 'scroll_down' | 'scroll_up' | 'open_result'; tabId: string; expectedUrl: string; url?: string; targetTabId?: string; index?: number; executionId?: string; expectedDocumentId?: string }) => Promise<{ success: boolean; message: string }>
   navigate: (url: string, tabId?: string) => void
   goBack: (tabId?: string) => void
   goForward: (tabId?: string) => void

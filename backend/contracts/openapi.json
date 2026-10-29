@@ -66,6 +66,71 @@
         }
       }
     },
+    "/v1/auth/usage": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Own Usage",
+        "operationId": "own_usage_v1_auth_usage_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsageRead"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
+    "/v1/auth/data": {
+      "delete": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Erase Own Shopping Data",
+        "operationId": "erase_own_shopping_data_v1_auth_data_delete",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EraseShoppingData"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
+      }
+    },
     "/v1/auth/register": {
       "post": {
         "tags": [
@@ -1104,6 +1169,53 @@
         }
       }
     },
+    "/internal/jobs/usage": {
+      "get": {
+        "tags": [
+          "internal"
+        ],
+        "summary": "Aggregate Ai Usage",
+        "operationId": "aggregate_ai_usage_internal_jobs_usage_get",
+        "parameters": [
+          {
+            "name": "X-Job-Secret",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "X-Job-Secret"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/internal/jobs/run": {
       "post": {
         "tags": [
@@ -1152,6 +1264,133 @@
             }
           }
         }
+      }
+    },
+    "/v1/ai/navigation/plan": {
+      "post": {
+        "tags": [
+          "AI runtime"
+        ],
+        "summary": "Navigation Plan",
+        "description": "Separate navigation planner; no DOM, execution, mutations or model prose.",
+        "operationId": "navigation_plan_v1_ai_navigation_plan_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BrowserPlanRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BrowserGoalPlan"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not Found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Conflict",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Request Entity Too Large",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "Unsupported Media Type",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Unprocessable Entity",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Too Many Requests",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service Unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "HTTPBearer": []
+          }
+        ]
       }
     },
     "/v1/ai/analysis": {
@@ -3577,6 +3816,65 @@
         ],
         "title": "BrowserAction"
       },
+      "BrowserGoalPlan": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "ready",
+              "needs_input",
+              "not_navigation"
+            ],
+            "title": "Status"
+          },
+          "steps": {
+            "items": {
+              "$ref": "#/components/schemas/BrowserPlanStep"
+            },
+            "type": "array",
+            "maxItems": 8,
+            "title": "Steps",
+            "default": []
+          },
+          "plan_id": {
+            "type": "string",
+            "maxLength": 100,
+            "minLength": 1,
+            "pattern": "^[a-zA-Z0-9_.:-]+$",
+            "title": "Plan Id"
+          },
+          "processing": {
+            "type": "string",
+            "enum": [
+              "rules",
+              "model"
+            ],
+            "title": "Processing",
+            "default": "rules"
+          },
+          "inference_fallback": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "deterministic",
+                  "cloud"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inference Fallback"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "title": "BrowserGoalPlan"
+      },
       "BrowserObservation": {
         "properties": {
           "outcome": {
@@ -3655,6 +3953,144 @@
           "observed_at"
         ],
         "title": "BrowserObservation"
+      },
+      "BrowserPlanRequest": {
+        "properties": {
+          "message": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Message"
+          },
+          "current_site": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "amazon",
+                  "flipkart",
+                  "google"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Site"
+          },
+          "allowed_tab_ids": {
+            "items": {
+              "type": "string",
+              "maxLength": 100,
+              "minLength": 1,
+              "pattern": "^[a-zA-Z0-9_.:-]+$"
+            },
+            "type": "array",
+            "maxItems": 20,
+            "title": "Allowed Tab Ids",
+            "default": []
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "title": "BrowserPlanRequest"
+      },
+      "BrowserPlanStep": {
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "navigate",
+              "search",
+              "back",
+              "forward",
+              "reload",
+              "scroll_down",
+              "scroll_up",
+              "open_result",
+              "switch"
+            ],
+            "title": "Kind"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 2000,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          },
+          "query": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 200,
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Query"
+          },
+          "site": {
+            "anyOf": [
+              {
+                "type": "string",
+                "enum": [
+                  "amazon",
+                  "flipkart",
+                  "google"
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Site"
+          },
+          "index": {
+            "anyOf": [
+              {
+                "type": "integer",
+                "maximum": 5.0,
+                "minimum": 1.0
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Index"
+          },
+          "tab_id": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 100,
+                "minLength": 1,
+                "pattern": "^[a-zA-Z0-9_.:-]+$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tab Id"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "kind"
+        ],
+        "title": "BrowserPlanStep"
       },
       "BrowserTarget": {
         "properties": {
@@ -4174,6 +4610,21 @@
         ],
         "title": "Confirmation"
       },
+      "EraseShoppingData": {
+        "properties": {
+          "confirm": {
+            "type": "boolean",
+            "const": true,
+            "title": "Confirm"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "confirm"
+        ],
+        "title": "EraseShoppingData"
+      },
       "ErrorDetail": {
         "properties": {
           "code": {
@@ -4309,6 +4760,11 @@
           "deleted_review_summaries": {
             "type": "integer",
             "title": "Deleted Review Summaries",
+            "default": 0
+          },
+          "deleted_usage_counters": {
+            "type": "integer",
+            "title": "Deleted Usage Counters",
             "default": 0
           }
         },
@@ -6871,6 +7327,78 @@
           "triggered_price"
         ],
         "title": "TriggeredAlertRead"
+      },
+      "UsageRead": {
+        "properties": {
+          "day": {
+            "type": "string",
+            "format": "date",
+            "title": "Day"
+          },
+          "resets_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Resets At"
+          },
+          "ai_requests": {
+            "type": "integer",
+            "title": "Ai Requests"
+          },
+          "ai_limit": {
+            "type": "integer",
+            "title": "Ai Limit"
+          },
+          "ai_remaining": {
+            "type": "integer",
+            "title": "Ai Remaining"
+          },
+          "speech_requests": {
+            "type": "integer",
+            "title": "Speech Requests"
+          },
+          "speech_limit": {
+            "type": "integer",
+            "title": "Speech Limit"
+          },
+          "speech_remaining": {
+            "type": "integer",
+            "title": "Speech Remaining"
+          },
+          "processing_provider": {
+            "type": "string",
+            "enum": [
+              "mock",
+              "local",
+              "chat"
+            ],
+            "title": "Processing Provider"
+          },
+          "cloud_fallback_enabled": {
+            "type": "boolean",
+            "title": "Cloud Fallback Enabled"
+          },
+          "measurement": {
+            "type": "string",
+            "const": "admitted_requests_not_tokens_or_billed_cost",
+            "title": "Measurement",
+            "default": "admitted_requests_not_tokens_or_billed_cost"
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "required": [
+          "day",
+          "resets_at",
+          "ai_requests",
+          "ai_limit",
+          "ai_remaining",
+          "speech_requests",
+          "speech_limit",
+          "speech_remaining",
+          "processing_provider",
+          "cloud_fallback_enabled"
+        ],
+        "title": "UsageRead"
       },
       "ValidationError": {
         "properties": {

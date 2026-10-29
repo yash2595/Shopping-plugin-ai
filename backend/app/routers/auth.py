@@ -2,13 +2,44 @@ from app.config import get_settings
 from app.db import get_db
 from app.deps import bearer_scheme, get_auth_service, get_current_user
 from app.models.user import User
-from app.schemas.auth import RegisterResponse
+from app.schemas.auth import EraseShoppingData, RegisterResponse, UsageRead
+from app.repositories.usage_repo import UsageRepository
+from datetime import datetime, timedelta, timezone
 from app.services.auth_service import AuthService
 from fastapi import APIRouter, Depends, HTTPException, Response, status
 from fastapi.security import HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 
 router = APIRouter(prefix="/v1/auth", tags=["auth"])
+
+
+@router.get("/usage", response_model=UsageRead)
+def own_usage(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    config = get_settings()
+    now = datetime.now(timezone.utc)
+    repo = UsageRepository()
+    ai = repo.get_count(db, current_user.id, now.date(), "ai_daily")
+    speech = repo.get_count(db, current_user.id, now.date(), "speech_daily")
+    return UsageRead(
+        day=now.date(), resets_at=datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc),
+        ai_requests=ai, ai_limit=config.MAX_AI_CALLS_PER_USER_PER_DAY,
+        ai_remaining=max(0, config.MAX_AI_CALLS_PER_USER_PER_DAY - ai),
+        speech_requests=speech, speech_limit=config.MAX_SPEECH_CALLS_PER_USER_PER_DAY,
+        speech_remaining=max(0, config.MAX_SPEECH_CALLS_PER_USER_PER_DAY - speech),
+        processing_provider=config.AI_RUNTIME_PROVIDER,
+        cloud_fallback_enabled=config.AI_RUNTIME_PROVIDER == "local" and config.AI_LOCAL_FALLBACK == "cloud",
+    )
+
+
+@router.delete("/data", status_code=204, response_class=Response)
+def erase_own_shopping_data(
+    data: EraseShoppingData,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    auth_service.erase_shopping_data(db, current_user.id)
+    return Response(status_code=204)
 
 
 @router.post("/register", response_model=RegisterResponse, status_code=status.HTTP_201_CREATED)

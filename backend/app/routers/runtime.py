@@ -14,6 +14,13 @@ from shopping_ai.analysis import (
 )
 from shopping_ai.browser import BrowserTarget
 from shopping_ai.models import AIRequest, Identifier
+from shopping_ai.navigation import (
+    BrowserGoalPlan,
+    BrowserPlanRequest,
+    browser_goal_is_unsafe,
+    plan_browser_goal,
+    validate_browser_plan,
+)
 from shopping_ai.voice import AudioClip
 from sqlalchemy.orm import Session
 
@@ -49,6 +56,40 @@ router = APIRouter(
 
 def service(request: Request):
     return request.app.state.runtime_service
+
+
+@router.post("/navigation/plan", response_model=BrowserGoalPlan)
+async def navigation_plan(
+    data: BrowserPlanRequest,
+    current: User = Depends(get_current_user),
+    svc=Depends(service),
+    db: Session = Depends(get_db),
+):
+    """Separate navigation planner; no DOM, execution, mutations or model prose."""
+    from app.repositories.runtime_repo import utcnow
+    result = plan_browser_goal(data)
+    if (
+        result.status != "needs_input"
+        or svc.settings.AI_RUNTIME_PROVIDER == "mock"
+        or browser_goal_is_unsafe(data.message)
+    ):
+        return result
+    count = UsageRepository().increment_and_get_count(db, current.id, utcnow().date(), "ai_daily")
+    if count > svc.settings.MAX_AI_CALLS_PER_USER_PER_DAY:
+        db.rollback()
+        reject("RATE_LIMITED", 429)
+    db.commit()  # Release the quota transaction before waiting for the planner.
+    trace = inference_fallback.set(None)
+    try:
+        provider = svc.runtime.conversation.orchestrator.ai.provider
+        candidate = await provider.plan_navigation(data)
+        return validate_browser_plan(data, candidate, processing="model").model_copy(
+            update={"inference_fallback": inference_fallback.get()}
+        )
+    except Exception:
+        return result.model_copy(update={"inference_fallback": inference_fallback.get() or "deterministic"})
+    finally:
+        inference_fallback.reset(trace)
 
 
 @router.post("/analysis", response_model=AnalysisReply)

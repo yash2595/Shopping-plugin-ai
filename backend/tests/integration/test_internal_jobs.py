@@ -13,6 +13,24 @@ from app.models.user import AuthToken, User
 settings = get_settings()
 
 
+def test_usage_retention_purges_old_metadata_but_keeps_today_quota(client, db_session, auth_headers):
+    from app.models.usage import UsageCounter
+    from app.repositories.usage_repo import UsageRepository
+    from app.services.auth_service import AuthService
+    from sqlalchemy import select
+    owner = AuthService().authenticate_token(db_session, auth_headers['Authorization'].split()[1]).id
+    today = datetime.now(timezone.utc).date()
+    old = today - timedelta(days=settings.USAGE_RETENTION_DAYS + 1)
+    UsageRepository().increment_and_get_count(db_session, owner, old, 'ai_daily')
+    UsageRepository().increment_and_get_count(db_session, owner, today, 'ai_daily')
+    db_session.commit()
+    cleanup = client.post('/internal/jobs/run', headers={'X-Job-Secret': settings.JOB_SECRET})
+    assert cleanup.status_code == 200
+    assert cleanup.json()['deleted_usage_counters'] >= 1
+    assert db_session.scalar(select(UsageCounter.count).where(UsageCounter.user_id == owner, UsageCounter.day == old)) is None
+    assert client.get('/v1/auth/usage', headers=auth_headers).json()['ai_requests'] == 1
+
+
 def test_internal_job_secret_auth(client: TestClient):
     # Missing secret header -> 401
     r1 = client.post("/internal/jobs/run")

@@ -283,3 +283,43 @@ def test_provider_decision_still_passes_engine_grounding(ai_request, now, fact_i
             assert response.status == expected and response.tool is None
 
     asyncio.run(scenario())
+
+
+def test_navigation_role_uses_its_own_structured_prompt_and_no_dom_context():
+    from shopping_ai.navigation import BrowserPlanRequest
+
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        calls.append(body)
+        assert body["model"] == "navigation-role-model"
+        assert "read-only browser navigation" in body["messages"][0]["content"]
+        assert "ModelDecision" not in body["messages"][0]["content"]
+        assert set(json.loads(body["messages"][1]["content"])) == {
+            "message",
+            "current_site",
+            "allowed_tab_ids",
+        }
+        return httpx.Response(
+            200,
+            json=completion(
+                {
+                    "status": "ready",
+                    "steps": [{"kind": "search", "site": "amazon", "query": "headphones"}],
+                }
+            ),
+        )
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            async with ChatProvider(
+                settings(), client=client, navigation_model="navigation-role-model"
+            ) as model:
+                plan = await model.plan_navigation(
+                    BrowserPlanRequest(message="search headphones on amazon")
+                )
+                assert plan.status == "ready" and plan.steps[0].kind == "search"
+
+    asyncio.run(scenario())
+    assert len(calls) == 1

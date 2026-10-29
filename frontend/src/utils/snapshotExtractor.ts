@@ -6,6 +6,26 @@
 
 import type { AnalysisProduct, ShoppingAnalysis } from '../types/assistant'
 
+export function isSupportedProductAddress(address: string): boolean {
+  try {
+    const url = new URL(address)
+    return url.protocol === 'https:' && !url.username && !url.password &&
+      ['amazon.in', 'www.amazon.in', 'flipkart.com', 'www.flipkart.com'].includes(url.hostname) &&
+      (/\/(?:dp|gp\/product|ASIN)\/[a-z0-9]{10}(?:\/|$)/i.test(url.pathname) || /\/p\/itm[a-z0-9]+(?:\/|$)/i.test(url.pathname))
+  } catch { return false }
+}
+
+/** User-initiated local diagnostics: never include URLs, queries, IDs or page text. */
+export function buildReadDiagnostic(sourceUrl: string, issue: 'read_failed' | 'check_page' | 'service_unavailable'): string {
+  let site = 'unsupported'
+  try {
+    const url = new URL(sourceUrl)
+    if (url.protocol === 'https:' && ['amazon.in', 'www.amazon.in'].includes(url.hostname)) site = 'amazon_in'
+    if (url.protocol === 'https:' && ['flipkart.com', 'www.flipkart.com'].includes(url.hostname)) site = 'flipkart'
+  } catch { /* Reports intentionally omit unrecognized addresses. */ }
+  return JSON.stringify({ report_version: 1, adapter_version: 'captured-dom-1', platform: 'electron_desktop', site, issue }, null, 2)
+}
+
 export function rawCaptureFallback(capture: AnalysisProduct, now = Date.now()): ShoppingAnalysis {
   const p = capture.product
   const result: ShoppingAnalysis = {
@@ -177,7 +197,7 @@ export function extractSnapshotFromDocument(
         retailer,
         retailer_product_id: retailerProductId,
         title: rawTitle.slice(0, 500) || 'Untitled Page',
-        url: pageUrl,
+        url: new URL(pageUrl).origin + new URL(pageUrl).pathname,
         price: price || '0.00',
         currency,
         availability: inStock ? 'in_stock' : 'out_of_stock',

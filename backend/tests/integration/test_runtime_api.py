@@ -953,6 +953,31 @@ def blocked_provider(api, engine):
     return entered, release, calls
 
 
+def test_data_erasure_fences_late_provider_output_without_resurrecting_records(committed_api):
+    from concurrent.futures import ThreadPoolExecutor
+    from sqlalchemy.orm import Session
+
+    api, engine, _ = committed_api
+    entered, release, _ = blocked_provider(api, engine)
+    body = {"event_id": "erased-while-waiting", "expected_version": api.last["version"],
+            "kind": "text", "message": "price", "target": TARGET, "origin": ORIGIN}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(api.client.post, api.base + "/events", json=body, headers=api.headers)
+        try:
+            assert entered.wait(5)
+            erased = api.client.request("DELETE", "/v1/auth/data", json={"confirm": True}, headers=api.headers)
+            assert erased.status_code == 204
+        finally:
+            release.set()
+        late = pending.result(timeout=5)
+    assert late.status_code == 404
+    assert late.json()["error"]["code"] == "SESSION_NOT_FOUND"
+    assert api.client.get(api.base, headers=api.headers).status_code == 404
+    with Session(engine) as db:
+        for model in (AIConversation, AIEvent, AIDispatch):
+            assert not list(db.scalars(select(model).where(model.conversation_id == api.conversation_id)))
+
+
 def test_runtime_concurrent_retry_survives_fresh_application_without_duplicate_work(committed_api):
     from concurrent.futures import ThreadPoolExecutor
 
@@ -1203,3 +1228,37 @@ def test_new_turn_during_synthesis_discards_stale_audio(committed_api):
     assert response.status_code == 409
     assert response.json()["error"]["code"] == "SPEECH_SUPERSEDED"
     assert "obsolete-speech" not in response.text
+
+
+
+def test_navigation_plan_is_authenticated_bounded_and_read_only(api):
+    endpoint = "/v1/ai/navigation/plan"
+    body = {"message": "open amazon then search headphones then open first result", "allowed_tab_ids": [], "current_site": None}
+    assert api.client.post(endpoint, json=body).status_code == 401
+    result = api.client.post(endpoint, headers=api.headers, json=body)
+    assert result.status_code == 200
+    assert result.json()["status"] == "ready" and len(result.json()["steps"]) == 3
+    assert "owner_id" not in result.json() and "work_ids" not in result.json()
+    assert api.client.post(endpoint, headers=api.headers, json=body | {"dom": "private text"}).status_code == 422
+    denied = api.client.post(endpoint, headers=api.headers, json=body | {"message": "open amazon then checkout"})
+    assert denied.status_code == 200 and denied.json()["steps"] == []
+
+
+@pytest.mark.parametrize("bad_plan", [False, True])
+def test_navigation_model_is_separate_quota_bound_and_cannot_invent_destinations(api, monkeypatch, bad_plan):
+    from shopping_ai.navigation import BrowserModelPlan, BrowserPlanStep
+    service = api.client.app.state.runtime_service
+    monkeypatch.setattr(service.settings, "AI_RUNTIME_PROVIDER", "local")
+    monkeypatch.setattr(service.settings, "MAX_AI_CALLS_PER_USER_PER_DAY", 1)
+    calls = []
+    class Planner:
+        async def plan_navigation(self, request):
+            calls.append(request)
+            return BrowserModelPlan(status="ready", steps=(BrowserPlanStep(kind="navigate", url="https://attacker.test/") if bad_plan else BrowserPlanStep(kind="search", query="headphones", site="amazon"),))
+    service.runtime.conversation.orchestrator.ai.provider = Planner()
+    body = {"message": "could you search headphones on amazon", "allowed_tab_ids": [], "current_site": None}
+    response = api.client.post("/v1/ai/navigation/plan", headers=api.headers, json=body)
+    assert response.status_code == 200
+    assert response.json()["status"] == ("needs_input" if bad_plan else "ready")
+    assert api.client.post("/v1/ai/navigation/plan", headers=api.headers, json=body).status_code == 429
+    assert len(calls) == 1

@@ -5,10 +5,25 @@ import { transformSync } from 'esbuild'
 import {
   extractSnapshotFromDocument,
   rawCaptureFallback,
+  buildReadDiagnostic,
+  isSupportedProductAddress,
   type MinimalDocument,
 } from '../src/utils/snapshotExtractor.ts'
 
 describe('Browser Product Snapshot Extraction Unit Tests', () => {
+  test('identified product read failures are distinct from general browser conversation', () => {
+    assert.ok(isSupportedProductAddress('https://www.amazon.in/dp/B09V3KXJPB'))
+    assert.ok(isSupportedProductAddress('https://www.flipkart.com/phone/p/itm123abc'))
+    assert.ok(!isSupportedProductAddress('https://www.amazon.in/s?q=/dp/B09V3KXJPB'))
+    assert.ok(!isSupportedProductAddress('https://attacker.test/dp/B09V3KXJPB'))
+    assert.ok(!isSupportedProductAddress('https://user:secret@www.amazon.in/dp/B09V3KXJPB'))
+  })
+  test('local diagnostic reports exclude URLs, product identifiers, query secrets and page text', () => {
+    const report = buildReadDiagnostic('https://www.amazon.in/dp/B09V3KXJPB?email=private@example.test&token=private-token', 'read_failed')
+    assert.deepStrictEqual(JSON.parse(report), { report_version: 1, adapter_version: 'captured-dom-1', platform: 'electron_desktop', site: 'amazon_in', issue: 'read_failed' })
+    for (const secret of ['B09V3KXJPB', 'private', 'email', 'token=', '/dp/', 'https://']) assert.ok(!report.includes(secret))
+    assert.strictEqual(JSON.parse(buildReadDiagnostic('not an address', 'check_page')).site, 'unsupported')
+  })
   test('native HTTP bridge rejects foreign origins/frames and never forwards retailer cookies', async () => {
     const source = readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8')
     const start = source.indexOf("ipcMain.handle('backend:request'")
@@ -95,6 +110,10 @@ describe('Browser Product Snapshot Extraction Unit Tests', () => {
       location: { href: 'https://www.amazon.in/dp/B09V3KXJPB', hostname: 'www.amazon.in', pathname: '/dp/B09V3KXJPB' },
     })
     assert.strictEqual(result.success, true)
+    const privateAddress = new Function('document', 'window', 'return (' + script + ')')(document, {
+      location: { href: 'https://www.amazon.in/dp/B09V3KXJPB?email=private@example.test&token=private-token#secret', hostname: 'www.amazon.in', pathname: '/dp/B09V3KXJPB' },
+    })
+    assert.strictEqual(privateAddress.snapshot.url, 'https://www.amazon.in/dp/B09V3KXJPB')
     assert.strictEqual(result.snapshot.availability, 'unknown')
     assert.strictEqual(result.snapshot.specs.Battery, '5000 mAh')
     assert.strictEqual(result.snapshot.reviews[0].text, reviewText)

@@ -7,6 +7,17 @@ from sqlalchemy.orm import Session
 from app.models.product import Listing, PriceObservation
 
 
+def test_shared_catalogue_never_retains_private_query_or_fragment(client, auth_headers, db_session):
+    import uuid
+    body = {'retailer': 'amazon', 'retailer_product_id': uuid.uuid4().hex, 'title': 'Private URL fixture',
+            'price': '100', 'availability': 'unknown',
+            'url': 'https://www.amazon.in/dp/B09V3KXJPB?email=private@example.test&token=private-token#secret'}
+    result = client.post('/v1/snapshots', json=body, headers=auth_headers)
+    assert result.status_code == 201
+    listing = db_session.get(Listing, uuid.UUID(result.json()['listing_id']))
+    assert listing.url == 'https://www.amazon.in/dp/B09V3KXJPB'
+
+
 def test_create_snapshot_returns_201_and_insufficient_data(
     client: TestClient,
     auth_headers: dict[str, str],

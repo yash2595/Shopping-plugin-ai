@@ -279,3 +279,31 @@ def test_provider_exception_does_not_leak_a_capacity_slot():
         assert executor.call(lambda: "ok", timeout=1) == "ok"
     finally:
         executor.close()
+
+
+
+def test_navigation_local_failure_uses_rules_without_implicit_cloud():
+    import asyncio
+    from app.ai.runtime import LocalFirstProvider, inference_fallback
+    from shopping_ai.providers.base import ProviderError
+    from shopping_ai.navigation import BrowserPlanRequest
+    calls = []
+    class Local:
+        async def plan_navigation(self, request):
+            raise ProviderError("MODEL_CONNECTION_ERROR")
+    class Cloud:
+        async def plan_navigation(self, request):
+            calls.append(request)
+            raise AssertionError("No implicit cloud navigation planning")
+    route = LocalFirstProvider(Local(), Cloud(), Cloud(), Cloud(), timeout=1)
+    marker = inference_fallback.set(None)
+    try:
+        async def scenario():
+            reply = await route.plan_navigation(BrowserPlanRequest(message="open amazon"))
+            return reply, inference_fallback.get()
+        reply, degradation = asyncio.run(scenario())
+        assert reply.status == "ready"
+        assert degradation == "deterministic"
+        assert calls == []
+    finally:
+        inference_fallback.reset(marker)

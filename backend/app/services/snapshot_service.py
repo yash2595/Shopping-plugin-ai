@@ -22,6 +22,20 @@ def utc_now() -> datetime:
 
 
 class SnapshotService:
+    @staticmethod
+    def public_product_url(value: Optional[str]) -> Optional[str]:
+        """Catalogue links never retain query/fragment credentials or tracking."""
+        from urllib.parse import urlsplit, urlunsplit
+        if not value or len(value) > 2000:
+            return None
+        try:
+            url = urlsplit(value)
+            if url.scheme != "https" or not url.hostname or url.username or url.password:
+                return None
+            return urlunsplit((url.scheme, url.netloc, url.path, "", ""))
+        except ValueError:
+            return None
+
     def __init__(
         self,
         snapshot_repo: Optional[SnapshotRepository] = None,
@@ -50,6 +64,7 @@ class SnapshotService:
             data.retailer,
             data.retailer_product_id,
         )
+        public_url = self.public_product_url(data.url)
 
         # 1. Upsert listing
         listing = self.snapshot_repo.get_listing_by_identity(
@@ -62,7 +77,7 @@ class SnapshotService:
                 db,
                 listing=listing,
                 title=data.title,
-                url=data.url,
+                url=public_url,
             )
         else:
             listing = self.snapshot_repo.create_listing(
@@ -70,7 +85,7 @@ class SnapshotService:
                 retailer=norm_retailer,
                 retailer_product_id=norm_product_id,
                 title=data.title,
-                url=data.url,
+                url=public_url,
             )
 
         # 2. Store product snapshot (belongs to user and listing)

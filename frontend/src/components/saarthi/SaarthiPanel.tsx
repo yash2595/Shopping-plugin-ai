@@ -38,10 +38,16 @@ export const SaarthiPanel: React.FC<SaarthiPanelProps> = ({
   activeTabTitle,
   userRequest,
   parsedIntent,
+  navigationRun, onPauseNavigation, onResumeNavigation,
+  analysisConsent = false, onAnalysisConsent, onEraseStoredData, onCheckUsage, privacyStatus, diagnosticReport,
   conversation = [], onVoiceListening, analysis, analysisError, onAskShopping, onStopShopping,
 }) => {
   const [draft, setDraft] = useState('')
   const [voiceStatus, setVoiceStatus] = useState('')
+  const [speechConsent, setSpeechConsent] = useState(false)
+  const [confirmErase, setConfirmErase] = useState(false)
+  const [erasing, setErasing] = useState(false)
+  const [showDiagnostic, setShowDiagnostic] = useState(false)
   const recognition = useRef<{ abort: () => void } | null>(null)
   const stopRecognition = useCallback(() => {
     const current = recognition.current
@@ -65,6 +71,7 @@ export const SaarthiPanel: React.FC<SaarthiPanelProps> = ({
   }, [stopRecognition])
 
   const startVoice = () => {
+    if (!speechConsent) { setVoiceStatus('Allow browser speech in Data and privacy before using the microphone.'); return }
     type Recognition = { start: () => void; abort: () => void; lang: string; interimResults: boolean;
       onresult: ((event: { results: { [key: number]: { [key: number]: { transcript: string } } } }) => void) | null;
       onerror: (() => void) | null; onend: (() => void) | null }
@@ -119,6 +126,29 @@ export const SaarthiPanel: React.FC<SaarthiPanelProps> = ({
 
       {/* 2. Scrollable Observable Execution Workspace */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        <details className="text-xs text-neutral-300 space-y-3" open={!analysisConsent}>
+          <summary className="cursor-pointer font-semibold">Data and privacy · Desktop preview</summary>
+          <p className="mt-2">When you ask, your words and up to four selected product captures—URLs, specs and review excerpts—may go to the configured backend and its local or cloud model. The backend creates an anonymous identity or uses configured sign-in. Shopping conversations and preferences can be stored. Retailer cookies, password fields and payment fields are not read.</p>
+          <label className="flex gap-2 mt-2"><input type="checkbox" aria-label="Allow shopping analysis" checked={analysisConsent} disabled={erasing}
+            onChange={(event) => { stopRecognition(); setConfirmErase(false); onAnalysisConsent?.(event.target.checked) }} />Allow backend and configured model processing for shopping analysis</label>
+          <label className="flex gap-2 mt-2"><input type="checkbox" aria-label="Allow browser speech" checked={speechConsent} disabled={erasing}
+            onChange={(event) => { if (!event.target.checked) stopRecognition(); setSpeechConsent(event.target.checked) }} />Allow browser speech recognition. Audio may be processed online by the browser's speech service.</label>
+          <p className="mt-2">You can withdraw either permission here. Clear removes local conversation and captures; it does not erase stored server records. Closing the app resets these permissions. Navigation step IDs and results stay in memory until app exit to prevent duplicate actions.</p>
+          <div className="flex gap-2 flex-wrap mt-2">
+            <button type="button" className="underline" disabled={erasing || busy} onClick={() => void onCheckUsage?.()}>Check AI usage</button>
+            <button type="button" className="underline" disabled={erasing || busy || !onEraseStoredData} onClick={() => setConfirmErase((value) => !value)}>Delete stored shopping data</button>
+          </div>
+          {confirmErase && <div className="space-y-2 mt-2">
+            <p>This removes your shopping sessions, checkpoints, captures, price observations, alerts and owned review summaries from the active database. Identity/authentication and daily usage counters remain. Backups and external model records have separate retention. Other active devices can create new records.</p>
+            <button type="button" className="text-red-300 underline" disabled={erasing || busy} onClick={async () => {
+              stopRecognition(); setSpeechConsent(false); setErasing(true)
+              try { await onEraseStoredData?.() } finally { setErasing(false); setConfirmErase(false) }
+            }}>{erasing ? 'Deleting…' : 'Confirm deletion'}</button>
+            <button type="button" className="ml-3 underline" disabled={erasing} onClick={() => setConfirmErase(false)}>Cancel</button>
+          </div>}
+          {privacyStatus && <p role="status" className="mt-2 whitespace-pre-wrap select-text">{privacyStatus}</p>}
+          <p className="mt-2 text-neutral-500">Free desktop preview. No paid subscriptions or checkout are enabled.</p>
+        </details>
         <form className="space-y-2" onSubmit={(event) => {
           event.preventDefault()
           stopRecognition()
@@ -130,13 +160,24 @@ export const SaarthiPanel: React.FC<SaarthiPanelProps> = ({
             className="w-full rounded-lg bg-neutral-900 border border-neutral-700 p-3 text-sm text-white select-text" />
           <div className="flex gap-2">
             <button type="submit" disabled={busy || !draft.trim() || !onAskShopping} className="rounded bg-cyan-700 px-3 py-2 text-xs disabled:opacity-40">{busy ? 'Checking…' : 'Ask'}</button>
-            <button type="button" onClick={startVoice} disabled={busy} className="rounded bg-neutral-800 px-3 py-2 text-xs">Mic</button>
+            <button type="button" onClick={startVoice} disabled={busy || erasing} className="rounded bg-neutral-800 px-3 py-2 text-xs">Mic</button>
             <button type="button" onClick={() => { stopRecognition(); window.speechSynthesis?.cancel(); onStopShopping?.(); setVoiceStatus('Stopped.') }} className="rounded bg-neutral-800 px-3 py-2 text-xs">Stop</button>
             {(analysis || conversation.some((turn) => turn.role === 'assistant')) && <button type="button" onClick={speakAnswer} className="rounded bg-neutral-800 px-3 py-2 text-xs">Read aloud</button>}
           </div>
           <p className="text-[10px] text-neutral-500">Capture products by asking on each page, then ask to compare. Clear removes this session’s captures.</p>
           {voiceStatus && <p role="status" className="text-xs text-neutral-400">{voiceStatus}</p>}
         </form>
+        <div className="text-xs text-neutral-400">
+          <button type="button" className="underline" onClick={() => setShowDiagnostic((value) => !value)}>Report a page-reading problem</button>
+          {showDiagnostic && <div className="space-y-2 mt-2"><p>Copy this local report to a project issue yourself. It excludes addresses, page text, product/account IDs and secrets. Nothing is uploaded automatically.</p><textarea aria-label="Local page diagnostic" readOnly rows={8} value={diagnosticReport || 'No report available.'} className="w-full rounded bg-neutral-900 p-2 select-text" /></div>}
+        </div>
+        {navigationRun && <section aria-label="Navigation plan" data-status={navigationRun.status} className="space-y-2 text-xs text-neutral-300">
+          <p className="font-semibold">Browser plan · {navigationRun.status}</p>
+          <ol className="list-decimal pl-4 space-y-1">{navigationRun.steps.map((step) => <li key={step.step_id}>{step.command.kind.replaceAll('_', ' ')} · {step.status}</li>)}</ol>
+          <p role="status">{navigationRun.message}</p>
+          {navigationRun.status === 'executing' && <button type="button" className="underline" onClick={onPauseNavigation}>Pause after this step</button>}
+          {navigationRun.can_resume && <button type="button" className="underline" onClick={() => void onResumeNavigation?.()}>Resume browser plan</button>}
+        </section>}
         <section aria-label="Conversation" aria-live="polite" className="space-y-2 select-text">
           {conversation.map((turn) => <article key={turn.id} className={`rounded-lg p-3 text-sm whitespace-pre-wrap ${turn.role === 'user' ? 'bg-cyan-950 ml-5' : 'bg-neutral-900 mr-2'}`}><span className="block text-[10px] text-neutral-400">{turn.role === 'user' ? 'You' : 'Saarthi'}</span>{turn.text}</article>)}
         </section>

@@ -17,6 +17,17 @@ clarifications and explicit preferences survive page changes. Supported retailer
 results can be opened from observed product links, followed by source-based answers.
 See the [conversation/navigation implementation](frontend/README.md#saarthi-conversation-and-browser-navigation).
 
+The additional-considerations phase adds opt-in analysis/browser speech, confirmed
+stored-shopping-data erasure, daily usage visibility and private local diagnostics.
+Daily CI fixtures do not scrape retailer sites. Mobile, MV3 packaging and payment
+launch remain separate tracks; see the [risk implementation record](backend/README.md#additional-considerations-implementation-on-29-october-2026).
+
+Navigation now runs through a separate bounded planner/controller/native-executor
+pipeline, with per-step evidence, Pause/Resume/Stop and replay protection. A separate
+model can be configured for the navigation role. Existing durable AI work is claimed
+and acknowledged instead of being ignored; unsupported offer extraction remains
+explicitly incomplete. See [navigation orchestration](frontend/README.md#separate-navigation-orchestration).
+
 Shopping assistant monorepo. The original AI package and the newer API/browser demo
 are separate integration layers:
 

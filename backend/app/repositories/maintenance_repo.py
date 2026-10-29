@@ -7,6 +7,7 @@ from app.models.product import ProductSnapshot
 from app.models.review import ReviewSummary
 from app.models.session import Message, Session as ChatSession
 from app.models.user import AuthToken
+from app.models.usage import UsageCounter
 
 
 def utc_now() -> datetime:
@@ -14,6 +15,9 @@ def utc_now() -> datetime:
 
 
 class MaintenanceRepository:
+    def delete_usage_older_than(self, db: Session, cutoff) -> int:
+        return db.execute(delete(UsageCounter).where(UsageCounter.day < cutoff)).rowcount
+
     def expire_old_auth_tokens(self, db: Session, now: datetime) -> int:
         stmt = (
             update(AuthToken)

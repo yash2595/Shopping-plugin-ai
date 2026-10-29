@@ -17,6 +17,25 @@ settings = get_settings()
 
 
 class AuthService:
+    def erase_shopping_data(self, db: Session, user_id) -> None:
+        """Erase owned shopping records atomically; preserve identity and abuse limits.
+
+        This is data erasure, not identity-provider account closure or backup removal.
+        Session deletion cascades to checkpoints, events and pending browser work.
+        """
+        from sqlalchemy import delete
+        from app.models.alert import AlertNotification, PriceAlert
+        from app.models.context import ShoppingContext
+        from app.models.product import PriceObservation, ProductSnapshot
+        from app.models.review import ReviewSummary
+        from app.models.session import Session as ChatSession
+
+        db.execute(select(User.id).where(User.id == user_id).with_for_update())
+        db.execute(delete(ReviewSummary).where(ReviewSummary.summary["owner_id"].astext == str(user_id)))
+        for model in (AlertNotification, PriceAlert, PriceObservation, ProductSnapshot, ShoppingContext, ChatSession):
+            db.execute(delete(model).where(model.user_id == user_id))
+        db.commit()
+
     def __init__(self, user_repo: Optional[UserRepository] = None):
         self.user_repo = user_repo or UserRepository()
         self.verifier = None

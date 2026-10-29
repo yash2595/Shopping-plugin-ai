@@ -7,7 +7,7 @@
  */
 
 import type {
-  AnalysisProduct, ShoppingAnalysis,
+  AnalysisProduct, ShoppingAnalysis, UsageRead, BrowserGoalPlan,
   ClaimedRuntimeWork, RuntimeCapabilities, RuntimeConfirmation, RuntimeEvent, RuntimeReceipt, RuntimeReply,
   RuntimeTarget, RuntimeWork,
 } from '../types/assistant'
@@ -267,6 +267,19 @@ export class ShoppingApiClient {
     }
   }
 
+  async getOwnUsage(): Promise<UsageRead> {
+    const token = await this.bootstrapAuth()
+    const response = await this.authenticatedRequest('/v1/auth/usage', { method: 'GET', token })
+    return await response.json() as UsageRead
+  }
+
+  async eraseShoppingData(): Promise<void> {
+    // Deletion must never register a new anonymous identity or switch owners.
+    const token = await this.tokenProvider.get()
+    if (!token) throw new AuthError('No active account is connected. Stored data was not changed.')
+    await this.authenticatedRequest('/v1/auth/data', { method: 'DELETE', token, body: JSON.stringify({ confirm: true }) })
+  }
+
   /**
    * Creates a new chat session.
    */
@@ -434,6 +447,10 @@ export class ShoppingApiClient {
       throw new ApiError('The captures are too large. Clear previous products and capture fewer details.', 413)
     }
     return this.runtimeJson('/v1/ai/analysis', 'POST', payload)
+  }
+
+  async planBrowserNavigation(message: string, allowedTabIds: string[], currentSite: 'amazon' | 'flipkart' | 'google' | null): Promise<BrowserGoalPlan> {
+    return this.runtimeJson('/v1/ai/navigation/plan', 'POST', { message, allowed_tab_ids: allowedTabIds.slice(0, 20), current_site: currentSite })
   }
 
   async startAiConversation(sessionId: string, language: 'en' | 'hi-Latn' = 'hi-Latn'): Promise<RuntimeReply> {

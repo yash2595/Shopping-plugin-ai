@@ -917,7 +917,7 @@ retailer coverage or production capacity.
 
 ### Integrated analytical shopping flow verification
 
-The current local integration passed 621 core tests, 172 backend tests against
+The preceding analytical integration passed 621 core tests, 172 backend tests against
 disposable PostgreSQL 17 and, after conversation/navigation integration, 43 client
 tests (836 total). TypeScript/Vite build,
 Electron bundle and native TypeScript check passed. Core Ruff and Compose config
@@ -934,3 +934,106 @@ navigation is exercised by native fixture tests. Live ten-page retailer checks,
 focused visible-window navigation, device microphone/local voices, Ollama answer quality,
 MV3/WXT packaging and offscreen voice remain pending. Analysis-only mode keeps
 cart/purchase disabled.
+
+### Additional considerations implementation on 29 October 2026
+
+The attached Additional Considerations report is planning input, not evidence of
+legal approval or a request to add payments/mobile apps. The current MVP remains
+an Electron desktop browser. Chrome MV3 distribution and mobile share/PWA work
+are separate release tracks; desktop retention metrics must be labelled desktop.
+
+Authenticated `GET /v1/auth/usage` returns only the caller's UTC daily admission
+counts, limits, remaining turns, next UTC midnight and configured model route.
+It does not call a model. Existing strict daily admission gates are retained;
+extractive analysis and review statistics remain model-free. A turn may invoke
+multiple provider calls/fallbacks, so counts are not token telemetry or an invoice.
+Operator-only `GET /internal/jobs/usage` uses X-Job-Secret and exposes aggregate
+admissions without user IDs or page text. Actual provider bills/token costs,
+spend caps and production abuse prevention still need the chosen provider/account.
+Usage metadata older than USAGE_RETENTION_DAYS (default 30) is removed by the
+existing maintenance job; deployers must actually run that job.
+
+`DELETE /v1/auth/data` requires the current bearer and exact JSON `{ "confirm": true }`.
+It atomically erases owned shopping sessions/context, messages, checkpoints, event
+ledger/outbox, snapshots, contributed price observations, alerts/notifications and
+owner-tagged review summaries from the active database. It cannot choose another
+owner. Repeated erasure is safe; pending provider output cannot resurrect a deleted
+session. Account identity, authentication/revocation metadata, current quotas and
+shared product catalogue facts remain. It is not IdP account closure, erasure of
+backup copies, erasure from external model services, or a compliance certification.
+Subsequent requests from another active device can create new records. Ownerless
+legacy review caches remain inaccessible to users and follow their retention job.
+
+The UI requires an explicit session permission before capture/backend analysis,
+with a separate browser-speech permission. No checkboxes are preselected. Simple
+local conversation/navigation needs no analysis permission. Withdrawal cancels
+local work and clears local captures/history; deleting server data is a separate
+confirmed action. A local page-problem report includes only site/adapter version
+and error category, excluding addresses, search queries, IDs, page text and tokens;
+the user chooses whether to share it. Detected product-page read failures stop with
+an explicit error rather than falling into ungrounded general conversation.
+
+The CI schedule replays bounded offline adapter/navigation fixtures daily. It
+never polls retailers and therefore cannot by itself detect an external redesign.
+Live acceptance still requires user-visited sample pages, responsible site review
+and visible failures; no background server scraping or bot-defense bypass is added.
+
+Release decisions: verify Amazon/Flipkart permission and applicable ToS before
+distribution; publish an operator-specific privacy notice with contact/grievance,
+purposes, processors, retention/backup schedule and rights workflow. Confirm the
+applicable phased Indian data-protection obligations with the operator's adviser;
+do not infer legal permission from DOM-only extraction. No paid tier, gateway,
+subscription promises, refund processing or GST setup is enabled by this code.
+Business identity, provider/gateway account, refund/cancellation policy and tax
+review are prerequisites before a separate paid launch.
+
+Primary references checked on 29 October 2026:
+- Chrome Web Store disclosure/consent: https://developer.chrome.com/docs/webstore/program-policies/user-data-faq
+- Flipkart platform terms: https://www.flipkart.com/pages/terms
+- MeitY DPDP Rules page: https://www.meity.gov.in/documents/act-and-policies/digital-personal-data-protection-rules-2025-gDOxUjMtQWa?pageTitle=Digital-Personal-Data-Protection-Rules-2025
+- Amazon India Conditions of Use page (automated retrieval returned HTTP 503; manual review still required): https://www.amazon.in/gp/help/customer/display.html?nodeId=GLSBYFE9MGKKQXXM
+
+Verification for this additional-considerations phase: 178 backend tests against
+PostgreSQL 17 and 48 client tests passed. TypeScript/Vite, Electron bundling and
+native type checks passed; lint retains three existing warnings. The real hidden
+Electron fixture smoke verifies consent before registration/analysis, separate mic
+permission, usage display, private diagnostic fields, Cancel, confirmed server-data
+erasure, quota preservation and consent withdrawal. A separate independent-DB
+provider race proves deleted sessions cannot be recreated by late AI output.
+No real retailer/model/microphone acceptance or paid integration was performed.
+
+New native captures and catalogue writes omit URL query strings/fragments. Native
+highlighting remains bound to the current document ID and canonical product path.
+Existing shared catalogue rows and backups need an operator audit before migration;
+this code does not claim retroactive erasure of unknown legacy data. The CI schedule
+is source configuration and takes effect only after these changes are pushed.
+
+### Separate navigation planning role
+
+Authenticated `POST /v1/ai/navigation/plan` accepts direct user text, known current
+site (optional) and at most 20 allowed tab IDs. It returns a bounded complete plan
+with up to eight typed steps, or needs_input/not_navigation with no steps. It does
+not perform browser work, grant mutation permission, accept DOM or generate an
+executable script. Known rules are free of model calls; unresolved requests may
+use the navigation role under the same daily AI admission budget. The quota
+transaction is committed before provider waiting.
+
+The navigation role has a separate structured prompt/schema from conversation and
+product decisions. Optional AI_LOCAL_NAVIGATION_MODEL / AI_CHAT_NAVIGATION_MODEL
+settings select its model independently on the already trusted endpoint. Blank
+settings reuse the main model. Local inference falls back to rules by default;
+cloud fallback still requires the existing explicit configuration. Model routing
+is tested with mocked transports, not a claim that a local model is installed.
+
+Plan policy rejects unsafe/internal/credentialed URLs, fabricated search words or
+destinations, unknown tab IDs, negated/ambiguous instructions and unsupported
+operations. No safe prefix is returned for a bad tail. The native browser independently
+validates expected foreground source/document and command allowlists. The frontend
+controller verifies outcomes and stops on failure rather than treating LLM text as
+execution evidence.
+
+Existing runtime outbox/work ownership, claims, deadlines and receipt validation
+remain authoritative for durable product/offer/search work. The desktop bridge now
+consumes these records and sends observed/failed/blocked receipts. Missing offer
+identity or delivery evidence is never fabricated to make a market search appear
+complete. A universal live search-offer adapter is still outside this implementation.

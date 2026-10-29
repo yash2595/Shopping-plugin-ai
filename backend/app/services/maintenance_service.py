@@ -39,6 +39,7 @@ class MaintenanceService:
         deleted_notifications = self.maintenance_repo.delete_notifications_older_than(db, notification_cutoff)
         deleted_sessions = self.maintenance_repo.delete_sessions_older_than(db, session_cutoff)
         deleted_review_summaries = self.maintenance_repo.delete_review_summaries_older_than(db, review_summary_cutoff)
+        deleted_usage_counters = self.maintenance_repo.delete_usage_older_than(db, (now - timedelta(days=settings.USAGE_RETENTION_DAYS)).date())
 
         db.commit()
 
@@ -49,4 +50,5 @@ class MaintenanceService:
             deleted_notifications=deleted_notifications,
             deleted_sessions=deleted_sessions,
             deleted_review_summaries=deleted_review_summaries,
+            deleted_usage_counters=deleted_usage_counters,
         )

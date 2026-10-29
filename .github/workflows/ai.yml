@@ -1,5 +1,9 @@
 name: AI package
 on:
+  workflow_dispatch:
+  schedule:
+    # Offline fixtures only; this never polls retailer websites.
+    - cron: '17 3 * * *'
   push:
     paths: ["ai/**", "backend/**", "frontend/**", "Dockerfile", "compose.yaml", ".dockerignore", ".github/workflows/ai.yml"]
   pull_request:
@@ -7,7 +11,22 @@ on:
 permissions:
   contents: read
 jobs:
+  adapter_fixtures:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+        working-directory: frontend
+      - run: node --experimental-strip-types --test tests/snapshotExtraction.test.ts tests/browserConversation.test.ts tests/navigationOrchestrator.test.ts
+        working-directory: frontend
   check:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -24,6 +43,7 @@ jobs:
       - run: shopping-ai ai/examples/product_question.json --fresh-demo
       - run: shopping-ai ai/examples/cart_proposal.json --fresh-demo
   backend:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -55,6 +75,7 @@ jobs:
       - run: python -m alembic upgrade head
         working-directory: backend
   containers:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     env:
       SHOPPING_DB_PASSWORD: ci-local-container-test-password
@@ -69,6 +90,7 @@ jobs:
       - if: always()
         run: docker compose down
   client:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

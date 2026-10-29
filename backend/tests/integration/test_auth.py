@@ -12,6 +12,84 @@ from sqlalchemy.orm import Session
 from app.models.user import AuthToken
 
 
+def test_erasure_is_owned_cascades_runtime_and_preserves_daily_limits(client, auth_headers, db_session):
+    import uuid
+    from datetime import datetime, timezone
+    from sqlalchemy import func
+    from app.models.user import User
+    from app.models.product import ProductSnapshot, PriceObservation
+    from app.models.review import ReviewSummary
+    from app.models.alert import PriceAlert
+    from app.models.context import ShoppingContext
+    from app.models.session import AIConversation, AIEvent, AIDispatch, Session as ChatSession
+    from app.repositories.usage_repo import UsageRepository
+    from app.services.auth_service import AuthService
+
+    auth = AuthService()
+    owner = auth.authenticate_token(db_session, auth_headers['Authorization'].split()[1]).id
+    other = {'Authorization': 'Bearer ' + client.post('/v1/auth/register').json()['access_token']}
+    source = {'retailer': 'amazon', 'retailer_product_id': uuid.uuid4().hex, 'title': 'Erase fixture', 'price': '100', 'availability': 'in_stock'}
+    listing = client.post('/v1/snapshots', headers=auth_headers, json=source).json()['listing_id']
+    assert client.post('/v1/snapshots', headers=other, json=source).status_code == 201
+    reviews = {'reviews': [{'rating': 2, 'text': 'Battery lasts a day'}, {'rating': 3, 'text': 'Sound is clear'}, {'rating': 4, 'text': 'Build is solid'}]}
+    assert client.post(f'/v1/listings/{listing}/review-summary', headers=auth_headers, json=reviews).status_code == 200
+    assert client.post(f'/v1/listings/{listing}/review-summary', headers=other, json=reviews).status_code == 200
+    assert client.post('/v1/alerts', headers=auth_headers, json={'listing_id': listing, 'target_price': '90'}).status_code == 201
+    own_session = client.post('/v1/sessions', headers=auth_headers, json={}).json()['id']
+    other_session = client.post('/v1/sessions', headers=other, json={}).json()['id']
+    runtime = client.post(f'/v1/ai/sessions/{own_session}/conversation', headers=auth_headers, json={'language': 'en'})
+    assert runtime.status_code == 200
+    conv = runtime.json()
+    result = client.post(f"/v1/ai/conversations/{conv['conversation_id']}/events", headers=auth_headers, json={'event_id': 'erase-event', 'expected_version': conv['version'], 'kind': 'text', 'message': 'hello'})
+    assert result.status_code == 200
+    # A real pending outbox record must disappear, including its executable payload.
+    db_session.add(AIDispatch(dispatch_id=uuid.uuid4().hex, conversation_id=conv['conversation_id'], user_id=owner, session_id=uuid.UUID(own_session), kind='browser', payload={'private': 'pending'}, origin='https://www.amazon.in', version=result.json()['version'], deadline_at=datetime.now(timezone.utc)))
+    UsageRepository().increment_and_get_count(db_session, owner, datetime.now(timezone.utc).date(), 'ai_daily')
+    db_session.commit()
+    before = client.get('/v1/auth/usage', headers=auth_headers).json()
+    assert before['ai_requests'] >= 1
+    erased = client.request('DELETE', '/v1/auth/data', headers=auth_headers, json={'confirm': True})
+    assert erased.status_code == 204
+    assert client.get(f'/v1/sessions/{own_session}', headers=auth_headers).status_code == 404
+    assert client.get(f'/v1/sessions/{other_session}', headers=other).status_code == 200
+    for model in (ProductSnapshot, PriceObservation, PriceAlert, ShoppingContext, ChatSession, AIConversation, AIEvent, AIDispatch):
+        assert db_session.scalar(select(func.count()).select_from(model).where(model.user_id == owner)) == 0
+    assert db_session.scalar(select(func.count()).select_from(ReviewSummary).where(ReviewSummary.summary['owner_id'].astext == str(owner))) == 0
+    assert client.get(f'/v1/listings/{listing}/review-summary', headers=other).status_code == 200
+    assert db_session.get(User, owner) is not None
+    assert client.get('/v1/auth/usage', headers=auth_headers).json() == before
+    assert client.request('DELETE', '/v1/auth/data', headers=auth_headers, json={'confirm': True}).status_code == 204
+
+
+def test_erasure_requires_authentication_and_explicit_confirmation(client, auth_headers):
+    assert client.request('DELETE', '/v1/auth/data', json={'confirm': True}).status_code == 401
+    for body in ({}, {'confirm': False}, {'confirm': 1}, {'confirm': 'true'}, {'confirm': True, 'user_id': 'other'}):
+        assert client.request('DELETE', '/v1/auth/data', headers=auth_headers, json=body).status_code == 422
+
+
+def test_usage_is_private_bounded_and_aggregate_requires_operator_secret(client, auth_headers, db_session):
+    from app.config import get_settings
+    from app.repositories.usage_repo import UsageRepository
+    from app.services.auth_service import AuthService
+    from datetime import datetime, timezone
+    owner = AuthService().authenticate_token(db_session, auth_headers['Authorization'].split()[1]).id
+    today = datetime.now(timezone.utc).date()
+    repo = UsageRepository()
+    repo.increment_and_get_count(db_session, owner, today, 'ai_daily')
+    db_session.commit()
+    usage = client.get('/v1/auth/usage', headers=auth_headers)
+    assert usage.status_code == 200 and usage.headers['Cache-Control'] == 'no-store'
+    assert usage.json()['ai_requests'] == 1
+    other = {'Authorization': 'Bearer ' + client.post('/v1/auth/register').json()['access_token']}
+    assert client.get('/v1/auth/usage', headers=other).json()['ai_requests'] == 0
+    assert client.get('/v1/auth/usage').status_code == 401
+    assert client.get('/internal/jobs/usage', headers=auth_headers).status_code == 401
+    aggregate = client.get('/internal/jobs/usage', headers={'X-Job-Secret': get_settings().JOB_SECRET})
+    assert aggregate.status_code == 200 and aggregate.headers['Cache-Control'] == 'no-store'
+    assert aggregate.json()['ai_requests'] >= 1
+    assert set(aggregate.json()) == {'day', 'ai_requests', 'speech_requests', 'measurement'}
+
+
 def test_logout_revokes_token_and_prevents_replay(client, auth_headers):
     session_id = client.post("/v1/sessions", json={}, headers=auth_headers).json()["id"]
     payload = {"request_id": "logout-retry", "text": "hello"}

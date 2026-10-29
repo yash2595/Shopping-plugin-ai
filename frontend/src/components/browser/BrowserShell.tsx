@@ -67,6 +67,8 @@ export const BrowserShell: React.FC<BrowserShellProps> = ({
   userRequest,
   parsedIntent,
   onIdleOrbBoundsChange,
+  navigationRun, onPauseNavigation, onResumeNavigation,
+  analysisConsent, onAnalysisConsent, onEraseStoredData, onCheckUsage, privacyStatus, diagnosticReport,
   conversation, onVoiceListening, analysis, analysisError, onAskShopping, onStopShopping,
 }) => {
   const activeTab = tabs.find((t) => t.id === activeTabId) || tabs[0]
@@ -120,6 +122,15 @@ export const BrowserShell: React.FC<BrowserShellProps> = ({
         {isSaarthiPanelOpen && (
           <SaarthiPanel
             analysis={analysis}
+            navigationRun={navigationRun}
+            onPauseNavigation={onPauseNavigation}
+            onResumeNavigation={onResumeNavigation}
+            analysisConsent={analysisConsent}
+            onAnalysisConsent={onAnalysisConsent}
+            onEraseStoredData={onEraseStoredData}
+            onCheckUsage={onCheckUsage}
+            privacyStatus={privacyStatus}
+            diagnosticReport={diagnosticReport}
             conversation={conversation}
             onVoiceListening={onVoiceListening}
             analysisError={analysisError}

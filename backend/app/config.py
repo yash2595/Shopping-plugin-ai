@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     )
     MAX_OBSERVATIONS_PER_USER_PER_DAY: int = 100  # PLACEHOLDER: max observations per user per day
     MAX_FUTURE_TIMESTAMP_MINUTES: int = 5  # PLACEHOLDER: max clock skew in the future
-    MAX_AI_CALLS_PER_USER_PER_DAY: int = 50  # PLACEHOLDER: daily AI calls per user
+    MAX_AI_CALLS_PER_USER_PER_DAY: int = Field(default=50, ge=1, le=10000)
 
     # Policy & Context Limits
     MAX_ACTIVE_ALERTS_PER_USER: int = 20  # PLACEHOLDER: max active alerts per user
@@ -68,6 +68,8 @@ class Settings(BaseSettings):
     AI_ANALYSIS_ONLY: bool = True
     AI_LOCAL_ENDPOINT: str = "http://127.0.0.1:11434/v1/chat/completions"
     AI_LOCAL_MODEL: str = "llama3.2"
+    AI_LOCAL_NAVIGATION_MODEL: str = Field(default="", max_length=100)
+    AI_CHAT_NAVIGATION_MODEL: str = Field(default="", max_length=100)
     AI_LOCAL_TIMEOUT_SECONDS: float = Field(default=5, ge=0.1, le=60)
     AI_LOCAL_FALLBACK: Literal["deterministic", "cloud"] = "deterministic"
     AI_RUNTIME_TIMEOUT_SECONDS: float = Field(default=90, ge=5, le=300)
@@ -112,6 +114,7 @@ class Settings(BaseSettings):
     NOTIFICATION_RETENTION_DAYS: int = 90  # PLACEHOLDER: notification retention period in days
     SESSION_INACTIVE_RETENTION_DAYS: int = 90  # PLACEHOLDER: session retention period in days
     REVIEW_SUMMARY_RETENTION_DAYS: int = 30  # PLACEHOLDER: review summary retention period in days
+    USAGE_RETENTION_DAYS: int = Field(default=30, ge=1, le=3650)
 
     model_config = SettingsConfigDict(
         env_file=".env",

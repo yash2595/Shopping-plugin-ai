@@ -8,3 +8,4 @@ class JobResult(BaseSchema):
     deleted_notifications: int
     deleted_sessions: int = 0
     deleted_review_summaries: int = 0
+    deleted_usage_counters: int = 0

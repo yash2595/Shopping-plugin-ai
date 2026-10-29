@@ -69,7 +69,7 @@ function nativeHarness() {
   const code = transformSync(source.slice(start, end), { loader: 'ts' }).code
   let handler: (event: string, data: Record<string, unknown>) => Promise<{ success: boolean; message: string }>
   const wc = Object.assign(new EventEmitter(), {
-    current: 'https://www.google.com/', calls: 0, stopped: false,
+    id: 7, current: 'https://www.google.com/', calls: 0, stopped: false,
     getURL() { return this.current },
     async loadURL(url: string) { this.calls++; this.current = url },
     stop() { this.stopped = true }, reload() { this.calls++ },
@@ -158,4 +158,22 @@ test('packaged result extraction handles product links as data and drops trackin
   assert.equal(wc.current, 'https://www.amazon.in/dp/B09V3KXJPB')
   wc.emit('did-finish-load')
   assert.equal((await pending).success, true)
+})
+
+test('native step journal deduplicates execution and refuses identity reuse', async () => {
+  const { call, wc } = nativeHarness()
+  const data = { kind: 'navigate', url: 'https://example.com/', executionId: 'stable-step', expectedDocumentId: 'document-7-0' }
+  const first = call(data), duplicate = call(data)
+  assert.equal(wc.calls, 1)
+  assert.equal((await call({ ...data, url: 'https://other.test/' })).success, false)
+  wc.emit('did-finish-load')
+  assert.equal((await first).success, true)
+  assert.deepEqual(await duplicate, await first)
+  assert.equal((await call(data)).success, true)
+  assert.equal(wc.calls, 1)
+})
+test('an orchestrated step cannot execute against a reloaded same-URL document', async () => {
+  const { call, wc } = nativeHarness()
+  assert.equal((await call({ kind: 'navigate', url: 'https://example.com/', executionId: 'stale-step', expectedDocumentId: 'document-7-old' })).success, false)
+  assert.equal(wc.calls, 0)
 })

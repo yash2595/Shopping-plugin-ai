@@ -27,13 +27,35 @@ export interface ShoppingAnalysis {
 }
 
 export interface ConversationTurn { id: string; role: 'user' | 'assistant'; text: string }
+export interface BrowserGoalPlan {
+  plan_id: string; status: 'ready' | 'needs_input' | 'not_navigation'; processing: 'rules' | 'model';
+  inference_fallback: 'deterministic' | 'cloud' | null;
+  steps: { kind: 'navigate' | 'search' | 'back' | 'forward' | 'reload' | 'scroll_down' | 'scroll_up' | 'open_result' | 'switch';
+    url: string | null; query: string | null; site: string | null; index: number | null; tab_id: string | null }[];
+}
 export interface ShoppingPanelIntegration {
+  navigationRun?: import('../services/navigationOrchestrator').NavigationRunSnapshot | null
+  onPauseNavigation?: () => void
+  onResumeNavigation?: () => Promise<void>
+  analysisConsent?: boolean
+  onAnalysisConsent?: (allowed: boolean) => void
+  onEraseStoredData?: () => Promise<void>
+  onCheckUsage?: () => Promise<void>
+  privacyStatus?: string
+  diagnosticReport?: string
   conversation?: ConversationTurn[]
   onVoiceListening?: (listening: boolean) => void
   analysis?: ShoppingAnalysis | null
   analysisError?: string
   onAskShopping?: (question: string) => Promise<void>
   onStopShopping?: () => void
+}
+
+export interface UsageRead {
+  day: string; resets_at: string; ai_requests: number; ai_limit: number; ai_remaining: number;
+  speech_requests: number; speech_limit: number; speech_remaining: number;
+  processing_provider: 'mock' | 'local' | 'chat'; cloud_fallback_enabled: boolean;
+  measurement: 'admitted_requests_not_tokens_or_billed_cost';
 }
 
 export type BackendConnectionStatus = 'connected' | 'disconnected' | 'pending'

@@ -12,6 +12,39 @@ import {
 } from '../src/services/apiClient.ts'
 
 describe('ShoppingApiClient Integration Unit Tests', () => {
+  test('navigation planner receives direct user text and permitted tab IDs, never DOM', async () => {
+    const client = new ShoppingApiClient({ tokenProvider: createMockTokenProvider('existing'), customFetch: async (input, init) => {
+      assert.ok(String(input).endsWith('/v1/ai/navigation/plan'))
+      assert.deepStrictEqual(JSON.parse(init?.body as string), { message: 'open amazon then search headphones', allowed_tab_ids: ['tab-1'], current_site: 'google' })
+      return Response.json({ plan_id: 'plan', status: 'ready', steps: [], processing: 'rules' })
+    } })
+    assert.strictEqual((await client.planBrowserNavigation('open amazon then search headphones', ['tab-1'], 'google')).plan_id, 'plan')
+  })
+  test('data erasure requires an existing identity and never registers a replacement', async () => {
+    let calls = 0
+    const client = new ShoppingApiClient({ tokenProvider: createMockTokenProvider(), customFetch: async () => { calls++; throw new Error('Unexpected network call') } })
+    await assert.rejects(() => client.eraseShoppingData(), AuthError)
+    assert.strictEqual(calls, 0)
+  })
+  test('data erasure sends explicit confirmation under the current bearer identity', async () => {
+    const client = new ShoppingApiClient({ tokenProvider: createMockTokenProvider('existing'), customFetch: async (input, init) => {
+      assert.ok(String(input).endsWith('/v1/auth/data'))
+      assert.strictEqual(init?.method, 'DELETE')
+      assert.deepStrictEqual(JSON.parse(init?.body as string), { confirm: true })
+      assert.strictEqual(new Headers(init?.headers).get('Authorization'), 'Bearer existing')
+      return new Response(null, { status: 204 })
+    } })
+    await client.eraseShoppingData()
+  })
+  test('usage reads are authenticated and do not submit a shopping question', async () => {
+    const client = new ShoppingApiClient({ tokenProvider: createMockTokenProvider('existing'), customFetch: async (input, init) => {
+      assert.ok(String(input).endsWith('/v1/auth/usage'))
+      assert.strictEqual(init?.method, 'GET')
+      assert.strictEqual(init?.body, undefined)
+      return Response.json({ ai_requests: 3, ai_remaining: 47 })
+    } })
+    assert.strictEqual((await client.getOwnUsage()).ai_remaining, 47)
+  })
   test('packaged desktop JSON uses the trusted HTTP bridge and preserves 204 responses', async () => {
     const original = Object.getOwnPropertyDescriptor(globalThis, 'window')
     const calls: unknown[] = []

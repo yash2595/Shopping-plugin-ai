@@ -398,3 +398,105 @@ def test_model_intent_cannot_invent_an_open_request(setup):
     reply = say(dialogue, principal, state, target, "tell me the cheapest price")
     assert reply.status == "needs_input" and reply.navigation is None
     assert reply.state.pending_navigation is None
+
+
+def test_browser_goal_planner_orders_complete_plan_without_executing():
+    from shopping_ai.navigation import BrowserPlanRequest, plan_browser_goal
+
+    plan = plan_browser_goal(
+        BrowserPlanRequest(message="open amazon then search headphones then open first result")
+    )
+    assert plan.status == "ready"
+    assert [step.kind for step in plan.steps] == ["navigate", "navigate", "open_result"]
+    assert plan.steps[1].url == "https://www.amazon.in/s?k=headphones"
+    assert plan.processing == "rules"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "open amazon then checkout",
+        "do not open amazon",
+        "amazon mat kholo",
+        "open amazon then execute arbitrary script",
+        "open amazon then",
+        "open amazon;" * 9,
+    ],
+)
+def test_browser_goal_has_no_partial_plan_for_unsafe_or_ambiguous_request(message):
+    from shopping_ai.navigation import BrowserPlanRequest, plan_browser_goal
+
+    plan = plan_browser_goal(BrowserPlanRequest(message=message))
+    assert plan.status != "ready" and not plan.steps
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "javascript:alert(1)",
+        "http://example.test",
+        "https://user:pass@example.test/",
+        "https://127.0.0.1/",
+        "https://localhost./",
+        "https://192.168.1.1/",
+        "https://example.test/checkout",
+    ],
+)
+def test_browser_goal_url_policy_blocks_privileged_or_internal_targets(url):
+    from shopping_ai.navigation import public_browser_url
+
+    assert not public_browser_url(url)
+
+
+def test_navigation_model_cannot_invent_url_query_tab_or_extra_skill():
+    from shopping_ai.navigation import (
+        BrowserModelPlan,
+        BrowserPlanRequest,
+        BrowserPlanStep,
+        validate_browser_plan,
+    )
+
+    request = BrowserPlanRequest(message="search headphones on amazon", allowed_tab_ids=("tab-1",))
+    for step in (
+        BrowserPlanStep(kind="navigate", url="https://attacker.test/"),
+        BrowserPlanStep(kind="search", site="flipkart", query="headphones"),
+        BrowserPlanStep(kind="search", site="amazon", query="password dump"),
+        BrowserPlanStep(kind="switch", tab_id="foreign-tab"),
+        BrowserPlanStep(kind="open_result", index=1),
+    ):
+        plan = validate_browser_plan(
+            request, BrowserModelPlan(status="ready", steps=(step,)), processing="model"
+        )
+        assert plan.status == "needs_input" and not plan.steps
+    with pytest.raises(ValueError):
+        BrowserPlanStep.model_validate(
+            {"kind": "navigate", "url": "https://www.amazon.in/", "script": "injected"}
+        )
+
+
+def test_model_search_is_user_grounded_and_compiled_to_data_only_url():
+    from shopping_ai.navigation import (
+        BrowserModelPlan,
+        BrowserPlanRequest,
+        BrowserPlanStep,
+        validate_browser_plan,
+    )
+
+    request = BrowserPlanRequest(message="search headphones on amazon")
+    result = validate_browser_plan(
+        request,
+        BrowserModelPlan(
+            status="ready",
+            steps=(BrowserPlanStep(kind="search", site="amazon", query="headphones"),),
+        ),
+        processing="model",
+    )
+    assert result.status == "ready" and result.processing == "model"
+    assert result.steps[0].url == "https://www.amazon.in/s?k=headphones"
+
+
+def test_overlong_navigation_query_clarifies_instead_of_raising():
+    from shopping_ai.navigation import BrowserPlanRequest, plan_browser_goal
+
+    result = plan_browser_goal(BrowserPlanRequest(message="search " + "x" * 300 + " on amazon"))
+    assert result.status == "needs_input" and not result.steps

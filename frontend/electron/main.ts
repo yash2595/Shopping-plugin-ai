@@ -863,14 +863,26 @@ ipcMain.on('orb:update-state', (event, payload: { state: string; isPanelOpen: bo
 
 const conversationNavigationCancels = new Map<string, () => void>()
 // Conversation navigation accepts bounded commands from the trusted UI only.
-ipcMain.handle('browser:conversation-navigation', async (event, data: {
-  kind: string; tabId: string; expectedUrl: string; url?: string; targetTabId?: string; index?: number;
-}) => {
+function navigationContext() {
+  const view = views.get(activeTabId)
+  if (!view || view.webContents.isDestroyed()) throw new Error('No active browser tab')
+  return {
+    tabId: activeTabId, url: view.webContents.getURL(),
+    target: { tab_id: view.webContents.id, document_id: `document-${view.webContents.id}-${documentVersions.get(activeTabId) || 0}`,
+      active: true, window_focused: !!mainWindow?.isFocused() },
+  }
+}
+ipcMain.handle('browser:navigation-context', (event) => { assertTrustedUi(event); return navigationContext() })
+const navigationExecutions = new Map<string, { fingerprint: string; result: Promise<{ success: boolean; message: string }> }>()
+async function executeConversationNavigation(event: Electron.IpcMainInvokeEvent, data: {
+  kind: string; tabId: string; expectedUrl: string; url?: string; targetTabId?: string; index?: number; executionId?: string; expectedDocumentId?: string;
+}) {
   assertTrustedUi(event)
   const view = views.get(data?.tabId)
-  if (!view || data.tabId !== activeTabId || !mainWindow?.isFocused() ||
+  if (!view || data.tabId !== activeTabId || (!mainWindow?.isFocused() && data.kind !== 'stop') ||
       (data.kind !== 'stop' && view.webContents.getURL() !== data.expectedUrl)) return { success: false, message: 'The active page changed. Please repeat your request.' }
   const wc = view.webContents
+  if (data.executionId && data.kind !== 'stop' && data.expectedDocumentId !== `document-${wc.id}-${documentVersions.get(data.tabId) || 0}`) return { success: false, message: 'The source document changed before execution.' }
   if (data.kind === 'stop') {
     documentVersions.set(data.tabId, (documentVersions.get(data.tabId) || 0) + 1)
     conversationNavigationCancels.get(data.tabId)?.()
@@ -965,6 +977,19 @@ ipcMain.handle('browser:conversation-navigation', async (event, data: {
     else if (data.kind === 'forward') history.goForward()
     else wc.reload()
   })
+}
+
+ipcMain.handle('browser:conversation-navigation', async (event, data: Parameters<typeof executeConversationNavigation>[1]) => {
+  assertTrustedUi(event)
+  if (!data?.executionId) return executeConversationNavigation(event, data)
+  if (!/^[a-zA-Z0-9_.:-]{1,100}$/.test(data.executionId)) return { success: false, message: 'Invalid navigation step identity.' }
+  const fingerprint = JSON.stringify(data)
+  const existing = navigationExecutions.get(data.executionId)
+  if (existing) return existing.fingerprint === fingerprint ? existing.result : { success: false, message: 'Navigation step identity was already used for another action.' }
+  if (navigationExecutions.size >= 500) return { success: false, message: 'Navigation journal is full. Restart the app before starting another plan.' }
+  const result = executeConversationNavigation(event, data)
+  navigationExecutions.set(data.executionId, { fingerprint, result })
+  return result
 })
 
 ipcMain.on('browser:navigate', (_event, payload: { url: string; tabId?: string } | string) => {
@@ -1109,7 +1134,7 @@ ipcMain.handle('browser:extract-snapshot', async (_event, tabId?: string) => {
 
   const sourceUrl = targetView.webContents.getURL()
   const parsedSource = new URL(sourceUrl)
-  if (parsedSource.protocol !== 'https:' || !['www.amazon.in', 'amazon.in', 'www.flipkart.com', 'flipkart.com'].includes(parsedSource.hostname)) {
+  if (parsedSource.protocol !== 'https:' || parsedSource.username || parsedSource.password || !['www.amazon.in', 'amazon.in', 'www.flipkart.com', 'flipkart.com'].includes(parsedSource.hostname)) {
     return { success: false, error: 'Open a supported Amazon.in or Flipkart product page' }
   }
   if (!/\/(?:dp|gp\/product|ASIN)\/[a-z0-9]{10}(?:\/|$)/i.test(parsedSource.pathname)
@@ -1128,7 +1153,8 @@ ipcMain.handle('browser:extract-snapshot', async (_event, tabId?: string) => {
             const match = text.match(/^(?:₹|INR|Rs\\.?)?\\s*((?:[0-9]+|[0-9]{1,3}(?:,[0-9]{3})+|[0-9]{1,2}(?:,[0-9]{2})*,[0-9]{3})(?:\\.[0-9]{1,2})?)$/i);
             return match ? match[1].replace(/,/g, '') : null;
           };
-          const url = window.location.href;
+          const pageSource = new URL(window.location.href);
+          const url = pageSource.origin + pageSource.pathname;
           const hostname = window.location.hostname || '';
           const title = (document.title || '').trim();
           
@@ -1275,7 +1301,7 @@ ipcMain.handle('browser:analysis-skill', async (event, data: {
   const currentUrl = view.webContents.getURL()
   let source: URL
   try { source = new URL(currentUrl) } catch { return { success: false, error: 'No product page' } }
-  if (expectedDocument !== data.document_id || currentUrl !== data.source_url || source.protocol !== 'https:'
+  if (expectedDocument !== data.document_id || source.origin + source.pathname !== data.source_url || source.protocol !== 'https:'
       || !['amazon.in', 'www.amazon.in', 'flipkart.com', 'www.flipkart.com'].includes(source.hostname)) {
     return { success: false, error: 'Page changed. Capture fresh evidence before continuing.' }
   }

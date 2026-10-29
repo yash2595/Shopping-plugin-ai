@@ -1700,3 +1700,19 @@ to select fact IDs when exact lookup has no answer. `selected_fact_reply` requir
 canonical field/value equality and fresh source facts after inference, then renders
 original observations. Model prose, foreign IDs and action proposals cannot become
 shopping answers or browser actions. Default extractive questions use no model.
+
+## Browser navigation planning role
+
+`navigation.py` now also defines BrowserPlanRequest, BrowserPlanStep, BrowserModelPlan
+and BrowserGoalPlan. `plan_browser_goal` handles a bounded offline navigation
+sequence. `validate_browser_plan` policy-checks complete model candidates, compiles
+search arguments into data-only known-site URLs, and rejects invented destinations,
+query words, tab IDs or unsupported actions. These values are proposals and do not
+execute a browser. The existing offer-navigation identity/receipt validation remains
+separate and unchanged.
+
+ChatProvider.plan_navigation uses its own schema/prompt and an optional trusted
+navigation_model override. It shares the bounded transport/capacity but not product
+decision instructions or raw DOM. The desktop NavigationOrchestrator and trusted
+native actor perform actual observations, serial execution and verification. No
+checkpoint format migration is needed for this planning-only API.

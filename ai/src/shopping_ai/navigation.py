@@ -1,8 +1,11 @@
 """Read-only offer navigation proposals and trusted visible-browser receipts."""
 
+import ipaddress
+import re
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Annotated, Literal
+from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 from pydantic import AwareDatetime, Field, model_validator
@@ -186,3 +189,274 @@ def verify_navigation(
     ):
         raise ValueError("NAVIGATION_EVIDENCE_MISMATCH")
     return receipt.product
+
+
+# Browser-goal planning is separate from product decisions and offer verification.
+# These values are proposals only. The native browser remains the executor.
+
+
+class BrowserPlanStep(Contract):
+    kind: Literal[
+        "navigate",
+        "search",
+        "back",
+        "forward",
+        "reload",
+        "scroll_down",
+        "scroll_up",
+        "open_result",
+        "switch",
+    ]
+    url: Annotated[str, Field(min_length=1, max_length=2000)] | None = None
+    query: Annotated[str, Field(min_length=1, max_length=200)] | None = None
+    site: Literal["amazon", "flipkart", "google"] | None = None
+    index: Annotated[int, Field(strict=True, ge=1, le=5)] | None = None
+    tab_id: Identifier | None = None
+
+    @model_validator(mode="after")
+    def correct_arguments(self):
+        actual = {
+            key
+            for key in ("url", "query", "site", "index", "tab_id")
+            if getattr(self, key) is not None
+        }
+        expected = {
+            "navigate": {"url"},
+            "search": {"query", "site"},
+            "open_result": {"index"},
+            "switch": {"tab_id"},
+        }.get(self.kind, set())
+        if actual != expected:
+            raise ValueError("Unexpected navigation arguments")
+        return self
+
+
+class BrowserPlanRequest(Contract):
+    message: Annotated[str, Field(min_length=1, max_length=2000)]
+    current_site: Literal["amazon", "flipkart", "google"] | None = None
+    allowed_tab_ids: tuple[Identifier, ...] = Field(default=(), max_length=20)
+
+
+class BrowserModelPlan(Contract):
+    status: Literal["ready", "needs_input", "not_navigation"]
+    steps: tuple[BrowserPlanStep, ...] = Field(default=(), max_length=8)
+
+    @model_validator(mode="after")
+    def executable_only_when_ready(self):
+        if (self.status == "ready") != bool(self.steps):
+            raise ValueError("Ready plans require steps; other statuses cannot execute")
+        return self
+
+
+class BrowserGoalPlan(BrowserModelPlan):
+    plan_id: Identifier = Field(default_factory=lambda: uuid4().hex)
+    processing: Literal["rules", "model"] = "rules"
+    inference_fallback: Literal["deterministic", "cloud"] | None = None
+
+
+BROWSER_SITES = {
+    "amazon": "https://www.amazon.in/",
+    "flipkart": "https://www.flipkart.com/",
+    "google": "https://www.google.com/",
+}
+BROWSER_SEARCH = {
+    "amazon": "https://www.amazon.in/s?k=",
+    "flipkart": "https://www.flipkart.com/search?q=",
+    "google": "https://www.google.com/search?q=",
+}
+
+
+def normalise_browser_message(message: str) -> str:
+    text = (
+        message.strip()
+        .lower()
+        .replace("अमेज़न", "amazon")
+        .replace("अमेजन", "amazon")
+        .replace("फ्लिपकार्ट", "flipkart")
+        .replace("गूगल", "google")
+    )
+    return re.sub(r"^(please|bhai|saarthi)[, ]+", "", text).strip()
+
+
+def public_browser_url(value: str) -> bool:
+    try:
+        url = urlsplit(value)
+        if (
+            url.scheme != "https"
+            or not url.hostname
+            or url.username
+            or url.password
+            or url.port is not None
+            or "." not in url.hostname
+            or any(c.isspace() or ord(c) < 32 or c == chr(92) for c in value)
+        ):
+            return False
+        if url.hostname.rstrip(".") in {
+            "localhost",
+            "metadata.google.internal",
+        } or url.hostname.rstrip(".").endswith((".localhost", ".local", ".internal")):
+            return False
+        try:
+            if not ipaddress.ip_address(url.hostname.rstrip(".")).is_global:
+                return False
+        except ValueError:
+            if re.fullmatch(
+                r"(?:0x[0-9a-f]+|[0-9]+)(?:\.(?:0x[0-9a-f]+|[0-9]+))*",
+                url.hostname,
+                re.I,
+            ):
+                return False
+        return (
+            re.search(
+                r"/(cart|checkout|payment|buy|order|logout|delete)(?:[/?-]|$)", url.path, re.I
+            )
+            is None
+        )
+    except ValueError:
+        return False
+
+
+def browser_goal_is_unsafe(message: str) -> bool:
+    text = normalise_browser_message(message)
+    return bool(
+        re.search(
+            r"\b(buy|purchase|checkout|payment|pay|login|delete|add to cart|do not|dont|"
+            r"don't|mat|nahi)\b|नहीं|मत|खरीद",
+            text,
+        )
+    )
+
+
+def validate_browser_plan(
+    request: BrowserPlanRequest, candidate: BrowserModelPlan, *, processing="rules"
+) -> BrowserGoalPlan:
+    if candidate.status != "ready":
+        return BrowserGoalPlan(status=candidate.status, processing=processing)
+    if browser_goal_is_unsafe(request.message) or re.match(
+        r"^(how|why|what|kaise|kyun)\b", normalise_browser_message(request.message)
+    ):
+        return BrowserGoalPlan(status="needs_input", processing=processing)
+    text = normalise_browser_message(request.message)
+    site_text = re.sub(r"https://[^\s]+", " ", text)
+    named = {name for name in BROWSER_SITES if re.search(rf"\b{name}\b", site_text)}
+    permitted_sites = named or ({request.current_site} if request.current_site else set())
+    literals = {match.rstrip(".,!?") for match in re.findall(r"https://[^\s]+", request.message)}
+    output = []
+    cues = {
+        "open_result": r"\b(result|product|pehla|first|offer)\b|पहला|रिजल्ट",
+        "scroll_down": r"\b(scroll|neeche)\b|नीचे",
+        "scroll_up": r"\b(scroll|upar)\b|ऊपर",
+        "back": r"\b(back|peeche|pichhe)\b|पीछे",
+        "forward": r"\b(forward|aage)\b|आगे",
+        "reload": r"\b(reload|refresh)\b|रीफ्रेश",
+        "switch": r"\btab\b|टैब",
+    }
+    for step in candidate.steps:
+        if step.kind in cues and not re.search(cues[step.kind], text):
+            return BrowserGoalPlan(status="needs_input", processing=processing)
+        if step.kind == "navigate":
+            if not public_browser_url(step.url) or not (
+                step.url in literals
+                or step.url in {BROWSER_SITES[name] for name in permitted_sites}
+            ):
+                return BrowserGoalPlan(status="needs_input", processing=processing)
+        elif step.kind == "search":
+            # The planner may select/reorder user words, never invent a search goal.
+            words = re.findall(r"\w+", step.query.lower())
+            if (
+                step.site not in permitted_sites
+                or not words
+                or any(word not in re.findall(r"\w+", text) for word in words)
+            ):
+                return BrowserGoalPlan(status="needs_input", processing=processing)
+            step = BrowserPlanStep(
+                kind="navigate", url=BROWSER_SEARCH[step.site] + quote(step.query, safe="")
+            )
+        elif step.kind == "switch" and step.tab_id not in request.allowed_tab_ids:
+            return BrowserGoalPlan(status="needs_input", processing=processing)
+        output.append(step)
+    return BrowserGoalPlan(status="ready", steps=tuple(output), processing=processing)
+
+
+def plan_browser_goal(request: BrowserPlanRequest) -> BrowserGoalPlan:
+    text = normalise_browser_message(request.message)
+    if browser_goal_is_unsafe(text):
+        return BrowserGoalPlan(status="needs_input")
+    pieces = re.split(
+        r"\s*(?:;|\band then\b|\bthen\b|\baur phir\b|\bphir\b|और फिर|\s+और\s+|\s+aur\s+)\s*", text
+    )
+    if len(pieces) > 8 or any(not item for item in pieces):
+        return BrowserGoalPlan(status="needs_input")
+    steps = []
+    site = request.current_site
+    for piece in pieces:
+        direct = {
+            "back": "back",
+            "go back": "back",
+            "peeche jao": "back",
+            "forward": "forward",
+            "go forward": "forward",
+            "refresh": "reload",
+            "reload": "reload",
+            "scroll down": "scroll_down",
+            "neeche jao": "scroll_down",
+            "scroll up": "scroll_up",
+            "upar jao": "scroll_up",
+        }
+        if piece in direct:
+            steps.append(BrowserPlanStep(kind=direct[piece]))
+            continue
+        if re.fullmatch(r"open first result|pehla result kholo|पहला रिजल्ट खोलो", piece):
+            steps.append(BrowserPlanStep(kind="open_result", index=1))
+            continue
+        result = re.fullmatch(r"(?:open result|result) ([1-5])(?: kholo)?", piece)
+        if result:
+            steps.append(BrowserPlanStep(kind="open_result", index=int(result[1])))
+            continue
+        opened = re.fullmatch(
+            r"(?:open|visit|go to|navigate to) (.+)|(.+?) (?:kholo|khol do|खोलो)", piece
+        )
+        if opened:
+            value = opened[1] or opened[2]
+            url = BROWSER_SITES.get(
+                value, value if value.startswith("https://") else "https://" + value
+            )
+            if len(url) > 2000:
+                return BrowserGoalPlan(status="needs_input")
+            steps.append(BrowserPlanStep(kind="navigate", url=url))
+            site = next((name for name, address in BROWSER_SITES.items() if url == address), site)
+            continue
+        found = re.fullmatch(
+            r"(?:search|find|dhundo|dhoondo) (.+?)(?: (?:on|par|pe) (amazon|flipkart|google))?",
+            piece,
+        )
+        reverse = re.fullmatch(
+            r"(?:mujhe )?(amazon|flipkart|google) (?:pe|par|पर) (.+?) "
+            r"(?:search karo|dhundo|dhoondo|dikhado|dikhao|सर्च करो|खोजो)",
+            piece,
+        )
+        if found or reverse:
+            query = found[1] if found else reverse[2]
+            selected = (found[2] or site) if found else reverse[1]
+            if not selected or len(query) > 200:
+                return BrowserGoalPlan(status="needs_input")
+            steps.append(BrowserPlanStep(kind="search", query=query, site=selected))
+            site = selected
+            continue
+        return BrowserGoalPlan(
+            status="needs_input"
+            if steps
+            or len(pieces) > 1
+            or re.search(
+                r"\b(open|navigate|search|kholo|dhoondo|website|browser|amazon|flipkart|google|dikhao|dikhado)\b",
+                text,
+            )
+            else "not_navigation"
+        )
+    return validate_browser_plan(request, BrowserModelPlan(status="ready", steps=tuple(steps)))
+
+
+class RulesBrowserPlanner:
+    async def plan_navigation(self, request: BrowserPlanRequest) -> BrowserModelPlan:
+        plan = plan_browser_goal(request)
+        return BrowserModelPlan(status=plan.status, steps=plan.steps)

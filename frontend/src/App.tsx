@@ -7,10 +7,12 @@ import type { BrowserTab } from './types/browser'
 import type { OrbOverlayBounds } from './types/electron'
 import type { AnalysisProduct, ShoppingAnalysis } from './types/assistant'
 import { apiClient, NetworkError } from './services/apiClient'
+import { NavigationOrchestrator, drainRuntimeNavigation, localNavigationPlan, type NavigationRunSnapshot } from './services/navigationOrchestrator'
+import type { BrowserCommand } from './utils/browserConversation'
 import { planConversation, updateShoppingPreferences } from './utils/browserConversation'
 import type { RuntimeReply } from './types/assistant'
 import type { ConversationTurn } from './types/assistant'
-import { rawCaptureFallback } from './utils/snapshotExtractor'
+import { buildReadDiagnostic, isSupportedProductAddress, rawCaptureFallback } from './utils/snapshotExtractor'
 
 function App() {
   const [tabs, setTabs] = useState<BrowserTab[]>(INITIAL_TABS)
@@ -23,11 +25,18 @@ function App() {
   const [backendStatus, setBackendStatus] = useState<BackendConnectionStatus>('pending')
   const [conversation, setConversation] = useState<ConversationTurn[]>([])
   const runtimeConversation = useRef<RuntimeReply | null>(null)
+  const runtimeCancellation = useRef<Promise<void> | null>(null)
+  const runtimeBusy = useRef(false)
+  const marketDialogue = useRef(false)
   const pendingSearch = useRef<string | undefined>(undefined)
   const navigationPending = useRef(false)
+  const navigationController = useRef(new NavigationOrchestrator())
+  const [navigationRun, setNavigationRun] = useState<NavigationRunSnapshot | null>(null)
   const appendTurn = (role: 'user' | 'assistant', text: string) => setConversation((turns) => [...turns, { id: crypto.randomUUID(), role, text }].slice(-40))
   const [analysis, setAnalysis] = useState<ShoppingAnalysis | null>(null)
   const [analysisError, setAnalysisError] = useState('')
+  const [analysisConsent, setAnalysisConsent] = useState(false)
+  const [privacyStatus, setPrivacyStatus] = useState('')
   const analysisGeneration = useRef(0)
   const capturedProducts = useRef(new Map<string, AnalysisProduct>())
   const confirmedBudget = useRef<string | undefined>(undefined)
@@ -44,6 +53,19 @@ function App() {
   useLayoutEffect(() => { activeContext.current = { id: activeTabId, url: currentUrl } }, [activeTabId, currentUrl])
 
   const handleStopShopping = () => {
+    navigationController.current.cancel()
+    setAgentEvents((events) => events.map((event) => event.type === 'action_started' ? { ...event, type: 'action_failed', message: 'Stopped before outcome confirmation' } : event))
+    const owned = runtimeConversation.current
+    if (owned && (runtimeBusy.current || marketDialogue.current || ['working', 'awaiting_browser', 'ready_to_navigate', 'paused'].includes(owned.status))) {
+      const previous = runtimeCancellation.current || Promise.resolve()
+      const cancelled = previous.catch(() => {}).then(async () => {
+        const latest = await apiClient.getAiConversation(owned.conversation_id)
+        const reply = await apiClient.sendAiEvent(owned.conversation_id, { event_id: crypto.randomUUID(), expected_version: latest.version, kind: 'cancel' })
+        if (runtimeConversation.current?.conversation_id === reply.conversation_id) runtimeConversation.current = reply
+      }).catch(() => { setAnalysisError('Local browser work stopped; backend cancellation could not be confirmed. Check the conversation before starting more work.') })
+      runtimeCancellation.current = cancelled
+    }
+    marketDialogue.current = false
     if (navigationPending.current) recordEvent('action_failed', 'Browser command stopped')
     analysisGeneration.current += 1
     if (navigationPending.current) {
@@ -56,8 +78,41 @@ function App() {
     setAgentRunState('idle')
   }
 
+  const runNavigation = async (commands: BrowserCommand[], generation: number) => {
+    const native = window.electronAPI
+    if (!native) { appendTurn('assistant', 'Browser navigation requires the desktop app.'); setAgentRunState('failed'); return }
+    navigationPending.current = true
+    setParsedIntent('Navigation orchestration')
+    try {
+      const result = await navigationController.current.start(commands, {
+        observe: () => native.getNavigationContext(),
+        execute: (command, before, stepId) => native.conversationNavigation({
+          ...(command.kind === 'switch' ? { kind: 'switch' as const, targetTabId: command.tabId } : command),
+          tabId: before.tabId, expectedUrl: before.url, expectedDocumentId: before.target.document_id, executionId: stepId,
+        }),
+        stop: () => { const active = activeContext.current; void native.conversationNavigation({ kind: 'stop', tabId: active.id, expectedUrl: active.url }).catch(() => {}) },
+        observed: (context) => {
+          if (generation !== analysisGeneration.current) return
+          setActiveTabId(context.tabId)
+          setTabs((previous) => previous.map((tab) => ({ ...tab, isActive: tab.id === context.tabId, ...(tab.id === context.tabId ? { url: context.url } : {}) })))
+        },
+        changed: (run) => {
+          if (generation !== analysisGeneration.current) return
+          setNavigationRun(run)
+          setAgentRunState(run.status === 'completed' ? 'completed' : run.status === 'failed' ? 'failed' : run.status === 'executing' || run.status === 'planned' ? 'executing' : 'idle')
+          setAgentEvents(run.steps.map((step) => ({ id: step.step_id, stepId: step.step_id, timestamp: Date.now(),
+            type: step.status === 'executing' ? 'action_started' : step.status === 'completed' ? 'action_completed' : ['unknown', 'failed'].includes(step.status) ? 'action_failed' : 'navigation_planned',
+            action: step.command.kind, message: step.command.kind.replaceAll('_', ' ') + ': ' + step.status })))
+        },
+      })
+      if (generation === analysisGeneration.current) appendTurn('assistant', result.message)
+    } catch (error) {
+      if (generation === analysisGeneration.current) { appendTurn('assistant', error instanceof Error ? error.message : 'Navigation plan failed.'); setAgentRunState('failed') }
+    } finally { if (generation === analysisGeneration.current) navigationPending.current = false }
+  }
+
   const handleAskShopping = async (question: string) => {
-    if (navigationPending.current) handleStopShopping()
+    if (navigationPending.current || navigationController.current.snapshot()?.status === 'paused') handleStopShopping()
     const generation = ++analysisGeneration.current
     const target = { ...activeContext.current }
     window.speechSynthesis?.cancel()
@@ -65,67 +120,124 @@ function App() {
     setUserRequest(question)
     setAgentEvents([{ id: crypto.randomUUID(), type: 'agent_started', message: 'Understanding your request', timestamp: Date.now() }])
     setAnalysis(null)
+    setNavigationRun(null)
     setAnalysisError('')
     appendTurn('user', question)
     const preferences = updateShoppingPreferences(question, { budget: confirmedBudget.current, specs: confirmedSpecs.current })
     confirmedBudget.current = preferences.budget
     confirmedSpecs.current = preferences.specs
-    const plan = planConversation(question, tabs, pendingSearch.current, target.id)
+    const marketIntent = /\bacross\s+(websites|stores)|\bcompare prices\b|\bsab websites\b/i.test(question)
+    if (marketIntent) marketDialogue.current = true
+    const forceRuntime = marketDialogue.current || runtimeConversation.current?.market_result != null && /\b(open|offer|cheapest|excluded|coverage)\b/i.test(question)
+    const localSteps = marketIntent ? null : localNavigationPlan(question, tabs, target.id, pendingSearch.current)
+    const plan: ReturnType<typeof planConversation> = forceRuntime ? { analyze: true } : planConversation(question, tabs, pendingSearch.current, target.id)
     pendingSearch.current = plan.pendingSearch
-    if (!plan.analyze) {
-      if (plan.reply) { appendTurn('assistant', plan.reply); recordEvent('agent_completed', 'Conversation reply ready'); setAgentRunState('completed'); return }
-      if (plan.command) {
-        const command = plan.command
-        recordEvent('action_started', 'Checking the requested browser command')
-        if (!window.electronAPI) { appendTurn('assistant', 'Browser navigation is available in the desktop app.'); recordEvent('action_failed', 'Desktop browser unavailable'); setAgentRunState('failed'); return }
-        if (command.kind === 'switch') {
-          try {
-            const result = await window.electronAPI.conversationNavigation({ kind: 'switch', tabId: target.id, expectedUrl: target.url, targetTabId: command.tabId })
-            if (generation !== analysisGeneration.current) return
-            if (result.success) { setActiveTabId(command.tabId); setTabs((previous) => previous.map((tab) => ({ ...tab, isActive: tab.id === command.tabId }))) }
-            appendTurn('assistant', result.message); recordEvent(result.success ? 'action_completed' : 'action_failed', result.message); setAgentRunState(result.success ? 'completed' : 'failed')
-          } catch { if (generation === analysisGeneration.current) { appendTurn('assistant', 'The tab could not be switched.'); recordEvent('action_failed', 'Tab switch failed'); setAgentRunState('failed') } }
+    if (localSteps) { pendingSearch.current = undefined; await runNavigation(localSteps, generation); return }
+    const compound = /\b(then|phir|aur phir)\b|;|और फिर/i.test(question)
+    const navigationGoal = !forceRuntime && (compound || /\b(open|navigate|search|kholo|dhoondo|dikhao|dikhado|take me|browser)\b/i.test(question) && (/\b(amazon|flipkart|google)\b/i.test(question) || plan.analyze))
+    if (navigationGoal && /\b(do not|dont|don't|mat|nahi|buy|checkout|pay|payment|delete|login|purchase|add to cart)\b|नहीं|मत/i.test(question)) {
+      appendTurn('assistant', 'No browser steps were executed. Negated requests, checkout, payment, login and cart changes are not navigation permissions.')
+      setAgentRunState('idle')
+      return
+    }
+    if (navigationGoal) {
+      if (!analysisConsent) { appendTurn('assistant', 'Allow analysis in Data and privacy to plan this navigation request. Simple direct browser commands remain available locally.'); setAgentRunState('idle'); return }
+      try {
+        const context = await window.electronAPI?.getNavigationContext()
+        if (generation !== analysisGeneration.current) return
+        const host = context ? new URL(context.url).hostname : ''
+        const site = /(^|\.)amazon\.in$/.test(host) ? 'amazon' : /(^|\.)flipkart\.com$/.test(host) ? 'flipkart' : /(^|\.)google\.com$/.test(host) ? 'google' : null
+        const proposed = await apiClient.planBrowserNavigation(question, tabs.map((tab) => tab.id), site)
+        if (generation !== analysisGeneration.current) return
+        if (proposed.inference_fallback) appendTurn('assistant', proposed.inference_fallback === 'cloud' ? 'The configured cloud fallback was used for navigation planning.' : 'The navigation model was unavailable; only explicit rule-based planning remains available.')
+        if (proposed.status === 'ready') {
+          const commands: BrowserCommand[] = proposed.steps.map((step) => {
+            if (step.kind === 'navigate' && step.url) return { kind: 'navigate', url: step.url }
+            if (step.kind === 'switch' && step.tab_id) return { kind: 'switch', tabId: step.tab_id }
+            if (step.kind === 'open_result' && step.index) return { kind: 'open_result', index: step.index }
+            if (['back', 'forward', 'reload', 'scroll_down', 'scroll_up'].includes(step.kind)) return { kind: step.kind } as BrowserCommand
+            throw new Error('Navigation planner returned an unsupported step.')
+          })
+          pendingSearch.current = undefined
+          await runNavigation(commands, generation)
           return
         }
-        navigationPending.current = true
-        setParsedIntent('Browser navigation')
-        setAgentRunState('executing')
-        try {
-          const result = await window.electronAPI.conversationNavigation({ ...command, tabId: target.id, expectedUrl: target.url })
-          if (generation !== analysisGeneration.current || activeContext.current.id !== target.id) return
-          appendTurn('assistant', result.message)
-          recordEvent(result.success ? 'action_completed' : 'action_failed', result.message)
-          setAgentRunState(result.success ? 'completed' : 'failed')
-        } catch { if (generation === analysisGeneration.current) { appendTurn('assistant', 'Browser navigation is unavailable. Please retry.'); recordEvent('action_failed', 'Browser navigation unavailable'); setAgentRunState('failed') } }
-        finally { if (generation === analysisGeneration.current) navigationPending.current = false }
-        return
-      }
+        if (proposed.status === 'needs_input') { appendTurn('assistant', 'Please specify the website and the browser steps you want. No part of this request was executed. Checkout, payments, login and cart actions are disabled.'); setAgentRunState('idle'); return }
+      } catch (error) { if (generation === analysisGeneration.current) { appendTurn('assistant', error instanceof Error ? error.message : 'Navigation planning is unavailable.'); setAgentRunState('failed') }; return }
+    }
+    if (!plan.analyze) {
+      appendTurn('assistant', plan.reply || 'Please clarify your browser request.')
+      setAgentRunState('completed')
+      return
     }
     let requestedBackend = false
     let localCapture: AnalysisProduct | null = null
     try {
+      if (!analysisConsent) {
+        appendTurn('assistant', 'Please read Data and privacy and allow analysis before sending questions or captured product details to the backend. Browser commands still work without this permission.')
+        recordEvent('agent_completed', 'Waiting for analysis permission')
+        setAgentRunState('idle')
+        return
+      }
       if (!window.electronAPI) throw new Error('Open this assistant in the desktop browser to read a product page.')
-      const captured = await window.electronAPI.extractPageSnapshot(target.id)
+      const captured = forceRuntime ? { success: false, snapshot: undefined } : await window.electronAPI.extractPageSnapshot(target.id)
       if (generation !== analysisGeneration.current || activeContext.current.id !== target.id || activeContext.current.url !== target.url) return
       if (!captured.success || !captured.snapshot) {
+        if (!forceRuntime && isSupportedProductAddress(target.url)) throw new Error('This product page could not be read. Refresh it and retry, or use Report a page-reading problem. No product answer was generated.')
         requestedBackend = true
+        await runtimeCancellation.current
+        if (generation !== analysisGeneration.current) return
         let current = runtimeConversation.current
         if (!current) {
           const session = await apiClient.createSession()
+          if (generation !== analysisGeneration.current) return
           current = await apiClient.startAiConversation(session.id)
           if (generation !== analysisGeneration.current) return
           runtimeConversation.current = current
         }
         // Only the user's words enter dialogue; page text cannot become commands.
-        const reply = await apiClient.sendAiEvent(current.conversation_id, {
-          event_id: crypto.randomUUID(), expected_version: current.version, kind: 'text', message: question,
-        })
+        const browserContext = await window.electronAPI.getNavigationContext()
+        if (generation !== analysisGeneration.current) return
+        const capabilities = await apiClient.getAiCapabilities()
+        if (generation !== analysisGeneration.current) return
+        const contextAllowed = capabilities.browser_origins.includes(new URL(browserContext.url).origin)
+        runtimeBusy.current = true
+        let reply: RuntimeReply
+        try {
+          reply = await apiClient.sendAiEvent(current.conversation_id, {
+            event_id: crypto.randomUUID(), expected_version: current.version, kind: 'text', message: question,
+            ...(contextAllowed ? { target: browserContext.target, origin: new URL(browserContext.url).origin } : {}),
+          })
+        } finally { runtimeBusy.current = false }
         if (runtimeConversation.current?.conversation_id === reply.conversation_id) runtimeConversation.current = reply
         if (generation !== analysisGeneration.current) return
-        appendTurn('assistant', reply.work_ids.length ? 'I have your shopping request. To navigate, give an explicit command such as “search headphones on Amazon”. I have not opened or clicked anything.' : reply.message)
+        let workNote: string | undefined
+        if (reply.work_ids.length) {
+          navigationPending.current = true
+          try {
+            const completed = await drainRuntimeNavigation(apiClient, reply, {
+              observe: () => window.electronAPI!.getNavigationContext(),
+              capture: (tabId) => window.electronAPI!.extractPageSnapshot(tabId),
+              navigate: (url, before, stepId) => window.electronAPI!.conversationNavigation({ kind: 'navigate', url,
+                tabId: before.tabId, expectedUrl: before.url, expectedDocumentId: before.target.document_id, executionId: stepId }),
+              alive: () => generation === analysisGeneration.current,
+              progress: (message, dispatchId, status) => {
+                if (generation !== analysisGeneration.current) return
+                setAgentRunState('executing')
+                setAgentEvents((events) => [...events, { id: crypto.randomUUID(), stepId: dispatchId, timestamp: Date.now(), message,
+                  type: status === 'executing' ? 'action_started' : status === 'completed' ? 'action_completed' : 'action_failed' }].slice(-100))
+              },
+            })
+            reply = completed.reply; workNote = completed.note
+            if (runtimeConversation.current?.conversation_id === reply.conversation_id) runtimeConversation.current = reply
+          } finally { if (generation === analysisGeneration.current) navigationPending.current = false }
+        }
+        if (generation !== analysisGeneration.current) return
+        appendTurn('assistant', [reply.message, workNote].filter(Boolean).join(' '))
         setBackendStatus('connected')
-        recordEvent('agent_completed', 'Conversation reply ready')
-        setAgentRunState('completed')
+        const pendingWork = reply.status === 'paused' || reply.work_ids.length > 0
+        recordEvent(pendingWork ? 'agent_paused' : 'agent_completed', pendingWork ? 'Waiting for verified browser work' : 'Conversation reply ready')
+        setAgentRunState(pendingWork ? 'idle' : reply.status === 'error' ? 'failed' : 'completed')
         return
       }
       const source = captured.snapshot
@@ -311,6 +423,7 @@ function App() {
   const handleClearExecution = () => {
     handleStopShopping()
     runtimeConversation.current = null
+    setNavigationRun(null)
     setConversation([])
     pendingSearch.current = undefined
     capturedProducts.current.clear()
@@ -322,6 +435,30 @@ function App() {
     setUserRequest(undefined)
     setParsedIntent(undefined)
     setAgentRunState('idle')
+  }
+
+  const handleAnalysisConsent = (allowed: boolean) => {
+    handleClearExecution()
+    setAnalysisConsent(allowed)
+    setPrivacyStatus(allowed ? 'Analysis allowed for this app session. You can withdraw it here.' : 'Analysis stopped. Existing server records are removed only by Delete stored shopping data.')
+  }
+  const handleCheckUsage = async () => {
+    if (!analysisConsent) { setPrivacyStatus('Allow analysis before connecting to the backend.'); return }
+    const generation = analysisGeneration.current
+    try {
+      const usage = await apiClient.getOwnUsage()
+      if (generation !== analysisGeneration.current) return
+      setPrivacyStatus(`Today: ${usage.ai_requests}/${usage.ai_limit} AI turns; ${usage.ai_remaining} remaining. Resets ${new Date(usage.resets_at).toLocaleString()}. Provider: ${usage.processing_provider}${usage.cloud_fallback_enabled ? ' with cloud fallback' : ''}. Counts measure admitted turns, not provider calls, tokens or billed cost.`)
+    } catch (error) { if (generation === analysisGeneration.current) setPrivacyStatus(error instanceof Error ? error.message : 'Usage is unavailable.') }
+  }
+  const handleEraseStoredData = async () => {
+    handleClearExecution()
+    setAnalysisConsent(false)
+    setPrivacyStatus('Deleting stored shopping data…')
+    try {
+      await apiClient.eraseShoppingData()
+      setPrivacyStatus('Stored shopping sessions, checkpoints, snapshots, price observations, alerts and owned review summaries deleted from the active database. Account identity, authentication and usage limits remain. Backups and external provider records follow their retention policies.')
+    } catch (error) { setPrivacyStatus(error instanceof Error ? error.message : 'Deletion failed. Stored data may remain; retry.') }
   }
 
   // Developer verification hook to test UI failure state handling
@@ -360,6 +497,19 @@ function App() {
 
   return (
     <BrowserShell
+      navigationRun={navigationRun}
+      onPauseNavigation={() => navigationController.current.pause()}
+      onResumeNavigation={async () => {
+        navigationPending.current = true
+        try { const run = await navigationController.current.resume(); if (run) appendTurn('assistant', run.message) }
+        finally { navigationPending.current = false }
+      }}
+      analysisConsent={analysisConsent}
+      onAnalysisConsent={handleAnalysisConsent}
+      onEraseStoredData={handleEraseStoredData}
+      onCheckUsage={handleCheckUsage}
+      privacyStatus={privacyStatus}
+      diagnosticReport={buildReadDiagnostic(currentUrl, analysisError ? 'read_failed' : 'check_page')}
       conversation={conversation}
       onVoiceListening={handleVoiceListening}
       analysis={analysis}

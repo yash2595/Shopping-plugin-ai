@@ -219,3 +219,76 @@ cover successful navigation, result extraction, failure, stale targets and Stop.
 Focused visible-window navigation, live retailer selectors, microphone/local voice
 and installed local-model quality still need device acceptance. No live retailer
 or paid model request was used.
+
+## Data controls and maintenance
+
+Data and privacy explains backend/model routing before any analysis capture or
+backend shopping request. Allow shopping analysis is unchecked by default and
+lasts only for this app process; browser speech has its own unchecked permission
+(which resets when its panel unmounts). Local greeting/navigation remains usable
+without either permission. Withdrawal stops local tasks and clears local memory.
+Clear alone does not erase server records.
+
+Delete stored shopping data has a second confirmation and preserves account/auth
+and quota metadata. It removes owned active-database shopping records and pending
+AI work, not backups, external-provider records or the identity-provider account.
+Check AI usage is an explicit authenticated read, not a background telemetry loop.
+Its counts represent admitted turns; real provider call/token costs may differ.
+Report a page-reading problem creates a local, manually shareable diagnostic
+without addresses, account/product identifiers, page text or secrets.
+
+Daily scheduled CI exercises existing offline DOM/navigation fixtures. It provides
+regression coverage and does not check live retailer layouts. The app neither
+adds bulk server scraping nor bypasses blocking/challenges. This remains a free
+desktop preview with paid plans/mobile/MV3 packaging outside this implementation.
+
+## Separate navigation orchestration
+
+Navigation now has a separate planner/controller/executor path instead of the old
+single-command-only wiring. `NavigationOrchestrator` accepts a complete validated
+plan, observes the native foreground tab/document before each step, dispatches one
+step with a stable execution ID, checks the resulting native URL/document, and only
+then runs the next step. The panel displays each step and its status. Example:
+`Amazon kholo aur headphones search karo phir pehla result kholo`. Rules handle
+known commands locally; ambiguous natural navigation can use the authenticated
+backend navigation-planning role after analysis permission. Product facts/review
+answers still use their existing analytical/conversation roles.
+
+Limits are eight steps, a two-minute run deadline and a bounded native step wait.
+Pause completes the current step and stops before the next; Resume re-observes the
+same target and skips completed steps. Stop cancels remaining steps, stops native
+loading and fences late replies. Unknown outcomes, changed documents/targets,
+unverified redirects and failed steps do not automatically retry. A fresh user
+request is needed after an uncertain result. Native execution IDs are replay-safe
+within this app process; they are not a persistent restart journal. Plan state and
+native replay records are held in memory, bounded, and reset when the app exits.
+
+The existing durable `/v1/ai` work channel is also consumed rather than replaced
+with the old message asking the user to issue an explicit command. It claims owned
+work, reads products or navigates to offers/search pages, and submits typed receipts.
+All mutation tools are refused. Offer navigation requires matching brand/model,
+condition and requested attributes from observed specs; missing fields produce a
+failed receipt, not an assumed match. A search adapter without verified offer
+extraction reports blocked coverage with no offers and makes no cheapest-price
+claim. Cross-store goals retain the existing identity-clarification dialogue.
+
+Native context exposes WebContents/document identity to the trusted app UI only.
+Every orchestrated step carries its expected document ID as well as source URL;
+reloads of the same URL are therefore detected. The main-process replay journal
+returns a previous result for an identical execution ID/body and refuses ID reuse
+with a different action. It does not execute model-generated code or selectors.
+
+The backend planner receives direct user text, an optional known current-site name
+and permitted tab IDs—not page HTML, cookies, page text or browser history. Model
+output is schema-checked and policy-checked again before entering the controller.
+`AI_LOCAL_NAVIGATION_MODEL` and `AI_CHAT_NAVIGATION_MODEL` can select a separate
+planner model; blank values reuse the current provider's configured model. Setting
+a name does not install or download it. Cloud fallback remains explicitly opt-in.
+
+Latest checks: 639 core tests, 182 backend tests and 64 client tests passed (885).
+TypeScript/Vite, native TypeScript and Electron bundles passed. The hidden Electron
+fixture smoke exercises real HTTPS-intercepted DOM/native loads and the local API: a
+three-step website/search/product journey, a separately planned backend goal, Stop
+during a delayed load, plus prior privacy/conversation/data-erasure flows. Focus is
+explicitly simulated for successful execution; the real unfocused guard is checked
+separately. Live visible-window/retailer/device/model quality acceptance is pending.

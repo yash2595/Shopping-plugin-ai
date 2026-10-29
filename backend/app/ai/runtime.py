@@ -39,6 +39,11 @@ class LocalFirstProvider:
             inference_fallback.set(self.fallback_kind)
             return await getattr(fallback, operation)(*args)
 
+    async def plan_navigation(self, request):
+        from shopping_ai.navigation import RulesBrowserPlanner
+        fallback = self.decisions if self.fallback_kind == "cloud" else RulesBrowserPlanner()
+        return await self._call("plan_navigation", fallback, request)
+
     async def decide(self, context):
         return await self._call("decide", self.decisions, context)
 
@@ -89,6 +94,7 @@ async def configured_runtime(settings):
                         api_key=settings.AI_CHAT_API_KEY or None,
                     ),
                     config,
+                    navigation_model=settings.AI_CHAT_NAVIGATION_MODEL or None,
                 )
             )
             interpreter = details = decisions
@@ -104,6 +110,7 @@ async def configured_runtime(settings):
                     config.model_copy(
                         update={"timeout_seconds": float(settings.AI_LOCAL_TIMEOUT_SECONDS)}
                     ),
+                    navigation_model=settings.AI_LOCAL_NAVIGATION_MODEL or None,
                 )
             )
             decisions = LocalFirstProvider(

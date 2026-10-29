@@ -40,7 +40,8 @@ export interface OrbOverlayBounds {
 }
 
 const electronAPI = {
-  conversationNavigation: (data: { kind: 'navigate' | 'back' | 'forward' | 'reload' | 'stop' | 'switch' | 'scroll_down' | 'scroll_up' | 'open_result'; tabId: string; expectedUrl: string; url?: string; targetTabId?: string; index?: number }) => ipcRenderer.invoke('browser:conversation-navigation', data),
+  getNavigationContext: () => ipcRenderer.invoke('browser:navigation-context'),
+  conversationNavigation: (data: { kind: 'navigate' | 'back' | 'forward' | 'reload' | 'stop' | 'switch' | 'scroll_down' | 'scroll_up' | 'open_result'; tabId: string; expectedUrl: string; url?: string; targetTabId?: string; index?: number; executionId?: string; expectedDocumentId?: string }) => ipcRenderer.invoke('browser:conversation-navigation', data),
   navigate: (url: string, tabId?: string) => {
     ipcRenderer.send('browser:navigate', { url, tabId })
   },
