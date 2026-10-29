@@ -218,6 +218,7 @@ function App() {
             const completed = await drainRuntimeNavigation(apiClient, reply, {
               observe: () => window.electronAPI!.getNavigationContext(),
               capture: (tabId) => window.electronAPI!.extractPageSnapshot(tabId),
+              searchOffers: (tabId) => window.electronAPI!.extractSearchOffers(tabId),
               navigate: (url, before, stepId) => window.electronAPI!.conversationNavigation({ kind: 'navigate', url,
                 tabId: before.tabId, expectedUrl: before.url, expectedDocumentId: before.target.document_id, executionId: stepId }),
               alive: () => generation === analysisGeneration.current,

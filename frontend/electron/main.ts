@@ -1,6 +1,7 @@
 import { app, BrowserWindow, WebContentsView, ipcMain, session } from 'electron'
 import * as path from 'path'
 import * as fs from 'fs'
+import { extractStructuredOffers } from '../src/utils/offerExtractor.js'
 
 // Keep Electron's runtime profile in the writable project workspace. The host
 // profile can be access-denied in managed environments, which breaks Chromium
@@ -1121,6 +1122,25 @@ ipcMain.handle('backend:request', async (event, data: {
     return { status: 503, headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ error: { code: 'BACKEND_UNAVAILABLE', message: 'The shopping service is unavailable. Check its local setup and retry.' } }) }
   }
+})
+
+ipcMain.handle('browser:extract-offers', async (event, tabId: string) => {
+  assertTrustedUi(event)
+  const view = views.get(tabId)
+  if (tabId !== activeTabId || !mainWindow?.isFocused() || !view || view.webContents.isDestroyed()) return { success: false }
+  const wc = view.webContents, address = wc.getURL(), version = documentVersions.get(tabId) || 0
+  try {
+    const source = new URL(address)
+    if (source.protocol !== 'https:' || source.username || source.password || source.port ||
+        !['www.amazon.in', 'amazon.in', 'www.flipkart.com', 'flipkart.com'].includes(source.hostname) ||
+        !(source.hostname.endsWith('amazon.in') ? source.pathname === '/s' : source.pathname === '/search')) return { success: false }
+    const offers = await wc.executeJavaScript(`(${extractStructuredOffers.toString()})(document, window.location.href)`)
+    if (wc.isDestroyed() || wc.getURL() !== address || (documentVersions.get(tabId) || 0) !== version || activeTabId !== tabId || !mainWindow?.isFocused()) return { success: false }
+    if (!Array.isArray(offers) || offers.length > 20 || JSON.stringify(offers).length > 100000) return { success: false }
+    const observed_at = new Date().toISOString()
+    return { success: true, document_id: `document-${wc.id}-${version}`, offers: offers.map((offer) => ({ ...offer,
+      offer_id: crypto.randomUUID(), snapshot_id: crypto.randomUUID(), observed_at })) }
+  } catch { return { success: false } }
 })
 
 // Safe Snapshot Extraction from Active Chromium WebContentsView

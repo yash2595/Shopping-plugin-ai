@@ -272,6 +272,22 @@ failed receipt, not an assumed match. A search adapter without verified offer
 extraction reports blocked coverage with no offers and makes no cheapest-price
 claim. Cross-store goals retain the existing identity-clarification dialogue.
 
+Supported Amazon.in `/s` and Flipkart `/search` pages now have a bounded structured
+offer adapter. It reads up to twenty single-seller JSON-LD Product/Offer records
+through ItemList/graph wrappers, requiring observed brand, model, condition,
+variant attributes, seller, price and currency. No identity is copied from the
+search request. Same-origin product links are canonicalized without query/fragment;
+aggregate prices and incomplete identities are excluded. The trusted native bridge
+checks foreground tab and unchanged document before returning capture IDs/timestamps.
+The claimed-work consumer verifies the search load and rechecks the source after
+capture before submitting offers to the existing server ranking flow.
+
+Search captures deliberately leave shipping and extra fees unknown, so they cannot
+establish a cheapest delivered total. This is a sample of structured page evidence,
+not exhaustive store coverage. Layouts without sufficient structured data remain
+blocked. Actual retailer compatibility and live model/speech acceptance remain
+unverified; fixture tests are not retailer acceptance tests.
+
 Native context exposes WebContents/document identity to the trusted app UI only.
 Every orchestrated step carries its expected document ID as well as source URL;
 reloads of the same URL are therefore detected. The main-process replay journal

@@ -4,6 +4,12 @@ import { NavigationOrchestrator, localNavigationPlan, drainRuntimeNavigation, ty
 import type { BrowserCommand } from '../src/utils/browserConversation.ts'
 import type { RuntimeReply, ClaimedRuntimeWork, RuntimeReceipt } from '../src/types/assistant.ts'
 const tabs = [{ id: 'a', title: 'Search', url: 'https://www.google.com/' }]
+test('compound relative tab switches follow the preceding planned switch', () => {
+  const openTabs = [...tabs, { id: 'b', title: 'Amazon', url: 'https://www.amazon.in/' }, { id: 'c', title: 'Flipkart', url: 'https://www.flipkart.com/' }]
+  assert.deepEqual(localNavigationPlan('next tab then next tab', openTabs, 'a'), [{ kind: 'switch', tabId: 'b' }, { kind: 'switch', tabId: 'c' }])
+  assert.deepEqual(localNavigationPlan('open tab 3 then previous tab', openTabs, 'a'), [{ kind: 'switch', tabId: 'c' }, { kind: 'switch', tabId: 'b' }])
+  assert.equal(localNavigationPlan('open amazon then next tab then headphones search karo', openTabs, 'a'), null)
+})
 function fixture() {
   let context: NavigationContext = { tabId: 'a', url: 'https://www.google.com/', target: { tab_id: 7, document_id: 'd0', active: true, window_focused: true } }
   let serial = 0, stops = 0
@@ -172,4 +178,22 @@ test('search work opens its page but does not invent verified offers or a delive
   assert.equal(receipts[0].search?.status, 'blocked')
   assert.deepEqual(receipts[0].search?.offers, [])
   assert.ok(result.note?.includes('no cheapest-price claim'))
+})
+
+test('market receipts accept only capture bound to the verified search document', async () => {
+  for (const changed of [false, true]) {
+    const f = fixture(), initial = runtimeReply(['structured']), receipts: RuntimeReceipt[] = []
+    initial.conversation_id += changed ? '-changed' : '-stable'
+    const api = {
+      getAiWork: async () => [{ dispatch_id: 'structured', kind: 'market' as const, status: 'pending' as const, version: 3, deadline_at: '2099-01-01T00:00:00Z' }],
+      claimAiWork: async () => ({ dispatch_id: 'structured', kind: 'market', claim_token: 'token', work: { url: 'https://www.amazon.in/s?k=phone' } } as ClaimedRuntimeWork),
+      submitAiReceipt: async (_id: string, _dispatch: string, receipt: RuntimeReceipt) => { receipts.push(receipt); return { ...initial, work_ids: [] } },
+    }
+    await drainRuntimeNavigation(api, initial, { observe: f.executor.observe, alive: () => true,
+      navigate: (url, before, id) => f.executor.execute({ kind: 'navigate', url }, before, id), capture: async () => ({ success: false }),
+      searchOffers: async () => { const document_id = f.context().target.document_id; if (changed) f.context().target.document_id = 'foreign'; return { success: true, document_id, offers: [{ offer_id: 'observed', shipping: null }] } },
+    })
+    assert.equal(receipts[0].search?.status, changed ? 'blocked' : 'complete')
+    assert.equal(receipts[0].search?.offers.length, changed ? 0 : 1)
+  }
 })

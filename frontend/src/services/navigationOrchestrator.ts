@@ -143,10 +143,12 @@ export function localNavigationPlan(message: string, tabs: { id: string; title: 
   if (!pieces.length || pieces.length > 8) return null
   const commands: BrowserCommand[] = []
   let currentSite: 'amazon' | 'flipkart' | 'google' | null = null
+  let plannedTabId = activeTabId
   for (const part of pieces) {
-    const plan = planConversation(part, tabs, pieces.length === 1 ? pendingSearch : undefined, activeTabId)
+    const plan = planConversation(part, tabs, pieces.length === 1 ? pendingSearch : undefined, plannedTabId)
     if (plan.command) {
       commands.push(plan.command)
+      if (plan.command.kind === 'switch') { plannedTabId = plan.command.tabId; currentSite = null }
       if (plan.command.kind === 'navigate') { const host = new URL(plan.command.url).hostname; currentSite = host.includes('amazon.in') ? 'amazon' : host.includes('flipkart.com') ? 'flipkart' : host.includes('google.com') ? 'google' : null }
     } else if (plan.pendingSearch && currentSite) {
       const bases = { amazon: 'https://www.amazon.in/s?k=', flipkart: 'https://www.flipkart.com/search?q=', google: 'https://www.google.com/search?q=' }
@@ -167,6 +169,7 @@ interface CapturedProduct {
   title: string; price: string; currency: string; availability: string; specs?: Record<string, string>
 }
 export interface RuntimeReadExecutor {
+  searchOffers?: (tabId: string) => Promise<{ success: boolean; document_id?: string; offers?: Record<string, unknown>[] }>
   observe: () => Promise<NavigationContext>
   capture: (tabId: string) => Promise<{ success: boolean; snapshot?: CapturedProduct; error?: string }>
   navigate: (url: string, before: NavigationContext, stepId: string) => Promise<{ success: boolean; message: string }>
@@ -242,17 +245,24 @@ export async function drainRuntimeNavigation(api: RuntimeWorkApi, initial: Runti
         note = 'The destination could not be verified against the selected offer identity. No product-match claim was made.'
       }
     } else {
-      // Search navigation can work without pretending that snippets prove seller/variant/delivery totals.
       const url = claimed.work.url
       let after = before
+      let verifiedLoad = false
       if (typeof url === 'string' && safeConversationUrl(url) === url) {
-        await executor.navigate(url, before, work.dispatch_id)
+        const result = await executor.navigate(url, before, work.dispatch_id)
         if (!executor.alive()) return { reply, note: 'Search navigation stopped.' }
         after = await executor.observe()
+        verifiedLoad = result.success && verified({ kind: 'navigate', url }, before, after)
       }
+      const captured = verifiedLoad && executor.searchOffers ? await executor.searchOffers(after.tabId) : null
+      const final = await executor.observe()
+      if (!executor.alive()) return { reply, note: 'Search capture stopped before receipt submission.' }
+      const accepted = captured?.success && captured.document_id === after.target.document_id && sameDocument(after, final) && visible(final) &&
+        Array.isArray(captured.offers) && captured.offers.length > 0 && captured.offers.length <= 20
       receipt.origin = new URL(after.url).origin
-      receipt.search = { status: 'blocked', target: after.target, observed_at: new Date().toISOString(), offers: [] }
-      note = 'Verified cross-store offer extraction is unavailable for this adapter. Search pages may be opened, but no cheapest-price claim was made.'
+      receipt.search = { status: accepted ? 'complete' : 'blocked', target: after.target, observed_at: new Date().toISOString(), offers: accepted ? captured!.offers! : [] }
+      note = accepted ? 'Observed structured search offers only; shipping and extra fees remain unknown. This is not an exhaustive store search or a verified cheapest delivered price.' :
+        'Verified cross-store offer extraction is unavailable for this page. Search pages may be opened, but no cheapest-price claim was made.'
     }
     if (!executor.alive()) return { reply, note: 'Browser work stopped before receipt submission.' }
     try {

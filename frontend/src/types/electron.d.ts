@@ -70,6 +70,7 @@ export interface ElectronAPI {
   getAuthToken: () => Promise<string | null>
   setAuthToken: (token: string) => Promise<boolean>
   clearAuthToken: () => Promise<boolean>
+  extractSearchOffers: (tabId: string) => Promise<{ success: boolean; document_id?: string; offers?: Record<string, unknown>[] }>
   extractPageSnapshot: (tabId?: string) => Promise<{
     success: boolean
     snapshot?: {

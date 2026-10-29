@@ -2,6 +2,28 @@ import { test, describe } from 'node:test'
 import assert from 'node:assert'
 import { readFileSync } from 'node:fs'
 import { transformSync } from 'esbuild'
+import { extractStructuredOffers } from '../src/utils/offerExtractor.ts'
+
+test('structured offers use observed identity and leave delivered costs unknown', () => {
+  const product = { '@type': 'Product', brand: { name: 'Example' }, model: 'Phone', color: 'Black',
+    offers: { '@type': 'Offer', price: '1999.00', priceCurrency: 'INR', seller: { name: 'Observed seller' }, itemCondition: 'https://schema.org/NewCondition',
+      availability: 'https://schema.org/InStock', url: 'https://www.amazon.in/dp/B09V3KXJPB?tracking=secret' } }
+  const doc = (value: unknown) => ({ querySelectorAll: () => [{ textContent: JSON.stringify(value) }] }) as unknown as Pick<Document, 'querySelectorAll'>
+  const observed = extractStructuredOffers(doc({ '@type': 'ItemList', itemListElement: [{ '@type': 'ListItem', item: product }] }), 'https://www.amazon.in/s?k=phone')
+  assert.strictEqual(observed.length, 1)
+  assert.strictEqual(observed[0].url, 'https://www.amazon.in/dp/B09V3KXJPB')
+  assert.strictEqual(observed[0].shipping, null)
+  assert.strictEqual(observed[0].extra_tax_and_fees, null)
+  assert.deepStrictEqual({ ...(observed[0].identity as { attributes: object }).attributes }, { colour: 'Black' })
+  for (const patch of [{ seller: null }, { itemCondition: null }, { url: 'https://evil.test/dp/B09V3KXJPB' }, { price: '1e3' }, { '@type': 'AggregateOffer' }]) {
+    assert.strictEqual(extractStructuredOffers(doc({ ...product, offers: { ...product.offers, ...patch } }), 'https://www.amazon.in/s?k=phone').length, 0)
+  }
+  assert.strictEqual(extractStructuredOffers(doc(product), 'https://evil.test/').length, 0)
+  assert.strictEqual(extractStructuredOffers(doc({ ...product, brand: undefined }), 'https://www.amazon.in/s?k=phone').length, 0)
+  assert.strictEqual(extractStructuredOffers(doc([product, product]), 'https://www.amazon.in/s?k=phone').length, 1)
+  // The same bounded parser handles Flipkart evidence without accepting Amazon URLs.
+  assert.strictEqual(extractStructuredOffers(doc({ ...product, offers: { ...product.offers, url: 'https://www.flipkart.com/phone/p/itm123abc' } }), 'https://www.flipkart.com/search?q=phone').length, 1)
+})
 import {
   extractSnapshotFromDocument,
   rawCaptureFallback,
@@ -11,6 +33,35 @@ import {
 } from '../src/utils/snapshotExtractor.ts'
 
 describe('Browser Product Snapshot Extraction Unit Tests', () => {
+  test('native offer capture checks trusted frame, foreground and document after executing the bounded parser', async () => {
+    const source = readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8')
+    const start = source.indexOf("ipcMain.handle('browser:extract-offers'")
+    const end = source.indexOf('// Safe Snapshot Extraction', start)
+    const code = transformSync(source.slice(start, end), { loader: 'ts' }).code
+    let handler: (event: string, tab: string) => Promise<{ success: boolean; offers?: Record<string, unknown>[] }>
+    let focused = true, changed = false, reads = 0
+    const versions = new Map([['a', 0]])
+    const product = { '@type': 'Product', brand: 'Example', model: 'Phone', color: 'black', offers: { '@type': 'Offer', price: 100, priceCurrency: 'INR', seller: 'Seller', itemCondition: 'NewCondition', url: 'https://www.amazon.in/dp/B09V3KXJPB' } }
+    const doc = { querySelectorAll: () => [{ textContent: JSON.stringify(product) }] }
+    const wc = { id: 9, isDestroyed: () => false, getURL: () => 'https://www.amazon.in/s?k=phone', executeJavaScript: async (script: string) => {
+      reads++; if (changed) versions.set('a', 1)
+      return new Function('document', 'window', `return ${script}`)(doc, { location: { href: wc.getURL() } })
+    } }
+    new Function('ipcMain', 'assertTrustedUi', 'views', 'activeTabId', 'mainWindow', 'documentVersions', 'extractStructuredOffers', 'crypto', code)(
+      { handle: (_name: string, fn: typeof handler) => { handler = fn } },
+      (event: string) => { if (event !== 'trusted') throw new Error('Untrusted') }, new Map([['a', { webContents: wc }]]), 'a', { isFocused: () => focused }, versions, extractStructuredOffers, crypto)
+    await assert.rejects(() => handler!('foreign', 'a'), /Untrusted/)
+    focused = false
+    assert.strictEqual((await handler!('trusted', 'a')).success, false)
+    assert.strictEqual(reads, 0)
+    focused = true
+    const result = await handler!('trusted', 'a')
+    assert.strictEqual(result.success, true)
+    assert.strictEqual(result.offers?.length, 1)
+    assert.ok(result.offers?.[0].offer_id)
+    changed = true
+    assert.strictEqual((await handler!('trusted', 'a')).success, false)
+  })
   test('identified product read failures are distinct from general browser conversation', () => {
     assert.ok(isSupportedProductAddress('https://www.amazon.in/dp/B09V3KXJPB'))
     assert.ok(isSupportedProductAddress('https://www.flipkart.com/phone/p/itm123abc'))
@@ -27,7 +78,7 @@ describe('Browser Product Snapshot Extraction Unit Tests', () => {
   test('native HTTP bridge rejects foreign origins/frames and never forwards retailer cookies', async () => {
     const source = readFileSync(new URL('../electron/main.ts', import.meta.url), 'utf8')
     const start = source.indexOf("ipcMain.handle('backend:request'")
-    const end = source.indexOf('// Safe Snapshot Extraction', start)
+    const end = source.indexOf("ipcMain.handle('browser:extract-offers'", start)
     assert.ok(start > 0 && end > start)
     const code = transformSync(source.slice(start, end), { loader: 'ts' }).code
     let bridge: (event: unknown, data: unknown) => Promise<{ status: number; body: string }>

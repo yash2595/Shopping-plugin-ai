@@ -25,8 +25,9 @@ launch remain separate tracks; see the [risk implementation record](backend/READ
 Navigation now runs through a separate bounded planner/controller/native-executor
 pipeline, with per-step evidence, Pause/Resume/Stop and replay protection. A separate
 model can be configured for the navigation role. Existing durable AI work is claimed
-and acknowledged instead of being ignored; unsupported offer extraction remains
-explicitly incomplete. See [navigation orchestration](frontend/README.md#separate-navigation-orchestration).
+and acknowledged instead of being ignored. Supported search pages can supply
+bounded structured offer evidence; unknown delivery costs and unsupported layouts
+remain explicitly incomplete. See [navigation orchestration](frontend/README.md#separate-navigation-orchestration).
 
 Shopping assistant monorepo. The original AI package and the newer API/browser demo
 are separate integration layers:
